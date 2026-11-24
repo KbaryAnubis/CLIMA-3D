@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "Clima 3D",
+  "description": "Previsão do tempo 3D com cenários dinâmicos em vídeo, ícones meteorológicos animados, radar climático, gestão de localizações e alertas.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

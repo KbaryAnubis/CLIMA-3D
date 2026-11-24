@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="128dp"
+    android:height="112dp"
+    android:viewportWidth="128"
+    android:viewportHeight="112">
+
+    <group android:translateY="-4">
+        <path
+            android:pathData="M13,79 C4,77 6,63 15,59 C12,48 22,41 33,44 C36,27 52,26 61,31 C72,17 91,24 94,40 C110,39 119,54 113,65 C110,78 97,81 88,81 L24,81 C19,81 16,80 13,79 Z"
+            android:strokeColor="#FF69798F"
+            android:strokeWidth="0.9">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:endX="35"
+                    android:endY="81"
+                    android:startX="10"
+                    android:startY="22"
+                    android:type="linear">
+                    <item android:color="#FFBCC4D0" android:offset="0.0" />
+                    <item android:color="#FF858E9F" android:offset="0.5" />
+                    <item android:color="#FF596477" android:offset="1.0" />
+                </gradient>
+            </aapt:attr>
+        </path>
+    </group>
+
+    <!-- Hail pellets / crystals -->
+    <path android:fillColor="#FFD8F4FF" android:pathData="M28,87 A4,4 0 1,0 36,87 A4,4 0 1,0 28,87 Z" />
+    <path android:fillColor="#FFAEE6FF" android:pathData="M49,95 A4.5,4.5 0 1,0 58,95 A4.5,4.5 0 1,0 49,95 Z" />
+    <path android:fillColor="#FFD8F4FF" android:pathData="M69,86 A4,4 0 1,0 77,86 A4,4 0 1,0 69,86 Z" />
+    <path android:fillColor="#FFAEE6FF" android:pathData="M88,94 A4.5,4.5 0 1,0 97,94 A4.5,4.5 0 1,0 88,94 Z" />
+</vector>

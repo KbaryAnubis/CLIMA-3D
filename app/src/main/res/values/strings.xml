@@ -1,3 +1,52 @@
 <resources>
-    <string name="app_name">My Application</string>
+    <string name="app_name">Clima 3D</string>
+
+    <!-- Navigation tabs -->
+    <string name="nav_home">Início</string>
+    <string name="nav_radar">Radar</string>
+    <string name="nav_cities">Cidades</string>
+    <string name="nav_settings">Ajustes</string>
+    <string name="nav_alerts">Alertas</string>
+
+    <!-- Weather condition labels (V53) -->
+    <string name="wx_sol">Ensolarado</string>
+    <string name="wx_sol_nuvens">Parcialmente nublado</string>
+    <string name="wx_nublado">Nublado</string>
+    <string name="wx_chuva_fraca">Chuva fraca</string>
+    <string name="wx_chuva">Chuva moderada</string>
+    <string name="wx_tempestade">Tempestade</string>
+    <string name="wx_trovoada">Trovoada</string>
+    <string name="wx_tempestade_forte">Tempestade forte</string>
+    <string name="wx_neblina">Neblina</string>
+    <string name="wx_noite">Noite estrelada</string>
+    <string name="wx_noite_parcial">Poucas nuvens à noite</string>
+    <string name="wx_noite_nuvens">Noite entre nuvens</string>
+    <string name="wx_noite_encoberta">Céu encoberto à noite</string>
+    <string name="wx_noite_chuva">Chuva à noite</string>
+    <string name="wx_neve">Neve</string>
+    <string name="wx_neve_noite">Neve à noite</string>
+    <string name="wx_granizo">Granizo</string>
+    <string name="wx_vento">Vento forte</string>
+    <string name="wx_tornado">Tornado</string>
+    <string name="wx_arco_iris">Arco-íris</string>
+    <string name="wx_termometro">Temperatura</string>
+
+    <!-- Stage 2A Native Assets Foundation UI -->
+    <string name="stage2a_title">Clima 3D • Recursos Nativos</string>
+    <string name="stage2a_subtitle">Motor de fundo persistente, Media3 em loop, WebPs animados e mapas nativos MapLibre + OpenStreetMap</string>
+    <string name="stage2a_video_toggle">Cenário em vídeo (Media3)</string>
+    <string name="stage2a_animated_icons_section">10 ícones WebP animados (sem movimento artificial)</string>
+    <string name="stage2a_fallback_icons_section">Vetores de fallback e ícones de interface</string>
+    <string name="cities_map_title">Mapa de localizações (MapLibre + OpenStreetMap)</string>
+    <string name="cities_map_subtitle">Toque no mapa para posicionar o marcador, use gestos ou os controles de zoom e GPS.</string>
+    <string name="cities_map_zoom_in">Aumentar zoom</string>
+    <string name="cities_map_zoom_out">Reduzir zoom</string>
+    <string name="cities_map_my_location">Usar minha localização</string>
+    <string name="cities_map_selected_point">Ponto selecionado</string>
+    <string name="cities_map_location_denied">Permissão de localização não concedida. O mapa permanece navegável manualmente.</string>
+    <string name="cities_map_location_active">Localização atual ativa</string>
+    <string name="cities_map_osm_attribution">© OpenStreetMap contributors</string>
+    <string name="radar_layer_title">Camada meteorológica do Radar</string>
+    <string name="radar_layer_note">MeteorologicalRadarTileProvider preservado e independente do motor cartográfico, pronto para quadros de precipitação.</string>
+    <string name="stage2a_tab_placeholder">Fundo climático persistente ativo nesta aba. Conteúdo completo desta tela será construído nas próximas etapas.</string>
 </resources>

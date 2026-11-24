@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="128dp"
+    android:height="112dp"
+    android:viewportWidth="128"
+    android:viewportHeight="112">
+
+    <group android:translateY="-5">
+        <path
+            android:pathData="M13,79 C4,77 6,63 15,59 C12,48 22,41 33,44 C36,27 52,26 61,31 C72,17 91,24 94,40 C110,39 119,54 113,65 C110,78 97,81 88,81 L24,81 C19,81 16,80 13,79 Z"
+            android:strokeWidth="0.9"
+            android:strokeColor="#DEE7EF">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:endX="41"
+                    android:endY="81"
+                    android:startX="10"
+                    android:startY="22"
+                    android:type="linear">
+                    <item android:color="#FFFFFFFF" android:offset="0.0" />
+                    <item android:color="#FFF1F5FB" android:offset="0.42" />
+                    <item android:color="#FFD4DCE8" android:offset="0.75" />
+                    <item android:color="#FFB6C2D3" android:offset="1.0" />
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path
+            android:fillColor="#00000000"
+            android:pathData="M29,58 C37,53 45,54 50,56 M58,43 C68,40 74,43 78,49 M83,68 C89,64 97,65 103,68"
+            android:strokeAlpha="0.34"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round"
+            android:strokeWidth="2.2" />
+    </group>
+
+    <!-- Snowflakes (V53 wxIconOriginal) -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M32,81 V90 M28.1,83.25 L35.9,87.75 M35.9,83.25 L28.1,87.75"
+        android:strokeColor="#FFD8F4FF"
+        android:strokeLineCap="round"
+        android:strokeWidth="2.2" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M53,88 V97 M49.1,90.25 L56.9,94.75 M56.9,90.25 L49.1,94.75"
+        android:strokeColor="#FFD8F4FF"
+        android:strokeLineCap="round"
+        android:strokeWidth="2.2" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M73,82 V91 M69.1,84.25 L76.9,88.75 M76.9,84.25 L69.1,88.75"
+        android:strokeColor="#FFD8F4FF"
+        android:strokeLineCap="round"
+        android:strokeWidth="2.2" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M92,89 V98 M88.1,91.25 L95.9,95.75 M95.9,91.25 L88.1,95.75"
+        android:strokeColor="#FFD8F4FF"
+        android:strokeLineCap="round"
+        android:strokeWidth="2.2" />
+</vector>

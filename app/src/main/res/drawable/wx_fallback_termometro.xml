@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="128dp"
+    android:height="112dp"
+    android:viewportWidth="128"
+    android:viewportHeight="112">
+
+    <!-- Warm thermometer -->
+    <path
+        android:fillColor="#FFE2E7EB"
+        android:pathData="M36,21 A10,10 0 0,1 46,31 V68 A10,10 0 0,1 26,68 V31 A10,10 0 0,1 36,21 Z"
+        android:strokeColor="#FFBAC9D5"
+        android:strokeWidth="2" />
+    <path
+        android:fillAlpha="0.72"
+        android:fillColor="#FFE47B85"
+        android:pathData="M36,35 A4,4 0 0,1 40,39 V73 A4,4 0 0,1 32,73 V39 A4,4 0 0,1 36,35 Z" />
+    <path
+        android:fillColor="#FFD85F6F"
+        android:pathData="M22,81 A14,14 0 1,0 50,81 A14,14 0 1,0 22,81 Z"
+        android:strokeColor="#FFC7DBE7"
+        android:strokeWidth="2" />
+
+    <!-- Cool thermometer -->
+    <path
+        android:fillColor="#FFE2E7EB"
+        android:pathData="M78,21 A10,10 0 0,1 88,31 V68 A10,10 0 0,1 68,68 V31 A10,10 0 0,1 78,21 Z"
+        android:strokeColor="#FFBAC9D5"
+        android:strokeWidth="2" />
+    <path
+        android:fillAlpha="0.72"
+        android:fillColor="#FF91CDE7"
+        android:pathData="M78,35 A4,4 0 0,1 82,39 V73 A4,4 0 0,1 74,73 V39 A4,4 0 0,1 78,35 Z" />
+    <path
+        android:fillColor="#FF55AAD7"
+        android:pathData="M64,81 A14,14 0 1,0 92,81 A14,14 0 1,0 64,81 Z"
+        android:strokeColor="#FFC7DBE7"
+        android:strokeWidth="2" />
+</vector>
