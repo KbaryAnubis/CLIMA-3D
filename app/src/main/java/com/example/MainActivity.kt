@@ -18,6 +18,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.ClimaDataContainer
 import com.example.data.local.preferences.AppThemeMode
+import com.example.maps.MapLibreInitializer
 import com.example.ui.components.ClimaDetailModalHost
 import com.example.ui.components.WeatherPersistentShell
 import com.example.ui.screens.AlertsScreen
@@ -34,6 +35,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        MapLibreInitializer.ensureInitialized(applicationContext)
         val dataContainer = ClimaDataContainer.getInstance(applicationContext)
         setContent {
             Clima3DApp(dataContainer = dataContainer)

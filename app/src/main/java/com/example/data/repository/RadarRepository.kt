@@ -15,6 +15,8 @@ import com.example.data.remote.RainViewerApi
 import com.example.data.remote.RainViewerMapper
 import com.example.data.remote.RemoteCallOutcome
 import com.example.data.remote.SafeApiExecutor
+import com.example.maps.ClimaMapLogTags
+import com.example.maps.ClimaMapLogger
 import com.squareup.moshi.Moshi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -88,6 +90,10 @@ class RadarRepository(
 
         if (!connectivityObserver.isOnline()) {
             val offlineError = WeatherError.NetworkUnavailableError(RainViewerApi.PROVIDER_NAME)
+            ClimaMapLogger.w(
+                ClimaMapLogTags.RADAR_FRAMES,
+                "Sem conexão ao buscar frames RainViewer (cacheDisponivel=${cachedRecord != null}).",
+            )
             return fallbackToCacheOrFail(cachedRecord, offlineError)
         }
 
@@ -106,11 +112,19 @@ class RadarRepository(
                     maxFrames = RadarTimelineSnapshot.V53_TARGET_FRAME_COUNT,
                 )
                 if (mapped == null || mapped.frames.isEmpty()) {
+                    ClimaMapLogger.w(
+                        ClimaMapLogTags.RADAR_FRAMES,
+                        "Resposta RainViewer sem frames históricos válidos (cacheDisponivel=${cachedRecord != null}).",
+                    )
                     fallbackToCacheOrFail(
                         cachedRecord,
                         WeatherError.EmptyResponseError(RainViewerApi.PROVIDER_NAME),
                     )
                 } else {
+                    ClimaMapLogger.i(
+                        ClimaMapLogTags.RADAR_FRAMES,
+                        "RainViewer retornou ${mapped.frames.size} frames históricos reais (host=${mapped.host}, maxZoom=${mapped.maxSupportedZoom}).",
+                    )
                     val serialized = snapshotAdapter.toJson(mapped)
                     cacheDao.upsertRadar(
                         RadarTimelineCacheEntity(
@@ -129,6 +143,10 @@ class RadarRepository(
             }
 
             is RemoteCallOutcome.Failure -> {
+                ClimaMapLogger.e(
+                    ClimaMapLogTags.RADAR_FRAMES,
+                    "Falha ao obter frames históricos do RainViewer: ${outcome.error.userMessagePt}",
+                )
                 fallbackToCacheOrFail(cachedRecord, outcome.error)
             }
         }

@@ -2,8 +2,10 @@ package com.example.maps
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.location.Location
 import android.location.LocationManager
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -31,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -47,7 +50,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.R
@@ -63,6 +65,7 @@ import com.example.ui.theme.WeatherGlassSpecs
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
+import java.util.concurrent.atomic.AtomicBoolean
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
@@ -76,15 +79,17 @@ import org.maplibre.android.style.sources.GeoJsonSource
 
 /**
  * Native Jetpack Compose section for the Cities tab backed by MapLibre Native Android SDK
- * and OpenStreetMap raster tiles (no WebView, no HTML, no Google Maps Platform, no API key).
+ * (OpenGL ES + TextureView) and OpenStreetMap raster tiles (no WebView, no HTML, no Google Maps, no API key).
  *
  * Provides interactive map navigation, zoom controls, tap-to-place markers, saved markers,
- * OpenStreetMap attribution, and runtime-permission-safe current GPS location support.
+ * OpenStreetMap attribution, runtime-permission-safe GPS support, and explicit load/offline/error states.
  */
 @Composable
 fun CityMapLibreSection(
     modifier: Modifier = Modifier,
     initialState: CityMapUiState = CityMapUiState(),
+    isOnline: Boolean = true,
+    onRetryReload: () -> Unit = {},
     onStateChanged: ((CityMapUiState) -> Unit)? = null,
 ) {
     val context = LocalContext.current
@@ -180,6 +185,8 @@ fun CityMapLibreSection(
             ) {
                 CityMapLibreView(
                     state = uiState,
+                    isOnline = isOnline,
+                    onRetryReload = onRetryReload,
                     onMapTap = { coordinate ->
                         updateState(
                             uiState.selectMarkerAt(
@@ -326,6 +333,11 @@ fun CityMapLibreSection(
 
 /**
  * Low-level native MapLibre MapView wrapper for Jetpack Compose.
+ *
+ * Uses:
+ * - `MapLibreMapOptions.textureMode(true)` (TextureView) for clean Compose compositing & clipping.
+ * - Valid MapLibre Style Spec v8 JSON (`Style.Builder().fromJson(...)`) with OpenStreetMap raster tiles.
+ * - [MapViewLifecycleController] + [ComponentCallbacks2] for symmetrical lifecycle transitions.
  */
 @Composable
 fun CityMapLibreView(
@@ -333,15 +345,26 @@ fun CityMapLibreView(
     onMapTap: (CityMapCoordinate) -> Unit,
     onCameraGestureSettled: (CityMapCoordinate, Double) -> Unit,
     modifier: Modifier = Modifier,
+    isOnline: Boolean = true,
+    onRetryReload: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestOnMapTap by rememberUpdatedState(onMapTap)
     val latestOnCameraSettled by rememberUpdatedState(onCameraGestureSettled)
 
+    var reloadNonce by remember { mutableIntStateOf(0) }
     val mapLibreReady = remember(context) { MapLibreInitializer.ensureInitialized(context) }
+
     if (!mapLibreReady) {
-        // Host JVM test environments without native GL binaries render a lightweight placeholder
+        val jvmState =
+            when {
+                !isOnline -> MapSurfaceLoadState.Offline
+                !MapLibreInitializer.isRobolectricEnvironment() && MapLibreInitializer.lastInitError != null ->
+                    MapSurfaceLoadState.Error(MapLibreInitializer.lastInitError.orEmpty())
+                else -> MapSurfaceLoadState.Loaded
+            }
+
         Box(
             modifier = modifier.fillMaxSize().testTag("city_maplibre_jvm_surface"),
             contentAlignment = Alignment.Center,
@@ -351,13 +374,28 @@ fun CityMapLibreView(
                 color = ClimaTextMutedOnDark,
                 style = MaterialTheme.typography.bodySmall,
             )
+            MapSurfaceStatusOverlay(
+                loadState = jvmState,
+                onRetry = {
+                    reloadNonce++
+                    onRetryReload()
+                },
+                testTagPrefix = "city_map",
+                modifier = Modifier.align(Alignment.Center),
+            )
         }
         return
     }
 
     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
+    var lifecycleControllerRef by remember { mutableStateOf<MapViewLifecycleController?>(null) }
     var mapLibreMapRef by remember { mutableStateOf<MapLibreMap?>(null) }
     var loadedStyleRef by remember { mutableStateOf<Style?>(null) }
+    var loadState by remember {
+        mutableStateOf<MapSurfaceLoadState>(
+            if (isOnline) MapSurfaceLoadState.Loading else MapSurfaceLoadState.Offline,
+        )
+    }
 
     val savedMarkersJson =
         remember(state.savedMarkers) { CityMapGeoJsonBuilder.buildFeatureCollection(state.savedMarkers) }
@@ -366,9 +404,48 @@ fun CityMapLibreView(
             CityMapGeoJsonBuilder.buildFeatureCollection(listOf(state.selectedMarker))
         }
 
+    fun applyCitiesStyle(map: MapLibreMap, viewContext: Context) {
+        loadState = if (isOnline) MapSurfaceLoadState.Loading else MapSurfaceLoadState.Offline
+        loadedStyleRef = null
+        ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "Carregando estilo base OSM v8 para Mapa de Cidades.")
+        runCatching {
+            val styleBuilder =
+                OpenStreetMapTileConfig.buildStyleBuilder(
+                    savedMarkersGeoJson = savedMarkersJson,
+                    selectedMarkerGeoJson = selectedMarkerJson,
+                )
+            map.setStyle(styleBuilder) { style ->
+                loadedStyleRef = style
+                loadState = MapSurfaceLoadState.Loaded
+                ClimaMapLogger.i(
+                    ClimaMapLogTags.MAP_STYLE,
+                    "Estilo OSM do Mapa de Cidades carregado com sucesso.",
+                )
+                if (hasLocationPermission(viewContext)) {
+                    enableMapLibreLocationComponent(viewContext, map, style)
+                }
+            }
+        }.onFailure { err ->
+            val msg = "Erro ao aplicar estilo do Mapa de Cidades: ${err.message ?: err.javaClass.simpleName}"
+            ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, msg, err)
+            loadState = MapSurfaceLoadState.Error(msg)
+        }
+    }
+
+    // Reload style when connectivity returns or user triggers retry
+    LaunchedEffect(mapLibreMapRef, reloadNonce, isOnline) {
+        val map = mapLibreMapRef ?: return@LaunchedEffect
+        if (!isOnline && loadedStyleRef == null) {
+            loadState = MapSurfaceLoadState.Offline
+        } else if (reloadNonce > 0 || (isOnline && loadState is MapSurfaceLoadState.Offline)) {
+            applyCitiesStyle(map, context)
+        }
+    }
+
     // Update marker GeoJSON layers whenever marker state changes
     LaunchedEffect(loadedStyleRef, savedMarkersJson, selectedMarkerJson) {
         val style = loadedStyleRef ?: return@LaunchedEffect
+        if (!style.isFullyLoaded) return@LaunchedEffect
         style.getSourceAs<GeoJsonSource>(OpenStreetMapTileConfig.SAVED_MARKERS_SOURCE_ID)
             ?.setGeoJson(savedMarkersJson)
         style.getSourceAs<GeoJsonSource>(OpenStreetMapTileConfig.SELECTED_MARKER_SOURCE_ID)
@@ -395,40 +472,81 @@ fun CityMapLibreView(
         }
     }
 
-    // Forward Compose lifecycle to MapLibre MapView
-    DisposableEffect(lifecycleOwner, mapViewRef) {
-        val mapView = mapViewRef
+    // Symmetrical, non-duplicated Compose lifecycle & low-memory bridge for MapView
+    DisposableEffect(lifecycleOwner, lifecycleControllerRef, context) {
+        val controller = lifecycleControllerRef
         val observer =
             LifecycleEventObserver { _, event ->
-                if (mapView == null) return@LifecycleEventObserver
-                when (event) {
-                    Lifecycle.Event.ON_START -> mapView.onStart()
-                    Lifecycle.Event.ON_RESUME -> mapView.onResume()
-                    Lifecycle.Event.ON_PAUSE -> mapView.onPause()
-                    Lifecycle.Event.ON_STOP -> mapView.onStop()
-                    Lifecycle.Event.ON_DESTROY -> mapView.onDestroy()
-                    else -> Unit
+                controller?.onLifecycleEvent(event)
+            }
+        val lowMemoryCallbacks =
+            object : ComponentCallbacks2 {
+                override fun onConfigurationChanged(newConfig: Configuration) = Unit
+                @Deprecated("Deprecated in Java")
+                override fun onLowMemory() {
+                    controller?.dispatchLowMemory()
+                }
+                override fun onTrimMemory(level: Int) {
+                    if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+                        controller?.dispatchLowMemory()
+                    }
                 }
             }
         lifecycleOwner.lifecycle.addObserver(observer)
+        context.applicationContext?.registerComponentCallbacks(lowMemoryCallbacks)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            mapView?.onPause()
-            mapView?.onStop()
-            mapView?.onDestroy()
+            context.applicationContext?.unregisterComponentCallbacks(lowMemoryCallbacks)
+            controller?.destroy()
+            mapViewRef = null
+            mapLibreMapRef = null
+            loadedStyleRef = null
+            ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "MapView de Cidades liberado com segurança no onDispose.")
         }
     }
 
-    AndroidView(
-        modifier = modifier.testTag("city_maplibre_native_view"),
-        factory = { viewContext ->
-            MapView(viewContext).apply {
-                onCreate(null)
-                onStart()
-                onResume()
-                mapViewRef = this
+    Box(modifier = modifier.fillMaxSize()) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize().testTag("city_maplibre_native_view"),
+            factory = { viewContext ->
+                val options = MapLibreInitializer.createTextureMapOptions(viewContext)
+                ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "Criando MapView de Cidades em modo TextureView (OpenGL ES).")
+                val view = MapView(viewContext, options)
+                val firstFrameLogged = AtomicBoolean(false)
 
-                getMapAsync { map ->
+                val controller =
+                    MapViewLifecycleController(
+                        onCreate = { view.onCreate(null) },
+                        onStart = { view.onStart() },
+                        onResume = { view.onResume() },
+                        onPause = { view.onPause() },
+                        onStop = { view.onStop() },
+                        onDestroy = { view.onDestroy() },
+                        onLowMemory = { view.onLowMemory() },
+                    )
+                controller.syncToLifecycleState(lifecycleOwner.lifecycle.currentState)
+                lifecycleControllerRef = controller
+                mapViewRef = view
+
+                view.addOnDidFailLoadingMapListener { errorMessage ->
+                    val reason = errorMessage.ifBlank { "Erro ao carregar mapa-base OpenStreetMap." }
+                    ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, "Falha no carregamento do Mapa de Cidades: $reason")
+                    loadState = if (!isOnline) MapSurfaceLoadState.Offline else MapSurfaceLoadState.Error(reason)
+                }
+                view.addOnDidFinishLoadingStyleListener {
+                    ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "Callback onDidFinishLoadingStyle disparado (Cidades).")
+                }
+                view.addOnDidFinishLoadingMapListener {
+                    ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "Mapa de Cidades carregado completamente.")
+                    loadState = MapSurfaceLoadState.Loaded
+                }
+                view.addOnDidFinishRenderingFrameListener { _ ->
+                    if (firstFrameLogged.compareAndSet(false, true)) {
+                        ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "Primeiro frame do MapView de Cidades renderizado.")
+                    }
+                }
+
+                view.getMapAsync { map ->
                     mapLibreMapRef = map
                     map.uiSettings.apply {
                         isZoomGesturesEnabled = true
@@ -446,17 +564,7 @@ fun CityMapLibreView(
                             .zoom(state.zoom)
                             .build()
 
-                    val styleBuilder =
-                        OpenStreetMapTileConfig.buildStyleBuilder(
-                            savedMarkersGeoJson = savedMarkersJson,
-                            selectedMarkerGeoJson = selectedMarkerJson,
-                        )
-                    map.setStyle(styleBuilder) { style ->
-                        loadedStyleRef = style
-                        if (hasLocationPermission(viewContext)) {
-                            enableMapLibreLocationComponent(viewContext, map, style)
-                        }
-                    }
+                    applyCitiesStyle(map, viewContext)
 
                     map.addOnMapClickListener { point ->
                         latestOnMapTap(CityMapCoordinate(point.latitude, point.longitude))
@@ -471,9 +579,20 @@ fun CityMapLibreView(
                         )
                     }
                 }
-            }
-        },
-    )
+                view
+            },
+        )
+
+        MapSurfaceStatusOverlay(
+            loadState = loadState,
+            onRetry = {
+                reloadNonce++
+                onRetryReload()
+            },
+            testTagPrefix = "city_map",
+            modifier = Modifier.align(Alignment.Center),
+        )
+    }
 }
 
 @Composable

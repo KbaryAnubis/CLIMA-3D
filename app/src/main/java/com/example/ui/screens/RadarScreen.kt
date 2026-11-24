@@ -380,6 +380,9 @@ fun RadarScreen(
                             activeFrame = activeFrame,
                             layerStyle = uiState.radarLayer,
                             maxRadarZoom = maxRadarZoom,
+                            isOnline = uiState.isOnline,
+                            radarErrorMessage = uiState.radarErrorMessage,
+                            onRetryReload = onRefreshRadar,
                             modifier = Modifier.fillMaxSize(),
                         )
 

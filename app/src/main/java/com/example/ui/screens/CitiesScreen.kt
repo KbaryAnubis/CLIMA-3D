@@ -132,6 +132,7 @@ fun CitiesScreen(
                 item(key = "cities_map_libre") {
                     CityMapLibreSection(
                         initialState = uiState.cityMapState,
+                        isOnline = uiState.isOnline,
                         onStateChanged = onMapStateChanged,
                     )
                 }
