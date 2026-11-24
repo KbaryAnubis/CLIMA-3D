@@ -821,6 +821,7 @@ internal fun CityMapLibreViewImpl(
                         sessionId = sessionId,
                         viewIdentity = port.viewIdentity,
                         attempt = viewRecreationNonce + 1,
+                        viewClass = port.viewClassName,
                     )
                     val firstFrameLogged = AtomicBoolean(false)
                     val fullyRenderedLogged = AtomicBoolean(false)
@@ -828,14 +829,38 @@ internal fun CityMapLibreViewImpl(
                     val controller =
                         MapViewLifecycleController(
                             onCreate = { port.onCreate() },
-                            onStart = { port.onStart() },
-                            onResume = { port.onResume() },
-                            onPause = { port.onPause() },
-                            onStop = { port.onStop() },
+                            onStart = {
+                                port.onStart()
+                                ClimaGraphicsLifecycleDiagnostics.logMapLifecycle("Cidades", sessionId, port.viewIdentity, "ON_START")
+                            },
+                            onResume = {
+                                port.onResume()
+                                ClimaGraphicsLifecycleDiagnostics.logMapLifecycle("Cidades", sessionId, port.viewIdentity, "ON_RESUME")
+                            },
+                            onPause = {
+                                port.onPause()
+                                ClimaGraphicsLifecycleDiagnostics.logMapLifecycle("Cidades", sessionId, port.viewIdentity, "ON_PAUSE")
+                            },
+                            onStop = {
+                                port.onStop()
+                                ClimaGraphicsLifecycleDiagnostics.logMapLifecycle("Cidades", sessionId, port.viewIdentity, "ON_STOP")
+                            },
                             onDestroy = { port.onDestroy() },
                             onLowMemory = { port.onLowMemory() },
                         )
                     controller.syncToLifecycleState(lifecycleOwner.lifecycle.currentState)
+
+                    val detachWindowObserver =
+                        port.attachWindowObserver { attached, surfaceInfo ->
+                            ClimaGraphicsLifecycleDiagnostics.logMapViewAttachState(
+                                screen = "Cidades",
+                                sessionId = sessionId,
+                                viewClass = port.viewClassName,
+                                viewIdentity = port.viewIdentity,
+                                attached = attached,
+                                surfaceInfo = surfaceInfo,
+                            )
+                        }
 
                     val detachListeners =
                         port.attachListeners(
@@ -921,7 +946,11 @@ internal fun CityMapLibreViewImpl(
                             surfacePort = port,
                             controller = controller,
                             onDetachListeners = detachListeners,
-                            onCancelTransitions = { mapLibreMapRef?.cancelTransitions() },
+                            onDetachWindowObserver = detachWindowObserver,
+                            onCancelTransitions = {
+                                mapLibreMapRef?.cancelTransitions()
+                                mapLibreMapRef?.clearMapListeners()
+                            },
                         )
                     mapViewRef = port
 

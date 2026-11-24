@@ -43,7 +43,20 @@ sealed interface ClimaActiveModal {
     data class DayDetail(val index: Int, val point: DailyForecastPoint) : ClimaActiveModal
     data class MetricDetail(val metric: WeatherMetricType) : ClimaActiveModal
     data object PressureInfo : ClimaActiveModal
+    data object LocationPicker : ClimaActiveModal
 }
+
+@Immutable
+data class LocationPickerUiState(
+    val searchQuery: String = "",
+    val searchResults: List<CitySearchResult> = emptyList(),
+    val isSearching: Boolean = false,
+    val searchErrorMessage: String? = null,
+    val hasSearchedCurrentQuery: Boolean = false,
+    val isLocatingUser: Boolean = false,
+    val gpsErrorMessage: String? = null,
+    val pendingGpsActionAfterPermission: Boolean = false,
+)
 
 @Immutable
 data class SavedLocationWeatherSummary(
@@ -86,6 +99,7 @@ data class ClimaUiState(
     val radarZoom: Double = 6.0,
     // Home UI interaction state
     val daysExpanded: Boolean = false,
+    val locationPickerState: LocationPickerUiState = LocationPickerUiState(),
     // Cities UI state
     val citiesSubTab: CitiesSubTab = CitiesSubTab.SAVED,
     val citySearchQuery: String = "",

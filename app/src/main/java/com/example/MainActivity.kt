@@ -1,5 +1,6 @@
 package com.example
 
+import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -29,6 +30,7 @@ import com.example.maps.LocationLookupResult
 import com.example.maps.LocationPermissionCoordinator
 import com.example.maps.MapLibreInitializer
 import com.example.ui.components.ClimaDetailModalHost
+import com.example.ui.components.LocationPickerDialog
 import com.example.ui.components.WeatherPersistentShell
 import com.example.ui.screens.AlertsScreen
 import com.example.ui.screens.CitiesScreen
@@ -62,6 +64,8 @@ fun Clima3DApp(
     dataContainer: ClimaDataContainer? = null,
     viewModel: ClimaMainViewModel? = null,
     onLaunchPermissionRequest: ((Array<String>) -> Unit)? = null,
+    onFetchPickerGpsLocation: ((Context, (LocationLookupResult) -> Unit) -> Unit)? = null,
+    onOpenAppSettingsOverride: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val resolvedContainer = remember(dataContainer, context) {
@@ -83,6 +87,46 @@ fun Clima3DApp(
         }
 
     var launchedPermissionInSession by rememberSaveable { mutableStateOf(false) }
+
+    val launchPickerGpsLookup: () -> Unit = {
+        val requestSeq = vm.beginLocationPickerGpsLookup()
+        val delivery: (LocationLookupResult) -> Unit = { lookup ->
+            when (lookup) {
+                is LocationLookupResult.Success -> {
+                    vm.activateCurrentGpsCoordinatesFromPicker(
+                        coordinate = lookup.coordinate,
+                        requestSeq = requestSeq,
+                    )
+                }
+
+                LocationLookupResult.LocationServiceDisabled -> {
+                    vm.finishLocationPickerGpsLookupWithError(
+                        message = "Localização do aparelho desativada no sistema. Ative o GPS ou pesquise uma cidade.",
+                        requestSeq = requestSeq,
+                    )
+                }
+
+                LocationLookupResult.PermissionDenied -> {
+                    vm.finishLocationPickerGpsLookupWithError(
+                        message = "Permissão de localização não concedida. Permita o acesso ou selecione uma cidade abaixo.",
+                        requestSeq = requestSeq,
+                    )
+                }
+
+                is LocationLookupResult.UnavailableTemporarily -> {
+                    vm.finishLocationPickerGpsLookupWithError(
+                        message = lookup.reason,
+                        requestSeq = requestSeq,
+                    )
+                }
+            }
+        }
+        if (onFetchPickerGpsLocation != null) {
+            onFetchPickerGpsLocation(context, delivery)
+        } else {
+            LocationPermissionCoordinator.fetchRealLocation(context, onResult = delivery)
+        }
+    }
 
     val locationPermissionLauncher =
         rememberLauncherForActivityResult(
@@ -106,35 +150,52 @@ fun Clima3DApp(
                 }
             vm.onLocationPermissionResult(effectiveSnapshot)
             if (effectiveSnapshot.hasAnyPermission) {
-                LocationPermissionCoordinator.fetchRealLocation(context) { lookup ->
-                    when (lookup) {
-                        is LocationLookupResult.Success -> {
-                            vm.updateCityMapState(
-                                vm.uiState.value.cityMapState.withCurrentLocation(
-                                    coordinate = lookup.coordinate,
-                                    label = context.getString(R.string.cities_map_my_location),
-                                    precision = lookup.precision,
-                                ),
-                            )
-                        }
+                if (vm.uiState.value.activeModal == ClimaActiveModal.LocationPicker &&
+                    vm.uiState.value.locationPickerState.pendingGpsActionAfterPermission
+                ) {
+                    launchPickerGpsLookup()
+                } else {
+                    LocationPermissionCoordinator.fetchRealLocation(context) { lookup ->
+                        when (lookup) {
+                            is LocationLookupResult.Success -> {
+                                vm.updateCityMapState(
+                                    vm.uiState.value.cityMapState.withCurrentLocation(
+                                        coordinate = lookup.coordinate,
+                                        label = context.getString(R.string.cities_map_my_location),
+                                        precision = lookup.precision,
+                                    ),
+                                )
+                            }
 
-                        is LocationLookupResult.UnavailableTemporarily -> {
-                            vm.updateCityMapState(
-                                vm.uiState.value.cityMapState.withLocationNotice(lookup.reason),
-                            )
-                        }
+                            is LocationLookupResult.UnavailableTemporarily -> {
+                                vm.updateCityMapState(
+                                    vm.uiState.value.cityMapState.withLocationNotice(lookup.reason),
+                                )
+                            }
 
-                        LocationLookupResult.LocationServiceDisabled -> {
-                            vm.updateCityMapState(
-                                vm.uiState.value.cityMapState.withLocationNotice(
-                                    "Localização do aparelho desativada no sistema.",
-                                ),
-                            )
-                        }
+                            LocationLookupResult.LocationServiceDisabled -> {
+                                vm.updateCityMapState(
+                                    vm.uiState.value.cityMapState.withLocationNotice(
+                                        "Localização do aparelho desativada no sistema.",
+                                    ),
+                                )
+                            }
 
-                        LocationLookupResult.PermissionDenied -> Unit
+                            LocationLookupResult.PermissionDenied -> Unit
+                        }
                     }
                 }
+            } else if (vm.uiState.value.activeModal == ClimaActiveModal.LocationPicker &&
+                vm.uiState.value.locationPickerState.pendingGpsActionAfterPermission
+            ) {
+                vm.finishLocationPickerGpsLookupWithError(
+                    message =
+                        if (effectiveSnapshot.permanentlyDenied) {
+                            "Permissão bloqueada pelo Android. Libere nas configurações ou escolha uma cidade abaixo."
+                        } else {
+                            "Permissão de localização recusada. Você pode tentar novamente ou pesquisar uma cidade."
+                        },
+                )
             }
         }
 
@@ -221,6 +282,7 @@ fun Clima3DApp(
                         onHourClick = vm::openHourModal,
                         onDayClick = vm::openDayModal,
                         onMetricClick = vm::openMetricModal,
+                        onOpenLocationPicker = vm::openLocationPickerModal,
                     )
 
                 ClimaTab.RADAR ->
@@ -284,6 +346,47 @@ fun Clima3DApp(
                         onBackToHome = { vm.selectTab(ClimaTab.HOME) },
                     )
             }
+        }
+
+        if (uiState.activeModal == ClimaActiveModal.LocationPicker) {
+            val openSettingsAction = {
+                if (onOpenAppSettingsOverride != null) {
+                    onOpenAppSettingsOverride()
+                } else {
+                    LocationPermissionCoordinator.openAppSettings(context)
+                }
+                Unit
+            }
+            LocationPickerDialog(
+                uiState = uiState,
+                onSearchQueryChanged = vm::updateLocationPickerSearchQuery,
+                onSubmitSearch = vm::submitLocationPickerSearch,
+                onSelectSearchResult = vm::selectSearchResultFromPicker,
+                onSelectSavedLocation = vm::selectSavedLocationFromPicker,
+                onUseMyLocationClick = {
+                    val liveSnapshot =
+                        LocationPermissionCoordinator.inspect(
+                            context = context,
+                            initialPromptShown = uiState.preferences.locationPermissionPromptShown,
+                        )
+                    val effectiveHasPermission =
+                        liveSnapshot.hasAnyPermission || uiState.locationPermissionSnapshot.hasAnyPermission
+                    when {
+                        effectiveHasPermission -> launchPickerGpsLookup()
+                        uiState.locationPermissionSnapshot.permanentlyDenied -> openSettingsAction()
+                        else -> {
+                            vm.markPendingPickerGpsAfterPermission(true)
+                            requestLocationPermissions()
+                        }
+                    }
+                },
+                onRequestLocationPermission = {
+                    vm.markPendingPickerGpsAfterPermission(true)
+                    requestLocationPermissions()
+                },
+                onOpenAppLocationSettings = openSettingsAction,
+                onDismiss = vm::closeLocationPickerModal,
+            )
         }
 
         ClimaDetailModalHost(

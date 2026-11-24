@@ -674,6 +674,438 @@ class SurfaceAndLifecycleAuditTest {
         assertTrue(logged.any { it.contains("MAP_DESTROYED") })
     }
 
+    // 13. Sessões MapLibre possuem sessionId único e identidade distinta
+    @Test
+    fun `test_13_maplibre_sessions_have_unique_session_id_and_identity`() {
+        val ports = mutableListOf<FakeMapViewSurfacePort>()
+        var screenMode by mutableStateOf("cities")
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                if (screenMode == "cities") {
+                    CityMapLibreViewImpl(
+                        state = CityMapUiState(),
+                        onMapTap = {},
+                        onCameraGestureSettled = { _, _ -> },
+                        surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { ports += it } },
+                    )
+                } else {
+                    RadarMapLibreViewImpl(
+                        center = CityMapCoordinate(-23.55, -46.63),
+                        zoom = 6.0,
+                        activeFrame = sampleRadarFrame(1700000000L),
+                        layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                        maxRadarZoom = 7,
+                        surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { ports += it } },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.runOnUiThread { screenMode = "radar" }
+        composeTestRule.waitForIdle()
+
+        val creates = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().filter { it.contains("MAP_CREATE") }
+        assertEquals(2, creates.size)
+        val sessions = creates.mapNotNull { extractToken(it, "session=") }.toSet()
+        val viewIds = creates.mapNotNull { extractToken(it, "viewId=") }.toSet()
+        assertEquals(2, sessions.size)
+        assertEquals(2, viewIds.size)
+    }
+
+    // 14. Sessões ExoPlayer possuem sessionId único e identidade distinta
+    @Test
+    fun `test_14_exoplayer_sessions_have_unique_session_id_and_identity`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var showFirst by mutableStateOf(true)
+
+        composeTestRule.setContent {
+            if (showFirst) {
+                WeatherVideoBackgroundImpl(
+                    videoResId = R.raw.wx_bg_sun_day,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                )
+            } else {
+                WeatherVideoBackgroundImpl(
+                    videoResId = R.raw.wx_bg_rain_day,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.runOnUiThread { showFirst = false }
+        composeTestRule.waitForIdle()
+
+        val creates = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().filter { it.contains("EXO_CREATE") }
+        assertEquals(2, creates.size)
+        val sessions = creates.mapNotNull { extractToken(it, "session=") }.toSet()
+        val playerIds = creates.mapNotNull { extractToken(it, "playerId=") }.toSet()
+        assertEquals(2, sessions.size)
+        assertEquals(2, playerIds.size)
+    }
+
+    // 15. Attach e detach de janela para MapView e ExoPlayer contêm metadados completos de correlação
+    @Test
+    fun `test_15_ordered_window_attach_and_detach_logging_with_correlation_fields`() {
+        val ports = mutableListOf<FakeMapViewSurfacePort>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var mounted by mutableStateOf(true)
+
+        ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.HOME, ClimaTab.RADAR)
+
+        composeTestRule.setContent {
+            if (mounted) {
+                Column {
+                    WeatherVideoBackgroundImpl(
+                        videoResId = R.raw.wx_bg_sun_day,
+                        playerBridgeFactory = { FakeWeatherVideoPlayerBridge() },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    )
+                    RadarMapLibreViewImpl(
+                        center = CityMapCoordinate(-23.55, -46.63),
+                        zoom = 6.0,
+                        activeFrame = sampleRadarFrame(1700000000L),
+                        layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                        maxRadarZoom = 7,
+                        surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { ports += it } },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val mapPort = ports.single()
+        val exoSurface = surfaces.single()
+        composeTestRule.runOnUiThread {
+            mapPort.emitAttach(true)
+            exoSurface.emitAttach(true)
+            mapPort.emitAttach(false)
+            exoSurface.emitAttach(false)
+        }
+        composeTestRule.waitForIdle()
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        val mapAttachIdx = logs.indexOfFirst { it.contains("MAP_VIEW_ATTACH") }
+        val mapDetachIdx = logs.indexOfFirst { it.contains("MAP_VIEW_DETACH") }
+        val exoAttachIdx = logs.indexOfFirst { it.contains("EXO_VIEW_ATTACH") }
+        val exoDetachIdx = logs.indexOfFirst { it.contains("EXO_VIEW_DETACH") }
+
+        assertTrue(mapAttachIdx >= 0 && mapDetachIdx > mapAttachIdx)
+        assertTrue(exoAttachIdx >= 0 && exoDetachIdx > exoAttachIdx)
+
+        listOf(logs[mapAttachIdx], logs[mapDetachIdx], logs[exoAttachIdx], logs[exoDetachIdx]).forEach { line ->
+            assertTrue("Line missing wall timestamp: $line", line.contains("wall="))
+            assertTrue("Line missing monoNs: $line", line.contains("monoNs="))
+            assertTrue("Line missing pid: $line", line.contains("pid="))
+            assertTrue("Line missing tab=RADAR: $line", line.contains("tab=RADAR"))
+            assertTrue("Line missing thread: $line", line.contains("thread="))
+        }
+    }
+
+    // 16. MAP_DISPOSE_REQ é registrado antes de MAP_DESTROYED para a mesma sessão
+    @Test
+    fun `test_16_map_dispose_req_logged_before_map_destroyed`() {
+        var mounted by mutableStateOf(true)
+        composeTestRule.setContent {
+            if (mounted) {
+                RadarMapLibreViewImpl(
+                    center = CityMapCoordinate(-23.55, -46.63),
+                    zoom = 6.0,
+                    activeFrame = sampleRadarFrame(1700000000L),
+                    layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                    maxRadarZoom = 7,
+                    surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx) },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.runOnUiThread { mounted = false }
+        composeTestRule.waitForIdle()
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        val createLine = logs.first { it.contains("MAP_CREATE") }
+        val sessionId = extractToken(createLine, "session=")!!
+        val disposeReqIdx = logs.indexOfFirst { it.contains("MAP_DISPOSE_REQ") && it.contains("session=$sessionId") }
+        val destroyedIdx = logs.indexOfFirst { it.contains("MAP_DESTROYED") && it.contains("session=$sessionId") }
+
+        assertTrue(disposeReqIdx >= 0 && destroyedIdx > disposeReqIdx)
+    }
+
+    // 17. EXO_SURFACE_CLEAR precede EXO_RELEASED único e releaseOnce permanece idempotente
+    @Test
+    fun `test_17_exoplayer_single_idempotent_release_after_detach_and_clear_surface`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var mounted by mutableStateOf(true)
+
+        composeTestRule.setContent {
+            if (mounted) {
+                WeatherVideoBackgroundImpl(
+                    videoResId = R.raw.wx_bg_sun_day,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+
+        composeTestRule.runOnUiThread { mounted = false }
+        composeTestRule.waitForIdle()
+
+        assertFalse(player.releaseOnce())
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        val sessionToken = "session=${player.sessionId}"
+        val clearIdx = logs.indexOfFirst { it.contains("EXO_SURFACE_CLEAR") && it.contains(sessionToken) }
+        val releasedLines = logs.withIndex().filter { it.value.contains("EXO_RELEASED") && it.value.contains(sessionToken) }
+
+        assertEquals(1, releasedLines.size)
+        assertTrue(clearIdx in 0 until releasedLines.single().index)
+    }
+
+    // 18. Callbacks tardios são descartados após dispose no Radar e em Cidades
+    @Test
+    fun `test_18_late_callbacks_discarded_after_dispose_in_both_radar_and_cities`() {
+        val ports = mutableListOf<FakeMapViewSurfacePort>()
+        var mounted by mutableStateOf(true)
+        var cityTapCount = 0
+
+        composeTestRule.setContent {
+            if (mounted) {
+                Column {
+                    RadarMapLibreViewImpl(
+                        center = CityMapCoordinate(-23.55, -46.63),
+                        zoom = 6.0,
+                        activeFrame = sampleRadarFrame(1700000000L),
+                        layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                        maxRadarZoom = 7,
+                        surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx, autoReady = false).also { ports += it } },
+                    )
+                    CityMapLibreViewImpl(
+                        state = CityMapUiState(),
+                        onMapTap = { cityTapCount++ },
+                        onCameraGestureSettled = { _, _ -> },
+                        surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx, autoReady = false).also { ports += it } },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val radarPort = ports[0]
+        val cityPort = ports[1]
+        val radarReadyCb = radarPort.pendingMapReadyCallback!!
+        val radarCallbacks = radarPort.attachedCallbacks!!
+        val cityReadyCb = cityPort.pendingMapReadyCallback!!
+        val cityCallbacks = cityPort.attachedCallbacks!!
+
+        composeTestRule.runOnUiThread { mounted = false }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.runOnUiThread {
+            radarReadyCb(radarPort.controllerPort)
+            radarCallbacks.onDidFinishLoadingStyle()
+            radarCallbacks.onFirstFrameRendered()
+            radarCallbacks.onRenderError("late radar failure")
+            radarPort.flushPendingUiPosts()
+
+            cityReadyCb(cityPort.controllerPort)
+            cityCallbacks.onDidFinishLoadingStyle()
+            cityCallbacks.onFirstFrameRendered()
+            cityCallbacks.onRenderError("late city failure")
+            cityPort.flushPendingUiPosts()
+            cityPort.controllerPort.simulateMapTap(CityMapCoordinate(-23.5, -46.6))
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(0, radarPort.controllerPort.setStyleCalls)
+        assertEquals(0, cityPort.controllerPort.setStyleCalls)
+        assertEquals(0, cityTapCount)
+    }
+
+    // 19. destroyOnceAfterDetach é idempotente em múltiplas chamadas
+    @Test
+    fun `test_19_idempotent_mapview_destroy_once_after_detach`() {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<Context>()
+        val port = FakeMapViewSurfacePort(context)
+        val pauseCalls = AtomicInteger(0)
+        val stopCalls = AtomicInteger(0)
+        val destroyCalls = AtomicInteger(0)
+        val detachListenersCalls = AtomicInteger(0)
+        val detachWindowCalls = AtomicInteger(0)
+
+        val controller =
+            MapViewLifecycleController(
+                onCreate = {},
+                onStart = {},
+                onResume = {},
+                onPause = { pauseCalls.incrementAndGet() },
+                onStop = { stopCalls.incrementAndGet() },
+                onDestroy = { destroyCalls.incrementAndGet() },
+                onLowMemory = {},
+            )
+        controller.ensureCreated()
+        controller.syncToLifecycleState(Lifecycle.State.RESUMED)
+
+        val handle =
+            MapViewSessionHandle(
+                screenName = "Cities",
+                sessionId = "map-idempotent-19",
+                surfacePort = port,
+                controller = controller,
+                onDetachListeners = { detachListenersCalls.incrementAndGet() },
+                onCancelTransitions = {},
+                onDetachWindowObserver = { detachWindowCalls.incrementAndGet() },
+            )
+
+        handle.destroyOnceAfterDetach()
+        handle.destroyOnceAfterDetach()
+        handle.destroyOnceAfterDetach()
+
+        assertEquals(1, pauseCalls.get())
+        assertEquals(1, stopCalls.get())
+        assertEquals(1, detachListenersCalls.get())
+        assertEquals(1, detachWindowCalls.get())
+        assertEquals(1, destroyCalls.get())
+        assertEquals(
+            1,
+            ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().count {
+                it.contains("MAP_DESTROYED") && it.contains("session=map-idempotent-19")
+            },
+        )
+    }
+
+    // 20. Diagnósticos permanecem desativados fora de BuildConfig.DEBUG
+    @Test
+    fun `test_20_diagnostics_completely_disabled_when_not_debug`() {
+        ClimaGraphicsLifecycleDiagnostics.debugOverrideForTest = false
+        ClimaGraphicsLifecycleDiagnostics.clearForTest()
+
+        ClimaGraphicsLifecycleDiagnostics.logMapViewCreated("Radar", "map-off", 101, 1)
+        ClimaGraphicsLifecycleDiagnostics.logExoPlayerCreated("exo-off", 202, R.raw.wx_bg_sun_day)
+        ClimaGraphicsLifecycleDiagnostics.logModalLifecycle("LocationPicker", "OPEN")
+        ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.HOME, ClimaTab.RADAR)
+
+        assertFalse(ClimaGraphicsLifecycleDiagnostics.isEnabled())
+        assertTrue(ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().isEmpty())
+    }
+
+    // 21. Ausência de log por frame ou por recomposição (buffer limitado e sem spam)
+    @Test
+    fun `test_21_no_per_frame_or_per_recomposition_log_spam`() {
+        var frameIdx by mutableIntStateOf(0)
+        var recomposeTick by mutableIntStateOf(0)
+        val frames = List(9) { i -> sampleRadarFrame(1700000000L + i * 600L) }
+
+        composeTestRule.setContent {
+            Column {
+                Text("recompose-$recomposeTick")
+                RadarMapLibreViewImpl(
+                    center = CityMapCoordinate(-23.55, -46.63),
+                    zoom = 6.0,
+                    frames = frames,
+                    activeFrame = frames[frameIdx],
+                    layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                    maxRadarZoom = 7,
+                    surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx) },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        val countAfterInit = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().size
+
+        // Simulate 15 animated radar frames + 15 Compose recompositions
+        repeat(15) { step ->
+            composeTestRule.runOnUiThread {
+                frameIdx = (frameIdx + 1) % frames.size
+                recomposeTick = step + 1
+            }
+            composeTestRule.waitForIdle()
+        }
+
+        val logsAfterTicks = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertEquals("Ticks and recompositions must emit zero extra lifecycle log entries", countAfterInit, logsAfterTicks.size)
+        assertTrue(logsAfterTicks.size <= 128)
+    }
+
+    // 22. Navegação repetida entre Home, Radar, Cidades e Ajustes não acumula mapas nem players ativos
+    @Test
+    fun `test_22_multi_tab_navigation_no_active_map_or_player_accumulation`() {
+        val createdMapPorts = mutableListOf<FakeMapViewSurfacePort>()
+        val createdPlayers = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL_NUVENS,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { createdPlayers += it } },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                    )
+                    when (activeTab) {
+                        ClimaTab.RADAR ->
+                            RadarMapLibreViewImpl(
+                                center = CityMapCoordinate(-23.55, -46.63),
+                                zoom = 6.0,
+                                activeFrame = sampleRadarFrame(1700000000L),
+                                layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                                maxRadarZoom = 7,
+                                surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { createdMapPorts += it } },
+                            )
+
+                        ClimaTab.CITIES ->
+                            CityMapLibreViewImpl(
+                                state = CityMapUiState(),
+                                onMapTap = {},
+                                onCameraGestureSettled = { _, _ -> },
+                                surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { createdMapPorts += it } },
+                            )
+
+                        else -> Text("tab-${activeTab.name}")
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val routeSequence =
+            listOf(
+                ClimaTab.RADAR,
+                ClimaTab.CITIES,
+                ClimaTab.SETTINGS,
+                ClimaTab.HOME,
+                ClimaTab.RADAR,
+                ClimaTab.CITIES,
+                ClimaTab.HOME,
+            )
+        routeSequence.forEach { next ->
+            val prev = activeTab
+            composeTestRule.runOnUiThread {
+                ClimaGraphicsLifecycleDiagnostics.logTabChanged(prev, next)
+                activeTab = next
+            }
+            composeTestRule.waitForIdle()
+            val activeMaps = createdMapPorts.count { it.destroyCount == 0 }
+            val expectedActive = if (next == ClimaTab.RADAR || next == ClimaTab.CITIES) 1 else 0
+            assertEquals(expectedActive, activeMaps)
+        }
+
+        assertEquals(1, createdPlayers.size)
+        assertEquals(0, createdPlayers.single().releaseCalls)
+        assertEquals(4, createdMapPorts.size)
+        assertEquals(4, createdMapPorts.count { it.destroyCount == 1 })
+    }
+
+    private fun extractToken(line: String, prefix: String): String? {
+        val idx = line.indexOf(prefix)
+        if (idx < 0) return null
+        return line.substring(idx + prefix.length).substringBefore(' ').substringBefore(']')
+    }
+
     private fun sampleRadarFrame(ts: Long) =
         RainViewerRadarFrame(
             timestampSeconds = ts,
@@ -788,7 +1220,9 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
 private class FakeWeatherVideoSurfaceBridge(context: Context) : WeatherVideoSurfaceBridge {
     override val view: View = View(context)
     override val viewIdentity: Int = System.identityHashCode(view)
+    override val viewClassName: String = "FakePlayerView"
     private var boundPlayer: WeatherVideoPlayerBridge? = null
+    private var attachObserver: ((Boolean, com.example.ui.components.ExoSurfaceSnapshot) -> Unit)? = null
     var detachCount = 0
     var firstDetachOrder = Int.MAX_VALUE
 
@@ -805,6 +1239,24 @@ private class FakeWeatherVideoSurfaceBridge(context: Context) : WeatherVideoSurf
             firstDetachOrder = GlobalOrderClock.counter.incrementAndGet()
         }
         boundPlayer = null
+    }
+
+    override fun inspectSurfaceSnapshot() =
+        com.example.ui.components.ExoSurfaceSnapshot(
+            surfaceViewClass = "TextureView",
+            textureAvailable = true,
+            hasSurfaceTexture = true,
+        )
+
+    override fun attachWindowObserver(
+        onAttachStateChanged: (Boolean, com.example.ui.components.ExoSurfaceSnapshot) -> Unit,
+    ): () -> Unit {
+        attachObserver = onAttachStateChanged
+        return { attachObserver = null }
+    }
+
+    fun emitAttach(attached: Boolean) {
+        attachObserver?.invoke(attached, inspectSurfaceSnapshot())
     }
 }
 
@@ -887,9 +1339,11 @@ private class FakeMapViewSurfacePort(
 ) : MapViewSurfacePort {
     override val androidView: View = View(context)
     override val viewIdentity: Int = System.identityHashCode(androidView)
+    override val viewClassName: String = "FakeMapView"
     val events = mutableListOf<String>()
     val controllerPort = FakeMapLibreControllerPort(events)
     private val pendingUiPosts = mutableListOf<() -> Unit>()
+    private var windowObserver: ((Boolean, String) -> Unit)? = null
 
     var createCount = 0
     var startCount = 0
@@ -936,6 +1390,15 @@ private class FakeMapViewSurfacePort(
     }
 
     override fun inspectSurfaceInfo(): String = "FakeMapView=1080x900, attached=true, textureAvailable=true"
+
+    override fun attachWindowObserver(onAttachStateChanged: (attached: Boolean, surfaceInfo: String) -> Unit): () -> Unit {
+        windowObserver = onAttachStateChanged
+        return { windowObserver = null }
+    }
+
+    fun emitAttach(attached: Boolean) {
+        windowObserver?.invoke(attached, inspectSurfaceInfo())
+    }
 
     override fun postToUi(action: () -> Unit) {
         pendingUiPosts += action

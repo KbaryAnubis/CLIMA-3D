@@ -102,6 +102,7 @@ fun HomeScreen(
     onHourClick: (Int, HourlyForecastPoint) -> Unit,
     onDayClick: (Int, DailyForecastPoint) -> Unit,
     onMetricClick: (WeatherMetricType) -> Unit,
+    onOpenLocationPicker: () -> Unit = onOpenCities,
 ) {
     val tabSpec = remember { WeatherGlassSpecs.forTab(ClimaTab.HOME) }
     val dark = LocalClimaDarkTheme.current
@@ -125,7 +126,7 @@ fun HomeScreen(
             // 1. V53 Hero (`clima-v36-summary`)
             HomeHeroSection(
                 uiState = uiState,
-                onOpenCities = onOpenCities,
+                onOpenLocationPicker = onOpenLocationPicker,
                 onOpenSettings = onOpenSettings,
                 onRefresh = onRefresh,
             )
@@ -190,7 +191,8 @@ fun HomeScreen(
                             V53PrimaryButton(
                                 text = "Escolher localização",
                                 iconRes = ClimaUiIcons.Pin,
-                                onClick = onOpenCities,
+                                onClick = onOpenLocationPicker,
+                                modifier = Modifier.testTag("home_empty_choose_location_button"),
                             )
                         } else {
                             Text(
@@ -268,7 +270,7 @@ fun HomeScreen(
 @Composable
 private fun HomeHeroSection(
     uiState: ClimaUiState,
-    onOpenCities: () -> Unit,
+    onOpenLocationPicker: () -> Unit,
     onOpenSettings: () -> Unit,
     onRefresh: () -> Unit,
 ) {
@@ -297,7 +299,7 @@ private fun HomeHeroSection(
                     modifier =
                         Modifier
                             .minimumInteractiveComponentSize()
-                            .clickable(onClick = onOpenCities)
+                            .clickable(onClick = onOpenLocationPicker)
                             .padding(horizontal = 13.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),

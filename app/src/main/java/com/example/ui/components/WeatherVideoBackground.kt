@@ -3,6 +3,7 @@ package com.example.ui.components
 import android.content.Context
 import android.net.Uri
 import android.view.LayoutInflater
+import android.view.TextureView
 import android.view.View
 import androidx.annotation.RawRes
 import androidx.compose.runtime.Composable
@@ -20,6 +21,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
@@ -28,12 +30,22 @@ import com.example.R
 import com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics
 import java.util.concurrent.atomic.AtomicBoolean
 
+internal data class ExoSurfaceSnapshot(
+    val surfaceViewClass: String? = null,
+    val textureAvailable: Boolean? = null,
+    val hasSurfaceTexture: Boolean? = null,
+) {
+    fun formatted(): String =
+        "surfaceView=${surfaceViewClass ?: "none"}, textureAvailable=${textureAvailable ?: "unknown"}, hasSurfaceTexture=${hasSurfaceTexture ?: "unknown"}"
+}
+
 internal interface WeatherVideoPlayerBridge {
     val sessionId: String
     val identityHash: Int
     val isReleased: Boolean
     val isIdle: Boolean
 
+    fun setVideoResIdHint(@RawRes resId: Int) {}
     fun setMediaItem(uri: Uri)
     fun setVolume(volume: Float)
     fun setRepeatMode(repeatMode: Int)
@@ -53,17 +65,32 @@ internal interface WeatherVideoPlayerBridge {
 internal interface WeatherVideoSurfaceBridge {
     val view: View
     val viewIdentity: Int
+    val viewClassName: String
+        get() = view::class.java.simpleName.ifEmpty { "View" }
+
     fun attachPlayer(player: WeatherVideoPlayerBridge)
     fun isPlayerAttached(player: WeatherVideoPlayerBridge): Boolean
     fun detachPlayer()
+
+    fun inspectSurfaceSnapshot(): ExoSurfaceSnapshot = ExoSurfaceSnapshot()
+
+    fun attachWindowObserver(
+        onAttachStateChanged: (attached: Boolean, snapshot: ExoSurfaceSnapshot) -> Unit,
+    ): () -> Unit = {}
 }
 
 private class RealExoPlayerBridge(
     private val exoPlayer: ExoPlayer,
     override val sessionId: String,
+    initialVideoResId: Int,
 ) : WeatherVideoPlayerBridge {
     private val releasedFlag = AtomicBoolean(false)
-    private var activeListener: Player.Listener? = null
+    private var firstFrameCallback: (() -> Unit)? = null
+    @Volatile
+    private var currentVideoResId: Int = initialVideoResId
+    private var firstFrameLoggedForCurrentItem = false
+    private var lastPlaybackSignature: Pair<Int, Boolean>? = null
+    private var lastSurfaceSize: Pair<Int, Int>? = null
 
     override val identityHash: Int
         get() = System.identityHashCode(exoPlayer)
@@ -74,8 +101,73 @@ private class RealExoPlayerBridge(
     override val isIdle: Boolean
         get() = !releasedFlag.get() && exoPlayer.playbackState == Player.STATE_IDLE
 
+    private val lifecycleDiagnosticListener =
+        object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (releasedFlag.get()) return
+                val isPlayingNow = exoPlayer.isPlaying
+                val signature = playbackState to isPlayingNow
+                if (lastPlaybackSignature != signature) {
+                    lastPlaybackSignature = signature
+                    ClimaGraphicsLifecycleDiagnostics.logExoPlaybackMilestone(
+                        sessionId = sessionId,
+                        playerIdentity = identityHash,
+                        playbackState = playbackStateName(playbackState),
+                        isPlaying = isPlayingNow,
+                        videoResId = currentVideoResId,
+                    )
+                }
+            }
+
+            override fun onSurfaceSizeChanged(width: Int, height: Int) {
+                if (releasedFlag.get()) return
+                val nextSize = width to height
+                if (lastSurfaceSize != nextSize) {
+                    lastSurfaceSize = nextSize
+                    ClimaGraphicsLifecycleDiagnostics.logExoSurfaceSizeChanged(
+                        sessionId = sessionId,
+                        playerIdentity = identityHash,
+                        width = width,
+                        height = height,
+                    )
+                }
+            }
+
+            override fun onRenderedFirstFrame() {
+                if (releasedFlag.get()) return
+                if (!firstFrameLoggedForCurrentItem) {
+                    firstFrameLoggedForCurrentItem = true
+                    ClimaGraphicsLifecycleDiagnostics.logExoFirstFrame(
+                        sessionId = sessionId,
+                        playerIdentity = identityHash,
+                        videoResId = currentVideoResId,
+                    )
+                }
+                firstFrameCallback?.invoke()
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                if (releasedFlag.get()) return
+                ClimaGraphicsLifecycleDiagnostics.logExoPlayerError(
+                    sessionId = sessionId,
+                    playerIdentity = identityHash,
+                    errorCodeName = error.errorCodeName,
+                    message = error.localizedMessage,
+                )
+            }
+        }
+
+    init {
+        exoPlayer.addListener(lifecycleDiagnosticListener)
+    }
+
+    override fun setVideoResIdHint(resId: Int) {
+        currentVideoResId = resId
+    }
+
     override fun setMediaItem(uri: Uri) {
         if (releasedFlag.get()) return
+        firstFrameLoggedForCurrentItem = false
         exoPlayer.setMediaItem(MediaItem.fromUri(uri))
     }
 
@@ -125,20 +217,7 @@ private class RealExoPlayerBridge(
     }
 
     override fun setFirstFrameListener(listener: (() -> Unit)?) {
-        activeListener?.let { prev ->
-            runCatching { exoPlayer.removeListener(prev) }
-            activeListener = null
-        }
-        if (listener != null && !releasedFlag.get()) {
-            val wrapped =
-                object : Player.Listener {
-                    override fun onRenderedFirstFrame() {
-                        listener()
-                    }
-                }
-            activeListener = wrapped
-            exoPlayer.addListener(wrapped)
-        }
+        firstFrameCallback = listener
     }
 
     override fun attachToPlayerView(playerView: PlayerView) {
@@ -151,10 +230,20 @@ private class RealExoPlayerBridge(
 
     override fun releaseOnce(): Boolean {
         if (!releasedFlag.compareAndSet(false, true)) return false
-        setFirstFrameListener(null)
+        firstFrameCallback = null
+        runCatching { exoPlayer.removeListener(lifecycleDiagnosticListener) }
         exoPlayer.release()
         return true
     }
+
+    private fun playbackStateName(state: Int): String =
+        when (state) {
+            Player.STATE_IDLE -> "IDLE"
+            Player.STATE_BUFFERING -> "BUFFERING"
+            Player.STATE_READY -> "READY"
+            Player.STATE_ENDED -> "ENDED"
+            else -> "UNKNOWN($state)"
+        }
 }
 
 private class RealPlayerViewSurfaceBridge(
@@ -166,6 +255,9 @@ private class RealPlayerViewSurfaceBridge(
     override val viewIdentity: Int
         get() = System.identityHashCode(playerView)
 
+    override val viewClassName: String
+        get() = playerView::class.java.simpleName.ifEmpty { "PlayerView" }
+
     override fun attachPlayer(player: WeatherVideoPlayerBridge) {
         player.attachToPlayerView(playerView)
     }
@@ -175,6 +267,38 @@ private class RealPlayerViewSurfaceBridge(
 
     override fun detachPlayer() {
         playerView.player = null
+    }
+
+    override fun inspectSurfaceSnapshot(): ExoSurfaceSnapshot {
+        val surface = runCatching { playerView.videoSurfaceView }.getOrNull()
+        val textureView = surface as? TextureView
+        return ExoSurfaceSnapshot(
+            surfaceViewClass = surface?.javaClass?.simpleName,
+            textureAvailable = textureView?.isAvailable,
+            hasSurfaceTexture = textureView?.let { it.surfaceTexture != null },
+        )
+    }
+
+    override fun attachWindowObserver(
+        onAttachStateChanged: (attached: Boolean, snapshot: ExoSurfaceSnapshot) -> Unit,
+    ): () -> Unit {
+        val listener =
+            object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    onAttachStateChanged(true, inspectSurfaceSnapshot())
+                }
+
+                override fun onViewDetachedFromWindow(v: View) {
+                    onAttachStateChanged(false, inspectSurfaceSnapshot())
+                }
+            }
+        playerView.addOnAttachStateChangeListener(listener)
+        if (playerView.isAttachedToWindow) {
+            onAttachStateChanged(true, inspectSurfaceSnapshot())
+        }
+        return {
+            playerView.removeOnAttachStateChangeListener(listener)
+        }
     }
 }
 
@@ -233,6 +357,7 @@ internal fun WeatherVideoBackgroundImpl(
                                 playWhenReady = isPlaying
                             },
                         sessionId = sessionId,
+                        initialVideoResId = videoResId,
                     )
             ClimaGraphicsLifecycleDiagnostics.logExoPlayerCreated(
                 sessionId = created.sessionId,
@@ -243,6 +368,7 @@ internal fun WeatherVideoBackgroundImpl(
         }
 
     var surfaceBridgeRef by remember { mutableStateOf<WeatherVideoSurfaceBridge?>(null) }
+    var detachWindowObserverRef by remember { mutableStateOf<(() -> Unit)?>(null) }
     var appliedVideoResId by remember(playerHandle) { mutableStateOf<Int?>(null) }
     var appliedSpeed by remember(playerHandle) { mutableStateOf<Float?>(null) }
     var lastAppliedPlayState by remember(playerHandle) { mutableStateOf<Boolean?>(null) }
@@ -253,6 +379,7 @@ internal fun WeatherVideoBackgroundImpl(
         if (appliedVideoResId != null) {
             playerHandle.stop()
         }
+        playerHandle.setVideoResIdHint(videoResId)
         playerHandle.setMediaItem(uri)
         playerHandle.setVolume(0f)
         playerHandle.setRepeatMode(Player.REPEAT_MODE_ONE)
@@ -328,6 +455,8 @@ internal fun WeatherVideoBackgroundImpl(
         }
         onDispose {
             playerHandle.setFirstFrameListener(null)
+            detachWindowObserverRef?.invoke()
+            detachWindowObserverRef = null
             surfaceBridgeRef?.let { bridge ->
                 bridge.detachPlayer()
                 ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceCleared(
@@ -359,10 +488,26 @@ internal fun WeatherVideoBackgroundImpl(
                     )
             bridge.attachPlayer(playerHandle)
             surfaceBridgeRef = bridge
+            detachWindowObserverRef?.invoke()
+            detachWindowObserverRef =
+                bridge.attachWindowObserver { attached, snapshot ->
+                    ClimaGraphicsLifecycleDiagnostics.logExoViewAttachState(
+                        sessionId = playerHandle.sessionId,
+                        playerIdentity = playerHandle.identityHash,
+                        viewClass = bridge.viewClassName,
+                        viewIdentity = bridge.viewIdentity,
+                        attached = attached,
+                        surfaceViewClass = snapshot.surfaceViewClass,
+                        textureAvailable = snapshot.textureAvailable,
+                        hasSurfaceTexture = snapshot.hasSurfaceTexture,
+                    )
+                }
             ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceAttached(
                 sessionId = playerHandle.sessionId,
                 playerIdentity = playerHandle.identityHash,
                 viewIdentity = bridge.viewIdentity,
+                viewClass = bridge.viewClassName,
+                surfaceInfo = bridge.inspectSurfaceSnapshot().formatted(),
             )
             bridge.view
         },
@@ -374,10 +519,14 @@ internal fun WeatherVideoBackgroundImpl(
                     sessionId = playerHandle.sessionId,
                     playerIdentity = playerHandle.identityHash,
                     viewIdentity = bridge.viewIdentity,
+                    viewClass = bridge.viewClassName,
+                    surfaceInfo = bridge.inspectSurfaceSnapshot().formatted(),
                 )
             }
         },
         onRelease = {
+            detachWindowObserverRef?.invoke()
+            detachWindowObserverRef = null
             val bridge = surfaceBridgeRef
             if (bridge != null) {
                 bridge.detachPlayer()

@@ -23,6 +23,7 @@ import com.example.data.model.WeatherResult
 import com.example.data.model.WindSpeedUnit
 import com.example.maps.CityMapCoordinate
 import com.example.maps.CityMapUiState
+import com.example.maps.LocationPermissionCoordinator
 import com.example.maps.LocationPermissionSnapshot
 import com.example.maps.LocationPermissionState
 import com.example.maps.LocationPrecisionLevel
@@ -35,6 +36,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -61,10 +63,15 @@ class ClimaMainViewModel(
     private var refreshJob: Job? = null
     private var citiesRefreshJob: Job? = null
     private var searchJob: Job? = null
+    private var pickerSearchJob: Job? = null
+    private var pickerActivationJob: Job? = null
     private var radarPlaybackJob: Job? = null
     private var toastJob: Job? = null
     private var initialLocationSeeded = false
     private var lastLoadedLocationId: Long? = null
+    private var pickerSearchSequence: Long = 0L
+    private var pickerGpsRequestSeq: Long = 0L
+    private var lastCompletedPickerQuery: String? = null
 
     init {
         observePreferences()
@@ -701,8 +708,380 @@ class ClimaMainViewModel(
         _uiState.update { it.copy(activeModal = ClimaActiveModal.PressureInfo) }
     }
 
+    fun openLocationPickerModal() {
+        pickerSearchJob?.cancel()
+        pickerSearchJob = null
+        pickerSearchSequence++
+        pickerGpsRequestSeq++
+        lastCompletedPickerQuery = null
+        ClimaGraphicsLifecycleDiagnostics.logModalLifecycle("LocationPicker", "OPEN")
+        _uiState.update {
+            it.copy(
+                activeModal = ClimaActiveModal.LocationPicker,
+                locationPickerState = LocationPickerUiState(),
+            )
+        }
+        hydrateCachedSummariesForSavedLocations(_uiState.value.savedLocations)
+    }
+
+    fun closeLocationPickerModal() {
+        pickerSearchJob?.cancel()
+        pickerSearchJob = null
+        pickerSearchSequence++
+        pickerGpsRequestSeq++
+        lastCompletedPickerQuery = null
+        ClimaGraphicsLifecycleDiagnostics.logModalLifecycle("LocationPicker", "CLOSE")
+        _uiState.update {
+            it.copy(
+                activeModal =
+                    if (it.activeModal == ClimaActiveModal.LocationPicker) {
+                        ClimaActiveModal.None
+                    } else {
+                        it.activeModal
+                    },
+                locationPickerState = LocationPickerUiState(),
+            )
+        }
+    }
+
     fun closeModal() {
+        if (_uiState.value.activeModal == ClimaActiveModal.LocationPicker) {
+            closeLocationPickerModal()
+            return
+        }
         _uiState.update { it.copy(activeModal = ClimaActiveModal.None) }
+    }
+
+    // --- Home Quick Location Picker Actions ---
+
+    fun updateLocationPickerSearchQuery(query: String) {
+        val trimmed = query.trim()
+        val currentPicker = _uiState.value.locationPickerState
+        if (
+            trimmed.length >= 2 &&
+            trimmed == lastCompletedPickerQuery &&
+            !currentPicker.isSearching &&
+            currentPicker.hasSearchedCurrentQuery &&
+            currentPicker.searchErrorMessage == null
+        ) {
+            _uiState.update { state ->
+                state.copy(locationPickerState = state.locationPickerState.copy(searchQuery = query))
+            }
+            return
+        }
+
+        pickerSearchJob?.cancel()
+        pickerSearchJob = null
+        val seq = ++pickerSearchSequence
+        if (trimmed != lastCompletedPickerQuery) {
+            lastCompletedPickerQuery = null
+        }
+
+        if (trimmed.length < 2) {
+            _uiState.update { state ->
+                state.copy(
+                    locationPickerState =
+                        state.locationPickerState.copy(
+                            searchQuery = query,
+                            searchResults = emptyList(),
+                            isSearching = false,
+                            searchErrorMessage = null,
+                            hasSearchedCurrentQuery = false,
+                        ),
+                )
+            }
+            return
+        }
+
+        _uiState.update { state ->
+            state.copy(
+                locationPickerState =
+                    state.locationPickerState.copy(
+                        searchQuery = query,
+                        searchErrorMessage = null,
+                        hasSearchedCurrentQuery = false,
+                    ),
+            )
+        }
+
+        pickerSearchJob =
+            viewModelScope.launch {
+                delay(PICKER_SEARCH_DEBOUNCE_MS)
+                executePickerCitySearch(trimmed, seq)
+            }
+    }
+
+    fun submitLocationPickerSearch() {
+        val currentPicker = _uiState.value.locationPickerState
+        val trimmed = currentPicker.searchQuery.trim()
+        if (trimmed.length < 2) return
+        if (
+            trimmed == lastCompletedPickerQuery &&
+            !currentPicker.isSearching &&
+            currentPicker.hasSearchedCurrentQuery &&
+            currentPicker.searchErrorMessage == null
+        ) {
+            return
+        }
+        pickerSearchJob?.cancel()
+        val seq = ++pickerSearchSequence
+        pickerSearchJob = viewModelScope.launch { executePickerCitySearch(trimmed, seq) }
+    }
+
+    private suspend fun executePickerCitySearch(
+        query: String,
+        requestSeq: Long,
+    ) {
+        if (!currentCoroutineContext().isActive || requestSeq != pickerSearchSequence) return
+        _uiState.update { state ->
+            state.copy(
+                locationPickerState =
+                    state.locationPickerState.copy(
+                        isSearching = true,
+                        searchErrorMessage = null,
+                    ),
+            )
+        }
+        when (val result = container.cityLocationRepository.searchCities(query = query)) {
+            is WeatherResult.Success -> {
+                if (!currentCoroutineContext().isActive ||
+                    requestSeq != pickerSearchSequence ||
+                    _uiState.value.activeModal != ClimaActiveModal.LocationPicker
+                ) {
+                    return
+                }
+                lastCompletedPickerQuery = query
+                _uiState.update { state ->
+                    state.copy(
+                        locationPickerState =
+                            state.locationPickerState.copy(
+                                isSearching = false,
+                                searchResults = result.data,
+                                searchErrorMessage = null,
+                                hasSearchedCurrentQuery = true,
+                            ),
+                    )
+                }
+            }
+
+            is WeatherResult.Failure -> {
+                if (!currentCoroutineContext().isActive ||
+                    requestSeq != pickerSearchSequence ||
+                    _uiState.value.activeModal != ClimaActiveModal.LocationPicker
+                ) {
+                    return
+                }
+                lastCompletedPickerQuery = null
+                _uiState.update { state ->
+                    state.copy(
+                        locationPickerState =
+                            state.locationPickerState.copy(
+                                isSearching = false,
+                                searchResults = emptyList(),
+                                searchErrorMessage = result.error.userMessagePt,
+                                hasSearchedCurrentQuery = true,
+                            ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun beginLocationPickerGpsLookup(): Long {
+        val seq = ++pickerGpsRequestSeq
+        _uiState.update { state ->
+            state.copy(
+                locationPickerState =
+                    state.locationPickerState.copy(
+                        isLocatingUser = true,
+                        gpsErrorMessage = null,
+                        pendingGpsActionAfterPermission = false,
+                    ),
+            )
+        }
+        return seq
+    }
+
+    fun markPendingPickerGpsAfterPermission(pending: Boolean) {
+        _uiState.update { state ->
+            state.copy(
+                locationPickerState =
+                    state.locationPickerState.copy(
+                        pendingGpsActionAfterPermission = pending,
+                        gpsErrorMessage = if (pending) null else state.locationPickerState.gpsErrorMessage,
+                    ),
+            )
+        }
+    }
+
+    fun finishLocationPickerGpsLookupWithError(
+        message: String,
+        requestSeq: Long? = null,
+    ) {
+        if (requestSeq != null && requestSeq != pickerGpsRequestSeq) return
+        _uiState.update { state ->
+            state.copy(
+                locationPickerState =
+                    state.locationPickerState.copy(
+                        isLocatingUser = false,
+                        gpsErrorMessage = message,
+                        pendingGpsActionAfterPermission = false,
+                    ),
+            )
+        }
+    }
+
+    fun activateCurrentGpsCoordinatesFromPicker(
+        coordinate: CityMapCoordinate,
+        requestSeq: Long? = null,
+    ) {
+        if (requestSeq != null && requestSeq != pickerGpsRequestSeq) return
+        if (!LocationPermissionCoordinator.isValidCoordinate(coordinate.latitude, coordinate.longitude)) {
+            finishLocationPickerGpsLookupWithError(
+                message = "Coordenadas de localização inválidas recebidas do aparelho.",
+                requestSeq = requestSeq,
+            )
+            return
+        }
+        pickerActivationJob?.cancel()
+        pickerActivationJob =
+            viewModelScope.launch {
+                val saved =
+                    container.cityLocationRepository.upsertCurrentLocation(
+                        coordinate = coordinate,
+                        name = "Minha localização",
+                        setAsPrimary = true,
+                    )
+                activateSavedLocationOnHome(
+                    location = saved,
+                    toastMessage = "Localização atual ativada",
+                    gpsCoordinateForMapState = coordinate,
+                )
+            }
+    }
+
+    fun selectSavedLocationFromPicker(location: SavedLocation) {
+        pickerActivationJob?.cancel()
+        pickerActivationJob =
+            viewModelScope.launch {
+                container.cityLocationRepository.setPrimaryLocation(location.id)
+                activateSavedLocationOnHome(
+                    location = location.copy(isPrimary = true),
+                    toastMessage = "Localização ativa: ${location.name}",
+                )
+            }
+    }
+
+    fun selectSearchResultFromPicker(result: CitySearchResult) {
+        pickerActivationJob?.cancel()
+        pickerActivationJob =
+            viewModelScope.launch {
+                val saved =
+                    container.cityLocationRepository.saveCityFromSearch(
+                        result = result,
+                        setAsPrimary = true,
+                    )
+                activateSavedLocationOnHome(
+                    location = saved,
+                    toastMessage = "Localização ativa: ${saved.name}",
+                )
+            }
+    }
+
+    private suspend fun activateSavedLocationOnHome(
+        location: SavedLocation,
+        toastMessage: String,
+        gpsCoordinateForMapState: CityMapCoordinate? = null,
+    ) {
+        pickerSearchJob?.cancel()
+        pickerSearchJob = null
+        pickerSearchSequence++
+        pickerGpsRequestSeq++
+        lastCompletedPickerQuery = null
+
+        lastLoadedLocationId = location.id
+        container.preferencesRepository.setSelectedLocationId(location.id)
+
+        // Consult Room cache immediately so cached forecast/air quality renders right away (including offline)
+        val cachedForecast =
+            container.weatherRepository.getForecast(
+                latitude = location.latitude,
+                longitude = location.longitude,
+                policy = CachePolicy.CacheOnly,
+            ) as? WeatherResult.Success
+        val cachedAir =
+            container.airQualityRepository.getAirQuality(
+                latitude = location.latitude,
+                longitude = location.longitude,
+                policy = CachePolicy.CacheOnly,
+            ) as? WeatherResult.Success
+        val cachedAlerts =
+            if (cachedForecast != null) {
+                withContext(cpuDispatcher) {
+                    InAppWeatherAlertEngine.evaluateAlerts(
+                        locationName = location.name,
+                        forecast = cachedForecast.data,
+                        airQuality = cachedAir?.data,
+                    )
+                }
+            } else {
+                emptyList()
+            }
+
+        ClimaGraphicsLifecycleDiagnostics.logModalLifecycle(
+            modalName = "LocationPicker",
+            action = "SELECTED locationId=${location.id}",
+        )
+
+        _uiState.update { state ->
+            val updatedMapState =
+                (if (gpsCoordinateForMapState != null) {
+                    state.cityMapState.withCurrentLocation(
+                        coordinate = gpsCoordinateForMapState,
+                        label = location.name,
+                        precision = state.locationPermissionSnapshot.precisionLevel,
+                    )
+                } else {
+                    state.cityMapState.selectMarkerAt(
+                        coordinate = location.toCityMapCoordinate(),
+                        label = location.name,
+                        moveCameraToMarker = true,
+                    )
+                })
+            val updatedSummaries =
+                if (cachedForecast != null) {
+                    state.savedLocationSummaries +
+                        (location.id to
+                            SavedLocationWeatherSummary(
+                                temperatureC = cachedForecast.data.current.temperatureC,
+                                descriptionPt = cachedForecast.data.current.weatherDescriptionPt,
+                                condition = cachedForecast.data.current.visualCondition,
+                                isFromCache = true,
+                            ))
+                } else {
+                    state.savedLocationSummaries
+                }
+            state.copy(
+                activeTab = ClimaTab.HOME,
+                activeLocation = location,
+                activeModal = ClimaActiveModal.None,
+                locationPickerState = LocationPickerUiState(),
+                cityMapState = updatedMapState,
+                forecast = cachedForecast?.data,
+                forecastOrigin = cachedForecast?.origin,
+                forecastFetchedAtMillis = cachedForecast?.fetchedAtEpochMillis,
+                forecastErrorMessage = null,
+                forecastStaleNotice = cachedForecast?.staleReason?.userMessagePt,
+                airQuality = cachedAir?.data,
+                airQualityOrigin = cachedAir?.origin,
+                airQualityErrorMessage = null,
+                alerts = cachedAlerts,
+                savedLocationSummaries = updatedSummaries,
+            )
+        }
+
+        refreshActiveLocation(policy = CachePolicy.NetworkFirst)
+        showToast(toastMessage)
     }
 
     // --- Radar Controls ---
@@ -1062,6 +1441,8 @@ class ClimaMainViewModel(
 
     override fun onCleared() {
         stopRadarPlayback()
+        pickerSearchJob?.cancel()
+        pickerActivationJob?.cancel()
         super.onCleared()
     }
 
@@ -1080,6 +1461,7 @@ class ClimaMainViewModel(
 
     companion object {
         private const val RADAR_FRAME_INTERVAL_MS = 650L
+        private const val PICKER_SEARCH_DEBOUNCE_MS = 280L
         private const val DEFAULT_SAO_PAULO_PROVIDER_ID = 3448439L
     }
 }

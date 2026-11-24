@@ -53,6 +53,7 @@ internal interface MapLibreControllerPort {
     fun setStyle(request: MapStyleSpecRequest, onLoaded: (MapStylePort) -> Unit)
     fun setOnMapClick(listener: (CityMapCoordinate) -> Unit)
     fun setOnCameraIdle(listener: (CityMapCoordinate, Double) -> Unit)
+    fun clearMapListeners() {}
     fun syncLocationComponent(context: Context, style: MapStylePort): LocationComponentSyncResult
 }
 
@@ -70,6 +71,8 @@ internal data class MapSurfaceCallbacks(
 internal interface MapViewSurfacePort {
     val androidView: View
     val viewIdentity: Int
+    val viewClassName: String
+        get() = androidView.javaClass.simpleName
     fun onCreate()
     fun onStart()
     fun onResume()
@@ -79,6 +82,7 @@ internal interface MapViewSurfacePort {
     fun onLowMemory()
     fun inspectSurfaceInfo(): String
     fun postToUi(action: () -> Unit)
+    fun attachWindowObserver(onAttachStateChanged: (Boolean, String) -> Unit): () -> Unit = { }
     fun attachListeners(callbacks: MapSurfaceCallbacks): () -> Unit
     fun getMapAsync(onReady: (MapLibreControllerPort) -> Unit)
 }
@@ -137,6 +141,9 @@ private class RealMapStylePort(
 private class RealMapLibreControllerPort(
     private val map: MapLibreMap,
 ) : MapLibreControllerPort {
+    private var activeClickListener: MapLibreMap.OnMapClickListener? = null
+    private var activeCameraIdleListener: MapLibreMap.OnCameraIdleListener? = null
+
     override fun configureUiSettings() {
         map.uiSettings.apply {
             isZoomGesturesEnabled = true
@@ -187,17 +194,30 @@ private class RealMapLibreControllerPort(
     }
 
     override fun setOnMapClick(listener: (CityMapCoordinate) -> Unit) {
-        map.addOnMapClickListener { point ->
+        activeClickListener?.let { runCatching { map.removeOnMapClickListener(it) } }
+        val wrapped = MapLibreMap.OnMapClickListener { point ->
             listener(CityMapCoordinate(point.latitude, point.longitude))
             true
         }
+        activeClickListener = wrapped
+        map.addOnMapClickListener(wrapped)
     }
 
     override fun setOnCameraIdle(listener: (CityMapCoordinate, Double) -> Unit) {
-        map.addOnCameraIdleListener {
-            val target = map.cameraPosition.target ?: return@addOnCameraIdleListener
+        activeCameraIdleListener?.let { runCatching { map.removeOnCameraIdleListener(it) } }
+        val wrapped = MapLibreMap.OnCameraIdleListener {
+            val target = map.cameraPosition.target ?: return@OnCameraIdleListener
             listener(CityMapCoordinate(target.latitude, target.longitude), map.cameraPosition.zoom)
         }
+        activeCameraIdleListener = wrapped
+        map.addOnCameraIdleListener(wrapped)
+    }
+
+    override fun clearMapListeners() {
+        activeClickListener?.let { runCatching { map.removeOnMapClickListener(it) } }
+        activeClickListener = null
+        activeCameraIdleListener?.let { runCatching { map.removeOnCameraIdleListener(it) } }
+        activeCameraIdleListener = null
     }
 
     override fun syncLocationComponent(context: Context, style: MapStylePort): LocationComponentSyncResult {
@@ -238,12 +258,32 @@ internal class RealMapViewSurfacePort(
 
     override fun inspectSurfaceInfo(): String {
         val renderView = runCatching { mapView.renderView }.getOrNull()
-        val textureAvailable = (renderView as? TextureView)?.isAvailable
-        return "MapView=${mapView.width}x${mapView.height}, attached=${mapView.isAttachedToWindow}, textureAvailable=$textureAvailable"
+        val renderViewClass = renderView?.javaClass?.simpleName ?: "none"
+        val textureView = renderView as? TextureView
+        val textureAvailable = textureView?.isAvailable
+        val hasSurfaceTexture = textureView?.surfaceTexture != null
+        return "MapView=${mapView.width}x${mapView.height}, attached=${mapView.isAttachedToWindow}, renderView=$renderViewClass, textureAvailable=$textureAvailable, hasSurfaceTexture=$hasSurfaceTexture"
     }
 
     override fun postToUi(action: () -> Unit) {
         mapView.post(action)
+    }
+
+    override fun attachWindowObserver(onAttachStateChanged: (Boolean, String) -> Unit): () -> Unit {
+        val listener =
+            object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    onAttachStateChanged(true, inspectSurfaceInfo())
+                }
+
+                override fun onViewDetachedFromWindow(v: View) {
+                    onAttachStateChanged(false, inspectSurfaceInfo())
+                }
+            }
+        mapView.addOnAttachStateChangeListener(listener)
+        return {
+            runCatching { mapView.removeOnAttachStateChangeListener(listener) }
+        }
     }
 
     override fun attachListeners(callbacks: MapSurfaceCallbacks): () -> Unit {
@@ -309,18 +349,24 @@ internal class MapViewSessionHandle(
     val surfacePort: MapViewSurfacePort,
     val controller: MapViewLifecycleController,
     private val onDetachListeners: () -> Unit,
+    private val onDetachWindowObserver: () -> Unit = {},
     private val onCancelTransitions: () -> Unit,
 ) {
     private val listenersDetached = AtomicBoolean(false)
+    private val windowObserverDetached = AtomicBoolean(false)
+    private val pausedAndStopped = AtomicBoolean(false)
     private val destroyed = AtomicBoolean(false)
 
     fun pauseAndStopBeforeDetach(stage: String) {
-        com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics.logMapViewDisposeRequested(
-            screen = screenName,
-            sessionId = sessionId,
-            viewIdentity = surfacePort.viewIdentity,
-            stage = stage,
-        )
+        if (pausedAndStopped.compareAndSet(false, true) || stage != "release") {
+            com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics.logMapViewDisposeRequested(
+                screen = screenName,
+                sessionId = sessionId,
+                viewIdentity = surfacePort.viewIdentity,
+                stage = stage,
+                surfaceInfo = runCatching { surfacePort.inspectSurfaceInfo() }.getOrNull(),
+            )
+        }
         runCatching { onCancelTransitions() }
         if (listenersDetached.compareAndSet(false, true)) {
             runCatching { onDetachListeners() }
@@ -330,12 +376,17 @@ internal class MapViewSessionHandle(
 
     fun destroyOnceAfterDetach() {
         pauseAndStopBeforeDetach("release")
+        if (windowObserverDetached.compareAndSet(false, true)) {
+            runCatching { onDetachWindowObserver() }
+        }
         if (destroyed.compareAndSet(false, true)) {
+            val surfaceSnapshot = runCatching { surfacePort.inspectSurfaceInfo() }.getOrNull()
             controller.destroy()
             com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics.logMapViewDestroyed(
                 screen = screenName,
                 sessionId = sessionId,
                 viewIdentity = surfacePort.viewIdentity,
+                surfaceInfo = surfaceSnapshot,
             )
         }
     }

@@ -122,4 +122,20 @@
     <string name="alerts_no_push_notice">Não há notificações push, alertas na barra de status nem integração com a tela de bloqueio.</string>
     <string name="action_back">Voltar</string>
     <string name="action_close">Fechar</string>
+
+    <!-- Home Quick Location Picker Modal -->
+    <string name="location_picker_title">Selecionar localização</string>
+    <string name="location_picker_subtitle">Escolha rapidamente sem sair da tela inicial.</string>
+    <string name="location_picker_use_my_location">Usar minha localização</string>
+    <string name="location_picker_locating">Obtendo localização do aparelho…</string>
+    <string name="location_picker_search_label">Pesquisar cidade ou localidade</string>
+    <string name="location_picker_search_placeholder">Buscar cidade (ex.: Teresópolis, Curitiba…)</string>
+    <string name="location_picker_search_results_title">Resultados da pesquisa</string>
+    <string name="location_picker_saved_title">Localizações salvas</string>
+    <string name="location_picker_active_badge">Ativa</string>
+    <string name="location_picker_grant_permission">Permitir localização</string>
+    <string name="location_picker_open_settings">Abrir configurações</string>
+    <string name="location_picker_retry">Tentar novamente</string>
+    <string name="location_picker_empty_results">Nenhuma localidade encontrada para essa busca.</string>
+    <string name="location_picker_no_saved">Nenhuma localização salva ainda. Pesquise uma cidade acima.</string>
 </resources>

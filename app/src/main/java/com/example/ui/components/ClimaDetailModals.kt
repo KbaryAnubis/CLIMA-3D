@@ -56,7 +56,7 @@ fun ClimaDetailModalHost(
     onOpenPressureInfo: () -> Unit,
 ) {
     val modal = uiState.activeModal
-    if (modal == ClimaActiveModal.None) return
+    if (modal == ClimaActiveModal.None || modal == ClimaActiveModal.LocationPicker) return
 
     val dark = LocalClimaDarkTheme.current
     Dialog(
@@ -83,7 +83,8 @@ fun ClimaDetailModalHost(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 when (modal) {
-                    ClimaActiveModal.None -> Unit
+                    ClimaActiveModal.None,
+                    ClimaActiveModal.LocationPicker -> Unit
                     is ClimaActiveModal.HourDetail ->
                         HourDetailModalContent(
                             uiState = uiState,
