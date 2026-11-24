@@ -25,6 +25,8 @@ import com.example.maps.OpenStreetMapTileConfig
 import com.example.maps.RadarBaseStyle
 import com.example.ui.theme.ClimaTab
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -47,6 +49,7 @@ class ClimaMainViewModel(
     val uiState: StateFlow<ClimaUiState> = _uiState.asStateFlow()
 
     private var refreshJob: Job? = null
+    private var citiesRefreshJob: Job? = null
     private var searchJob: Job? = null
     private var radarPlaybackJob: Job? = null
     private var toastJob: Job? = null
@@ -204,9 +207,24 @@ class ClimaMainViewModel(
 
     /**
      * Refreshes forecast, air quality, and radar timeline for the active location concurrently.
+     * Reused across app open, foreground resume, and Home/Radar pull-to-refresh gestures.
      */
-    fun refreshActiveLocation(policy: CachePolicy = CachePolicy.NetworkFirst) {
-        val location = _uiState.value.activeLocation ?: return
+    fun refreshActiveLocation(
+        policy: CachePolicy = CachePolicy.NetworkFirst,
+        preventDuplicate: Boolean = false,
+        preserveRadarPlayback: Boolean = true,
+        showFeedbackOnFailure: Boolean = false,
+    ) {
+        if (preventDuplicate && (refreshJob?.isActive == true || _uiState.value.isRefreshing)) {
+            return
+        }
+        val location = _uiState.value.activeLocation
+        if (location == null) {
+            if (showFeedbackOnFailure) {
+                showToast("Nenhuma localização selecionada para atualizar.")
+            }
+            return
+        }
         refreshJob?.cancel()
         refreshJob =
             viewModelScope.launch {
@@ -218,121 +236,312 @@ class ClimaMainViewModel(
                     )
                 }
 
-                val prefs = _uiState.value.preferences
-                val report =
-                    container.refreshLocationOnAppOpen(
-                        latitude = location.latitude,
-                        longitude = location.longitude,
-                        displayTimezoneId = location.timezoneId,
-                        displayUtcOffsetSeconds = _uiState.value.forecast?.utcOffsetSeconds ?: 0,
-                        timeFormat = prefs.timeFormat,
-                        policy = policy,
-                    )
-
-                _uiState.update { state ->
-                    val newForecast =
-                        when (val res = report.forecast) {
-                            is WeatherResult.Success -> res.data
-                            is WeatherResult.Failure -> state.forecast
-                        }
-                    val newForecastOrigin =
-                        when (val res = report.forecast) {
-                            is WeatherResult.Success -> res.origin
-                            is WeatherResult.Failure -> state.forecastOrigin
-                        }
-                    val newForecastFetchedAt =
-                        when (val res = report.forecast) {
-                            is WeatherResult.Success -> res.fetchedAtEpochMillis
-                            is WeatherResult.Failure -> state.forecastFetchedAtMillis
-                        }
-                    val newForecastError =
-                        when (val res = report.forecast) {
-                            is WeatherResult.Success -> null
-                            is WeatherResult.Failure -> res.error.userMessagePt
-                        }
-                    val newForecastStaleNotice =
-                        when (val res = report.forecast) {
-                            is WeatherResult.Success -> res.staleReason?.userMessagePt
-                            is WeatherResult.Failure -> null
-                        }
-
-                    val newAirQuality =
-                        when (val res = report.airQuality) {
-                            is WeatherResult.Success -> res.data
-                            is WeatherResult.Failure -> state.airQuality
-                        }
-                    val newAirQualityOrigin =
-                        when (val res = report.airQuality) {
-                            is WeatherResult.Success -> res.origin
-                            is WeatherResult.Failure -> state.airQualityOrigin
-                        }
-                    val newAirQualityError =
-                        when (val res = report.airQuality) {
-                            is WeatherResult.Success -> null
-                            is WeatherResult.Failure -> res.error.userMessagePt
-                        }
-
-                    val newRadar =
-                        when (val res = report.radar) {
-                            is WeatherResult.Success -> res.data
-                            is WeatherResult.Failure -> state.radarTimeline
-                        }
-                    val newRadarOrigin =
-                        when (val res = report.radar) {
-                            is WeatherResult.Success -> res.origin
-                            is WeatherResult.Failure -> state.radarOrigin
-                        }
-                    val newRadarError =
-                        when (val res = report.radar) {
-                            is WeatherResult.Success -> null
-                            is WeatherResult.Failure -> res.error.userMessagePt
-                        }
-
-                    val evaluatedAlerts =
-                        InAppWeatherAlertEngine.evaluateAlerts(
-                            locationName = location.name,
-                            forecast = newForecast,
-                            airQuality = newAirQuality,
+                try {
+                    val prefs = _uiState.value.preferences
+                    val report =
+                        container.refreshLocationOnAppOpen(
+                            latitude = location.latitude,
+                            longitude = location.longitude,
+                            displayTimezoneId = location.timezoneId,
+                            displayUtcOffsetSeconds = _uiState.value.forecast?.utcOffsetSeconds ?: 0,
+                            timeFormat = prefs.timeFormat,
+                            policy = policy,
                         )
 
-                    val updatedSummaries =
-                        if (newForecast != null) {
-                            state.savedLocationSummaries +
-                                (location.id to
-                                    SavedLocationWeatherSummary(
-                                        temperatureC = newForecast.current.temperatureC,
-                                        descriptionPt = newForecast.current.weatherDescriptionPt,
-                                        condition = newForecast.current.visualCondition,
-                                        isFromCache = newForecastOrigin == DataSourceOrigin.LOCAL_CACHE,
-                                    ))
-                        } else {
-                            state.savedLocationSummaries
-                        }
+                    _uiState.update { state ->
+                        val newForecast =
+                            when (val res = report.forecast) {
+                                is WeatherResult.Success -> res.data
+                                is WeatherResult.Failure -> state.forecast
+                            }
+                        val newForecastOrigin =
+                            when (val res = report.forecast) {
+                                is WeatherResult.Success -> res.origin
+                                is WeatherResult.Failure -> state.forecastOrigin
+                            }
+                        val newForecastFetchedAt =
+                            when (val res = report.forecast) {
+                                is WeatherResult.Success -> res.fetchedAtEpochMillis
+                                is WeatherResult.Failure -> state.forecastFetchedAtMillis
+                            }
+                        val newForecastError =
+                            when (val res = report.forecast) {
+                                is WeatherResult.Success -> null
+                                is WeatherResult.Failure -> res.error.userMessagePt
+                            }
+                        val newForecastStaleNotice =
+                            when (val res = report.forecast) {
+                                is WeatherResult.Success -> res.staleReason?.userMessagePt
+                                is WeatherResult.Failure -> null
+                            }
 
-                    val latestFrameIndex =
-                        if (newRadar != null && newRadar.frames.isNotEmpty()) {
-                            newRadar.frames.lastIndex
-                        } else {
-                            0
-                        }
+                        val newAirQuality =
+                            when (val res = report.airQuality) {
+                                is WeatherResult.Success -> res.data
+                                is WeatherResult.Failure -> state.airQuality
+                            }
+                        val newAirQualityOrigin =
+                            when (val res = report.airQuality) {
+                                is WeatherResult.Success -> res.origin
+                                is WeatherResult.Failure -> state.airQualityOrigin
+                            }
+                        val newAirQualityError =
+                            when (val res = report.airQuality) {
+                                is WeatherResult.Success -> null
+                                is WeatherResult.Failure -> res.error.userMessagePt
+                            }
 
-                    state.copy(
-                        isRefreshing = false,
-                        forecast = newForecast,
-                        forecastOrigin = newForecastOrigin,
-                        forecastFetchedAtMillis = newForecastFetchedAt,
-                        forecastErrorMessage = newForecastError,
-                        forecastStaleNotice = newForecastStaleNotice,
-                        airQuality = newAirQuality,
-                        airQualityOrigin = newAirQualityOrigin,
-                        airQualityErrorMessage = newAirQualityError,
-                        radarTimeline = newRadar,
-                        radarOrigin = newRadarOrigin,
-                        radarErrorMessage = newRadarError,
-                        radarSelectedFrameIndex = latestFrameIndex,
-                        alerts = evaluatedAlerts,
-                        savedLocationSummaries = updatedSummaries,
-                    )
+                        val newRadar =
+                            when (val res = report.radar) {
+                                is WeatherResult.Success -> res.data
+                                is WeatherResult.Failure -> state.radarTimeline
+                            }
+                        val newRadarOrigin =
+                            when (val res = report.radar) {
+                                is WeatherResult.Success -> res.origin
+                                is WeatherResult.Failure -> state.radarOrigin
+                            }
+                        val newRadarError =
+                            when (val res = report.radar) {
+                                is WeatherResult.Success -> null
+                                is WeatherResult.Failure -> res.error.userMessagePt
+                            }
+
+                        val evaluatedAlerts =
+                            InAppWeatherAlertEngine.evaluateAlerts(
+                                locationName = location.name,
+                                forecast = newForecast,
+                                airQuality = newAirQuality,
+                            )
+
+                        val updatedSummaries =
+                            if (newForecast != null) {
+                                state.savedLocationSummaries +
+                                    (location.id to
+                                        SavedLocationWeatherSummary(
+                                            temperatureC = newForecast.current.temperatureC,
+                                            descriptionPt = newForecast.current.weatherDescriptionPt,
+                                            condition = newForecast.current.visualCondition,
+                                            isFromCache = newForecastOrigin == DataSourceOrigin.LOCAL_CACHE,
+                                        ))
+                            } else {
+                                state.savedLocationSummaries
+                            }
+
+                        val nextFrameIndex =
+                            when {
+                                newRadar == null || newRadar.frames.isEmpty() -> 0
+                                preserveRadarPlayback && state.isRadarPlaying ->
+                                    state.radarSelectedFrameIndex.coerceIn(0, newRadar.frames.lastIndex)
+                                else -> newRadar.frames.lastIndex
+                            }
+
+                        state.copy(
+                            isRefreshing = false,
+                            forecast = newForecast,
+                            forecastOrigin = newForecastOrigin,
+                            forecastFetchedAtMillis = newForecastFetchedAt,
+                            forecastErrorMessage = newForecastError,
+                            forecastStaleNotice = newForecastStaleNotice,
+                            airQuality = newAirQuality,
+                            airQualityOrigin = newAirQualityOrigin,
+                            airQualityErrorMessage = newAirQualityError,
+                            radarTimeline = newRadar,
+                            radarOrigin = newRadarOrigin,
+                            radarErrorMessage = newRadarError,
+                            radarSelectedFrameIndex = nextFrameIndex,
+                            alerts = evaluatedAlerts,
+                            savedLocationSummaries = updatedSummaries,
+                        )
+                    }
+
+                    if (showFeedbackOnFailure) {
+                        val forecastErr =
+                            when (val res = report.forecast) {
+                                is WeatherResult.Failure -> res.error.userMessagePt
+                                is WeatherResult.Success -> res.staleReason?.userMessagePt
+                            }
+                        val radarErr =
+                            when (val res = report.radar) {
+                                is WeatherResult.Failure -> res.error.userMessagePt
+                                is WeatherResult.Success -> res.staleReason?.userMessagePt
+                            }
+                        val airErr =
+                            when (val res = report.airQuality) {
+                                is WeatherResult.Failure -> res.error.userMessagePt
+                                is WeatherResult.Success -> res.staleReason?.userMessagePt
+                            }
+                        val firstError = forecastErr ?: radarErr ?: airErr
+                        if (firstError != null) {
+                            val hasCache = _uiState.value.forecast != null || _uiState.value.radarTimeline != null
+                            val feedback =
+                                when {
+                                    !_uiState.value.isOnline && hasCache ->
+                                        "Sem conexão. Exibindo dados salvos em cache."
+                                    hasCache -> "$firstError Exibindo dados em cache."
+                                    else -> firstError
+                                }
+                            showToast(feedback)
+                        }
+                    }
+                } finally {
+                    _uiState.update { it.copy(isRefreshing = false) }
+                }
+            }
+    }
+
+    /**
+     * Pull-to-Refresh for Home: updates forecast, air quality, and weather data without duplicating in-flight calls.
+     */
+    fun onPullRefreshHome() {
+        refreshActiveLocation(
+            policy = CachePolicy.NetworkFirst,
+            preventDuplicate = true,
+            preserveRadarPlayback = true,
+            showFeedbackOnFailure = true,
+        )
+    }
+
+    /**
+     * Pull-to-Refresh for Radar: updates RainViewer historical frames and weather summary without
+     * reinitializing MapLibre or interrupting active timeline playback.
+     */
+    fun onPullRefreshRadar() {
+        refreshActiveLocation(
+            policy = CachePolicy.NetworkFirst,
+            preventDuplicate = true,
+            preserveRadarPlayback = true,
+            showFeedbackOnFailure = true,
+        )
+    }
+
+    /**
+     * Pull-to-Refresh for Cities: refreshes weather summaries for all saved cities (and active location)
+     * concurrently without reinitializing MapLibre, preserving cache when offline.
+     */
+    fun onPullRefreshCities() {
+        if (citiesRefreshJob?.isActive == true || _uiState.value.isRefreshingCities) {
+            return
+        }
+        val locations = _uiState.value.savedLocations
+        if (locations.isEmpty()) {
+            showToast(
+                if (_uiState.value.isOnline) {
+                    "Nenhuma cidade salva para atualizar."
+                } else {
+                    "Sem conexão com a internet."
+                },
+            )
+            return
+        }
+
+        citiesRefreshJob =
+            viewModelScope.launch {
+                _uiState.update { it.copy(isRefreshingCities = true) }
+                try {
+                    val activeId = _uiState.value.activeLocation?.id
+                    var activeForecastResult: WeatherResult<com.example.data.model.WeatherForecastBundle>? = null
+                    var firstErrorOrStale: String? = null
+                    val updatedSummaries = mutableMapOf<Long, SavedLocationWeatherSummary>()
+
+                    coroutineScope {
+                        val deferredCalls =
+                            locations.map { loc ->
+                                loc to
+                                    async {
+                                        container.weatherRepository.getForecast(
+                                            latitude = loc.latitude,
+                                            longitude = loc.longitude,
+                                            policy = CachePolicy.NetworkFirst,
+                                        )
+                                    }
+                            }
+                        deferredCalls.forEach { (loc, deferred) ->
+                            val result = deferred.await()
+                            if (loc.id == activeId) {
+                                activeForecastResult = result
+                            }
+                            when (result) {
+                                is WeatherResult.Success -> {
+                                    updatedSummaries[loc.id] =
+                                        SavedLocationWeatherSummary(
+                                            temperatureC = result.data.current.temperatureC,
+                                            descriptionPt = result.data.current.weatherDescriptionPt,
+                                            condition = result.data.current.visualCondition,
+                                            isFromCache = result.origin == DataSourceOrigin.LOCAL_CACHE,
+                                        )
+                                    if (firstErrorOrStale == null && result.staleReason != null) {
+                                        firstErrorOrStale = result.staleReason.userMessagePt
+                                    }
+                                }
+                                is WeatherResult.Failure -> {
+                                    if (firstErrorOrStale == null) {
+                                        firstErrorOrStale = result.error.userMessagePt
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    _uiState.update { state ->
+                        val mergedSummaries = state.savedLocationSummaries + updatedSummaries
+                        val activeResult = activeForecastResult
+                        val updatedForecast =
+                            when (activeResult) {
+                                is WeatherResult.Success -> activeResult.data
+                                else -> state.forecast
+                            }
+                        val updatedOrigin =
+                            when (activeResult) {
+                                is WeatherResult.Success -> activeResult.origin
+                                else -> state.forecastOrigin
+                            }
+                        val updatedFetchedAt =
+                            when (activeResult) {
+                                is WeatherResult.Success -> activeResult.fetchedAtEpochMillis
+                                else -> state.forecastFetchedAtMillis
+                            }
+                        val updatedStaleNotice =
+                            when (activeResult) {
+                                is WeatherResult.Success -> activeResult.staleReason?.userMessagePt
+                                else -> state.forecastStaleNotice
+                            }
+                        val evaluatedAlerts =
+                            if (state.activeLocation != null && updatedForecast != null) {
+                                InAppWeatherAlertEngine.evaluateAlerts(
+                                    locationName = state.activeLocation.name,
+                                    forecast = updatedForecast,
+                                    airQuality = state.airQuality,
+                                )
+                            } else {
+                                state.alerts
+                            }
+
+                        state.copy(
+                            isRefreshingCities = false,
+                            savedLocationSummaries = mergedSummaries,
+                            forecast = updatedForecast,
+                            forecastOrigin = updatedOrigin,
+                            forecastFetchedAtMillis = updatedFetchedAt,
+                            forecastStaleNotice = updatedStaleNotice,
+                            alerts = evaluatedAlerts,
+                        )
+                    }
+
+                    val errorMessage = firstErrorOrStale
+                    if (errorMessage != null) {
+                        val hasCachedCities = _uiState.value.savedLocationSummaries.isNotEmpty()
+                        val feedback =
+                            when {
+                                !_uiState.value.isOnline && hasCachedCities ->
+                                    "Sem conexão. Resumos das cidades mantidos em cache."
+                                hasCachedCities -> "$errorMessage Resumos em cache mantidos."
+                                else -> errorMessage
+                            }
+                        showToast(feedback)
+                    }
+                } finally {
+                    _uiState.update { it.copy(isRefreshingCities = false) }
                 }
             }
     }

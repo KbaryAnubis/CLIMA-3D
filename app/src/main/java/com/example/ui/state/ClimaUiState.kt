@@ -58,6 +58,7 @@ data class ClimaUiState(
     val preferences: UserPreferences = UserPreferences(),
     val isOnline: Boolean = true,
     val isRefreshing: Boolean = false,
+    val isRefreshingCities: Boolean = false,
     val savedLocations: List<SavedLocation> = emptyList(),
     val activeLocation: SavedLocation? = null,
     val savedLocationSummaries: Map<Long, SavedLocationWeatherSummary> = emptyMap(),

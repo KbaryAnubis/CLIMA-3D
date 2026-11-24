@@ -53,6 +53,7 @@ import com.example.ui.components.V53GlassCard
 import com.example.ui.components.V53NoticeBanner
 import com.example.ui.components.V53PageHeading
 import com.example.ui.components.V53PrimaryButton
+import com.example.ui.components.V53PullToRefreshBox
 import com.example.ui.components.V53SectionHeader
 import com.example.ui.components.V53SegmentedOptions
 import com.example.ui.state.CitiesSubTab
@@ -84,11 +85,17 @@ fun CitiesScreen(
     onAddCityResult: (CitySearchResult) -> Unit,
     onSelectSavedLocation: (SavedLocation) -> Unit,
     onRemoveSavedLocation: (SavedLocation) -> Unit,
+    onRetryMap: () -> Unit = {},
+    onRefreshCities: () -> Unit = {},
 ) {
     val tabSpec = remember { WeatherGlassSpecs.forTab(com.example.ui.theme.ClimaTab.CITIES) }
     val dark = LocalClimaDarkTheme.current
 
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+    V53PullToRefreshBox(
+        isRefreshing = uiState.isRefreshingCities,
+        onRefresh = onRefreshCities,
+        testTag = "cities_pull_refresh",
+    ) {
         LazyColumn(
             modifier = Modifier.fillMaxSize().widthIn(max = 640.dp).testTag("cities_screen_list"),
             contentPadding = contentPadding,
@@ -133,6 +140,7 @@ fun CitiesScreen(
                     CityMapLibreSection(
                         initialState = uiState.cityMapState,
                         isOnline = uiState.isOnline,
+                        onRetryReload = onRetryMap,
                         onStateChanged = onMapStateChanged,
                     )
                 }

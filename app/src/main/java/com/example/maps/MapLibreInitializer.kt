@@ -1,11 +1,14 @@
 package com.example.maps
 
 import android.content.Context
+import android.graphics.Color
 import android.os.Build
 import com.example.BuildConfig
 import java.io.IOException
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import okhttp3.Dispatcher
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import org.maplibre.android.MapLibre
 import org.maplibre.android.maps.MapLibreMapOptions
@@ -51,12 +54,8 @@ object OpenStreetMapTileConfig {
     /**
      * Builds a complete, valid MapLibre Style Specification v8 JSON containing:
      * - A dark cartographic background layer (prevents white/blank flash before first tile arrives).
-     * - The official OpenStreetMap raster tile source (`{z}/{x}/{y}.png`, 256px, zoom 0..19).
+     * - The official OpenStreetMap raster tile source (`{z}/{x}/{y}.png`, 256px, xyz, zoom 0..19).
      * - The base raster layer referencing the OSM source.
-     *
-     * Supplying a valid v8 JSON via [Style.Builder.fromJson] is mandatory in MapLibre Native Android;
-     * calling `Style.Builder()` without `.fromJson(...)` or `.fromUri(...)` fails to initialize the
-     * style document and can leave the map blank with `OnStyleLoaded` never firing.
      */
     fun buildBaseOsmStyleJson(
         sourceId: String = OSM_SOURCE_ID,
@@ -72,6 +71,7 @@ object OpenStreetMapTileConfig {
                   "type": "raster",
                   "tiles": ["$TILE_URL"],
                   "tileSize": $TILE_SIZE_PX,
+                  "scheme": "xyz",
                   "minzoom": 0,
                   "maxzoom": ${MAX_ZOOM.toInt()},
                   "attribution": "$ATTRIBUTION"
@@ -157,8 +157,8 @@ object OpenStreetMapTileConfig {
 
 /**
  * Thread-safe singleton initializer for MapLibre Native Android SDK (OpenGL ES backend) with a custom
- * OkHttpClient that attaches an OpenStreetMap-compliant User-Agent header, enforces timeouts, and logs
- * tile transport errors under [ClimaMapLogTags.OSM_TILES] and [ClimaMapLogTags.RAINVIEWER_TILES].
+ * OkHttpClient explicitly bound via [HttpRequestUtil.setOkHttpClient] so every OSM & RainViewer
+ * request uses the compliant User-Agent, concurrency limits, timeouts, and diagnostic telemetry.
  */
 object MapLibreInitializer {
     @Volatile
@@ -168,8 +168,10 @@ object MapLibreInitializer {
     var lastInitError: String? = null
         private set
 
-    private val loggedFirstOsmTile = AtomicBoolean(false)
-    private val loggedFirstRainViewerTile = AtomicBoolean(false)
+    private val osmRequestCounter = AtomicInteger(0)
+    private val osmSuccessCounter = AtomicInteger(0)
+    private val rainViewerRequestCounter = AtomicInteger(0)
+    private val rainViewerSuccessCounter = AtomicInteger(0)
 
     fun isRobolectricEnvironment(): Boolean =
         Build.FINGERPRINT.equals("robolectric", ignoreCase = true)
@@ -178,56 +180,106 @@ object MapLibreInitializer {
 
     /**
      * Creates [MapLibreMapOptions] configured with `textureMode(true)` (TextureView instead of SurfaceView)
-     * so MapLibre composites reliably inside Jetpack Compose `AndroidView`, rounded clips, scrollable
-     * containers (`LazyColumn`/`verticalScroll`), and over `WeatherVideoBackground` without blank frames.
+     * and dark ocean foreground load color so MapLibre composites reliably inside Jetpack Compose
+     * `AndroidView`, rounded clips, scrollable containers, and over `WeatherVideoBackground`.
      */
     fun createTextureMapOptions(context: Context): MapLibreMapOptions =
         MapLibreMapOptions.createFromAttributes(context)
             .textureMode(true)
+            .foregroundLoadColor(Color.parseColor(OpenStreetMapTileConfig.MAP_BACKGROUND_HEX))
             .compassEnabled(false)
             .logoEnabled(false)
             .attributionEnabled(false)
 
     /**
-     * Builds the OSM-compliant OkHttpClient shared with MapLibre's HTTP layer.
+     * Interceptor explicitly wired into MapLibre's `HttpRequestImpl` via `HttpRequestUtil.setOkHttpClient`.
+     * Enforces the OpenStreetMap User-Agent header, logs non-spammy tile milestones and all errors,
+     * and publishes real transport metrics into [TileTransportDiagnostics].
      */
-    fun buildTileOkHttpClient(): OkHttpClient =
-        OkHttpClient.Builder()
+    fun createTileTransportInterceptor(): Interceptor =
+        Interceptor { chain ->
+            val original = chain.request()
+            val host = original.url.host
+            val sanitizedUrl = "${original.url.scheme}://$host${original.url.encodedPath}"
+            val isRainViewer = host.contains("rainviewer", ignoreCase = true)
+            val logTag = classifyTileLogTag(host)
+
+            val request =
+                original
+                    .newBuilder()
+                    .header("User-Agent", OpenStreetMapTileConfig.userAgent)
+                    .build()
+
+            val reqSeq =
+                if (isRainViewer) rainViewerRequestCounter.incrementAndGet()
+                else osmRequestCounter.incrementAndGet()
+            TileTransportDiagnostics.recordRequestStart(isRainViewer, sanitizedUrl)
+
+            if (reqSeq == 1 || reqSeq % 20 == 0) {
+                ClimaMapLogger.i(logTag, "Requisição de tile #$reqSeq -> $sanitizedUrl")
+            }
+
+            val startNs = System.nanoTime()
+            try {
+                val response = chain.proceed(request)
+                val durationMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(0L)
+                TileTransportDiagnostics.recordHttpResponse(
+                    isRainViewer = isRainViewer,
+                    statusCode = response.code,
+                    durationMs = durationMs,
+                    sanitizedUrl = sanitizedUrl,
+                )
+
+                if (!response.isSuccessful) {
+                    ClimaMapLogger.w(
+                        logTag,
+                        "HTTP ${response.code} ao buscar tile em $sanitizedUrl (${durationMs}ms)",
+                    )
+                } else {
+                    val okSeq =
+                        if (isRainViewer) rainViewerSuccessCounter.incrementAndGet()
+                        else osmSuccessCounter.incrementAndGet()
+                    if (okSeq == 1 || okSeq % 20 == 0) {
+                        ClimaMapLogger.i(
+                            logTag,
+                            "Tile recebido com sucesso #$okSeq (HTTP ${response.code}, ${durationMs}ms) <- $sanitizedUrl",
+                        )
+                    }
+                }
+                response
+            } catch (ioe: IOException) {
+                val durationMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(0L)
+                TileTransportDiagnostics.recordTransportFailure(
+                    isRainViewer = isRainViewer,
+                    error = ioe,
+                    durationMs = durationMs,
+                    sanitizedUrl = sanitizedUrl,
+                )
+                ClimaMapLogger.e(
+                    logTag,
+                    "Falha de rede/DNS/TLS ao buscar tile ($sanitizedUrl, ${durationMs}ms): ${ioe.javaClass.simpleName}: ${ioe.message}",
+                    ioe,
+                )
+                throw ioe
+            }
+        }
+
+    /**
+     * Builds the OSM-compliant OkHttpClient shared with MapLibre's HTTP layer (`HttpRequestUtil`).
+     */
+    fun buildTileOkHttpClient(): OkHttpClient {
+        val dispatcher = Dispatcher().apply {
+            maxRequestsPerHost = 20
+        }
+        return OkHttpClient.Builder()
+            .dispatcher(dispatcher)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
-            .addInterceptor { chain ->
-                val original = chain.request()
-                val host = original.url.host
-                val request =
-                    original
-                        .newBuilder()
-                        .header("User-Agent", OpenStreetMapTileConfig.userAgent)
-                        .build()
-                val logTag = classifyTileLogTag(host)
-                try {
-                    val response = chain.proceed(request)
-                    if (!response.isSuccessful) {
-                        ClimaMapLogger.w(
-                            logTag,
-                            "HTTP ${response.code} ao buscar tile em $host (${original.url.encodedPath})",
-                        )
-                    } else if (logTag == ClimaMapLogTags.OSM_TILES && loggedFirstOsmTile.compareAndSet(false, true)) {
-                        ClimaMapLogger.i(logTag, "Primeiro tile OpenStreetMap recebido com sucesso (HTTP ${response.code}).")
-                    } else if (logTag == ClimaMapLogTags.RAINVIEWER_TILES && loggedFirstRainViewerTile.compareAndSet(false, true)) {
-                        ClimaMapLogger.i(logTag, "Primeiro tile RainViewer recebido com sucesso (HTTP ${response.code}).")
-                    }
-                    response
-                } catch (ioe: IOException) {
-                    ClimaMapLogger.e(
-                        logTag,
-                        "Falha de rede/TLS/timeout ao buscar tile em $host: ${ioe.javaClass.simpleName}: ${ioe.message}",
-                        ioe,
-                    )
-                    throw ioe
-                }
-            }
+            .callTimeout(25, TimeUnit.SECONDS)
+            .addInterceptor(createTileTransportInterceptor())
             .build()
+    }
 
     internal fun classifyTileLogTag(host: String): String =
         if (host.contains("rainviewer", ignoreCase = true)) {
@@ -241,6 +293,7 @@ object MapLibreInitializer {
         synchronized(this) {
             if (initialized) return true
             val appContext = context.applicationContext ?: context
+            val startNs = System.nanoTime()
             ClimaMapLogger.i(
                 ClimaMapLogTags.MAPLIBRE_INIT,
                 "Inicializando MapLibre Native (OpenGL ES 13.7.1) com User-Agent=${OpenStreetMapTileConfig.userAgent}",
@@ -248,11 +301,14 @@ object MapLibreInitializer {
             return try {
                 MapLibre.getInstance(appContext)
                 HttpRequestUtil.setOkHttpClient(buildTileOkHttpClient())
+                HttpRequestUtil.setLogEnabled(BuildConfig.DEBUG)
+                HttpRequestUtil.setPrintRequestUrlOnFailure(BuildConfig.DEBUG)
+                val durationMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(0L)
                 lastInitError = null
                 initialized = true
                 ClimaMapLogger.i(
                     ClimaMapLogTags.MAPLIBRE_INIT,
-                    "MapLibre inicializado com sucesso (OkHttp + User-Agent OSM configurados).",
+                    "MapLibre inicializado em ${durationMs}ms (HttpRequestUtil.setOkHttpClient ativo).",
                 )
                 true
             } catch (e: UnsatisfiedLinkError) {

@@ -111,7 +111,7 @@ fun Clima3DApp(
                         onOpenCities = { vm.selectTab(ClimaTab.CITIES) },
                         onOpenSettings = { vm.selectTab(ClimaTab.SETTINGS) },
                         onOpenAlerts = { vm.selectTab(ClimaTab.ALERTS) },
-                        onRefresh = { vm.refreshActiveLocation() },
+                        onRefresh = vm::onPullRefreshHome,
                         onToggleDaysExpanded = vm::toggleDaysExpanded,
                         onHourClick = vm::openHourModal,
                         onDayClick = vm::openDayModal,
@@ -128,7 +128,7 @@ fun Clima3DApp(
                         onZoomOut = vm::zoomRadarOut,
                         onSelectFrame = vm::selectRadarFrame,
                         onTogglePlay = vm::toggleRadarPlayback,
-                        onRefreshRadar = { vm.refreshActiveLocation() },
+                        onRefreshRadar = vm::onPullRefreshRadar,
                     )
 
                 ClimaTab.CITIES ->
@@ -144,6 +144,8 @@ fun Clima3DApp(
                         onAddCityResult = vm::addCityFromSearch,
                         onSelectSavedLocation = vm::selectSavedLocation,
                         onRemoveSavedLocation = vm::removeSavedLocation,
+                        onRetryMap = vm::onPullRefreshCities,
+                        onRefreshCities = vm::onPullRefreshCities,
                     )
 
                 ClimaTab.SETTINGS ->

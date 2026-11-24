@@ -20,6 +20,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -55,6 +56,7 @@ import com.example.media.ClimaUiIcons
 import com.example.media.WeatherIconSize
 import com.example.ui.components.AnimatedWeatherIcon
 import com.example.ui.components.V53NoticeBanner
+import com.example.ui.components.V53PullToRefreshBox
 import com.example.ui.state.ClimaUiState
 import com.example.ui.theme.ClimaAccentCyan
 import com.example.ui.theme.ClimaDeepSky
@@ -101,7 +103,11 @@ fun RadarScreen(
     val activeFrame = frames.getOrNull(safeIndex)
     val maxRadarZoom = radar?.maxSupportedZoom ?: RadarTimelineSnapshot.PUBLIC_MAX_ZOOM
 
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+    V53PullToRefreshBox(
+        isRefreshing = uiState.isRefreshing,
+        onRefresh = onRefreshRadar,
+        testTag = "radar_pull_refresh",
+    ) {
         Column(
             modifier =
                 Modifier
@@ -164,12 +170,20 @@ fun RadarScreen(
                                     onClick = onRefreshRadar,
                                     modifier = Modifier.size(44.dp).testTag("radar_refresh_button"),
                                 ) {
-                                    Icon(
-                                        painter = painterResource(ClimaUiIcons.Refresh),
-                                        contentDescription = stringResource(R.string.home_refresh_cd),
-                                        tint = ClimaTextOnDark,
-                                        modifier = Modifier.size(18.dp),
-                                    )
+                                    if (uiState.isRefreshing) {
+                                        CircularProgressIndicator(
+                                            color = ClimaAccentCyan,
+                                            strokeWidth = 2.dp,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    } else {
+                                        Icon(
+                                            painter = painterResource(ClimaUiIcons.Refresh),
+                                            contentDescription = stringResource(R.string.home_refresh_cd),
+                                            tint = ClimaTextOnDark,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
                                 }
                             }
                         }

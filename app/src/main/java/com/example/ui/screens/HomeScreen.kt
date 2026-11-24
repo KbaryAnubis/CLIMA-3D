@@ -60,6 +60,7 @@ import com.example.ui.components.ClimaDateLabels
 import com.example.ui.components.V53GlassCard
 import com.example.ui.components.V53NoticeBanner
 import com.example.ui.components.V53PrimaryButton
+import com.example.ui.components.V53PullToRefreshBox
 import com.example.ui.components.V53SectionHeader
 import com.example.ui.state.ClimaUiState
 import com.example.ui.state.WeatherMetricType
@@ -106,7 +107,11 @@ fun HomeScreen(
     val dark = LocalClimaDarkTheme.current
     val forecast = uiState.forecast
 
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+    V53PullToRefreshBox(
+        isRefreshing = uiState.isRefreshing,
+        onRefresh = onRefresh,
+        testTag = "home_pull_refresh",
+    ) {
         Column(
             modifier =
                 Modifier

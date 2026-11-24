@@ -6,13 +6,16 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -20,6 +23,9 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -39,6 +45,7 @@ import com.example.media.ClimaUiIcons
 import com.example.ui.theme.ClimaAccentCyan
 import com.example.ui.theme.ClimaButtonGradientEnd
 import com.example.ui.theme.ClimaButtonGradientStart
+import com.example.ui.theme.ClimaDeepSky
 import com.example.ui.theme.ClimaTextOnDark
 import com.example.ui.theme.ClimaToastBg
 import com.example.ui.theme.ClimaToastBorder
@@ -402,6 +409,35 @@ fun V53ToastOverlay(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
         )
     }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun V53PullToRefreshBox(
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit,
+    modifier: Modifier = Modifier,
+    testTag: String = "pull_to_refresh_box",
+    content: @Composable BoxScope.() -> Unit,
+) {
+    val state = rememberPullToRefreshState()
+    PullToRefreshBox(
+        isRefreshing = isRefreshing,
+        onRefresh = onRefresh,
+        state = state,
+        modifier = modifier.fillMaxSize().testTag(testTag),
+        contentAlignment = Alignment.TopCenter,
+        indicator = {
+            PullToRefreshDefaults.Indicator(
+                state = state,
+                isRefreshing = isRefreshing,
+                containerColor = ClimaDeepSky.copy(alpha = 0.94f),
+                color = ClimaAccentCyan,
+                modifier = Modifier.align(Alignment.TopCenter),
+            )
+        },
+        content = content,
+    )
 }
 
 /**

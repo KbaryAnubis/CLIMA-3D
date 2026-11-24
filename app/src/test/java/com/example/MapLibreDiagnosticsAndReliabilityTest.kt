@@ -15,21 +15,33 @@ import com.example.data.model.SavedLocation
 import com.example.maps.CityMapLibreSection
 import com.example.maps.CityMapUiState
 import com.example.maps.ClimaMapLogTags
+import com.example.maps.MapLoadStage
+import com.example.maps.MapLoadStateMachine
 import com.example.maps.MapLibreInitializer
 import com.example.maps.MapSurfaceLoadState
 import com.example.maps.MapSurfaceStatusOverlay
 import com.example.maps.MapViewLifecycleController
 import com.example.maps.OpenStreetMapTileConfig
 import com.example.maps.RadarBaseStyle
+import com.example.maps.TileTransportDiagnostics
+import com.example.maps.TileTransportFailureKind
 import com.example.ui.screens.RadarScreen
 import com.example.ui.state.ClimaUiState
 import com.example.ui.theme.Clima3DTheme
 import com.example.ui.theme.ClimaTab
+import java.net.UnknownHostException
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -37,9 +49,10 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * Etapa 3C verification suite covering MapLibre initialization, valid Style Spec v8 JSON,
- * OpenStreetMap tile configuration, symmetrical Compose MapView lifecycle, style/network error
- * handling, OSM vs RainViewer layer separation, missing historical frames, and repeated tab switches.
+ * Etapa 3C + 3D verification suite covering MapLibre initialization, valid Style Spec v8 JSON,
+ * OpenStreetMap tile configuration, OkHttp User-Agent & HTTP/DNS diagnostics, separated load stages
+ * (Initializing -> LoadingStyle -> LoadingMap -> Available), timeout with known cause & late
+ * completion, clean retry, symmetrical lifecycle cleanup, and OSM vs RainViewer isolation.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -48,20 +61,22 @@ class MapLibreDiagnosticsAndReliabilityTest {
     @get:Rule
     val composeTestRule = createComposeRule()
 
+    @Before
+    fun resetDiagnostics() {
+        TileTransportDiagnostics.reset()
+    }
+
     @Test
     fun `MapLibreInitializer handles JVM initialization cleanly and configures TextureView options and tile tags`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
 
         assertTrue(MapLibreInitializer.isRobolectricEnvironment())
-        // Must not crash on JVM without native .so libraries
         val ready = MapLibreInitializer.ensureInitialized(context)
         assertFalse(ready)
 
-        // Verify TextureView mode is enabled on MapLibreMapOptions for Compose compatibility
         val options = MapLibreInitializer.createTextureMapOptions(context)
         assertTrue("MapLibre must use TextureView inside Jetpack Compose", options.textureMode)
 
-        // Verify tile log tag classification separates OSM vs RainViewer requests
         assertEquals(
             ClimaMapLogTags.OSM_TILES,
             MapLibreInitializer.classifyTileLogTag("tile.openstreetmap.org"),
@@ -71,16 +86,17 @@ class MapLibreDiagnosticsAndReliabilityTest {
             MapLibreInitializer.classifyTileLogTag("tilecache.rainviewer.com"),
         )
 
-        // Verify OkHttpClient builds with OSM timeouts and User-Agent interceptor
         val client = MapLibreInitializer.buildTileOkHttpClient()
         assertNotNull(client)
         assertTrue(client.interceptors.isNotEmpty())
         assertEquals(15_000, client.connectTimeoutMillis)
         assertEquals(20_000, client.readTimeoutMillis)
+        assertEquals(25_000, client.callTimeoutMillis)
+        assertEquals(20, client.dispatcher.maxRequestsPerHost)
     }
 
     @Test
-    fun `OpenStreetMap base Style JSON v8 is valid and decoupled from RainViewer overlay`() {
+    fun `OpenStreetMap base Style JSON v8 is valid and raster layer is linked to OSM source`() {
         val citiesStyleJson =
             OpenStreetMapTileConfig.buildBaseOsmStyleJson(
                 sourceId = OpenStreetMapTileConfig.OSM_SOURCE_ID,
@@ -96,6 +112,7 @@ class MapLibreDiagnosticsAndReliabilityTest {
         assertEquals(8, citiesDoc.getInt("version"))
         val citiesSource = citiesDoc.getJSONObject("sources").getJSONObject(OpenStreetMapTileConfig.OSM_SOURCE_ID)
         assertEquals("raster", citiesSource.getString("type"))
+        assertEquals("xyz", citiesSource.getString("scheme"))
         assertEquals(OpenStreetMapTileConfig.TILE_URL, citiesSource.getJSONArray("tiles").getString(0))
         assertEquals(256, citiesSource.getInt("tileSize"))
         assertEquals(OpenStreetMapTileConfig.ATTRIBUTION, citiesSource.getString("attribution"))
@@ -103,14 +120,166 @@ class MapLibreDiagnosticsAndReliabilityTest {
         val citiesLayers = citiesDoc.getJSONArray("layers")
         assertEquals(2, citiesLayers.length())
         assertEquals("background", citiesLayers.getJSONObject(0).getString("type"))
-        assertEquals(OpenStreetMapTileConfig.OSM_LAYER_ID, citiesLayers.getJSONObject(1).getString("id"))
+        val rasterLayer = citiesLayers.getJSONObject(1)
+        assertEquals(OpenStreetMapTileConfig.OSM_LAYER_ID, rasterLayer.getString("id"))
+        assertEquals("raster", rasterLayer.getString("type"))
+        assertEquals(OpenStreetMapTileConfig.OSM_SOURCE_ID, rasterLayer.getString("source"))
 
-        // Radar base style must contain OSM base without hardcoding RainViewer source so failure in RainViewer never hides OSM
         val radarDoc = JSONObject(radarStyleJson)
         assertEquals(8, radarDoc.getInt("version"))
-        val radarSources = radarDoc.getJSONObject("sources")
-        assertTrue(radarSources.has(OpenStreetMapTileConfig.RADAR_OSM_SOURCE_ID))
+        assertTrue(radarDoc.getJSONObject("sources").has(OpenStreetMapTileConfig.RADAR_OSM_SOURCE_ID))
         assertFalse(radarStyleJson.contains("rainviewer", ignoreCase = true))
+    }
+
+    @Test
+    fun `MapLoadStateMachine separates style loaded, first frame, and full map render with no false Available`() {
+        var nowMs = 1_000L
+        val machine = MapLoadStateMachine(screenName = "Radar", clock = { nowMs })
+
+        assertEquals(
+            MapSurfaceLoadState.Initializing,
+            machine.beginAttempt(isOnline = true, hasMapReady = false),
+        )
+
+        nowMs += 200L
+        assertEquals(MapSurfaceLoadState.LoadingStyle, machine.onMapReady(isOnline = true))
+
+        // Style loaded must NOT falsely mark map Available before tiles/render
+        nowMs += 150L
+        val afterStyle = machine.onStyleLoaded()
+        assertEquals(MapSurfaceLoadState.LoadingMap, afterStyle)
+        assertTrue(machine.styleLoaded)
+        assertFalse(machine.firstFrameRendered)
+        assertFalse(machine.mapFullyRendered)
+
+        // First frame alone (e.g. background fill before tiles arrive) must NOT mark Available
+        nowMs += 50L
+        val afterFirstFrame = machine.onFirstFrameRendered()
+        assertEquals(MapSurfaceLoadState.LoadingMap, afterFirstFrame)
+        assertTrue(machine.firstFrameRendered)
+
+        // Partial render (fully = false) must still remain in LoadingMap
+        val afterPartialRender = machine.onMapFinishedRendering(fully = false, tileSnapshot = TileTransportDiagnostics.snapshot.value)
+        assertEquals(MapSurfaceLoadState.LoadingMap, afterPartialRender)
+
+        // Full render (fully = true) after style loaded transitions cleanly to Available
+        TileTransportDiagnostics.recordRequestStart(isRainViewer = false, sanitizedUrl = "https://tile.openstreetmap.org/6/23/36.png")
+        TileTransportDiagnostics.recordHttpResponse(isRainViewer = false, statusCode = 200, durationMs = 42L, sanitizedUrl = "https://tile.openstreetmap.org/6/23/36.png")
+        val afterFullRender = machine.onMapFinishedRendering(fully = true, tileSnapshot = TileTransportDiagnostics.snapshot.value)
+        assertEquals(MapSurfaceLoadState.Available, afterFullRender)
+    }
+
+    @Test
+    fun `Tile interceptor enforces OSM User-Agent and records HTTP 403 and DNS UnknownHostException failures`() {
+        var capturedUserAgent: String? = null
+        var nextStatusCode = 403
+        var throwDns = false
+
+        val testClient =
+            OkHttpClient.Builder()
+                .addInterceptor(MapLibreInitializer.createTileTransportInterceptor())
+                .addInterceptor { chain ->
+                    val req = chain.request()
+                    capturedUserAgent = req.header("User-Agent")
+                    if (throwDns) {
+                        throw UnknownHostException("Unable to resolve host \"tile.openstreetmap.org\"")
+                    }
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(nextStatusCode)
+                        .message("Mock")
+                        .body("".toResponseBody("image/png".toMediaType()))
+                        .build()
+                }
+                .build()
+
+        // 1. HTTP 403 tile rejection
+        val req1 = Request.Builder().url("https://tile.openstreetmap.org/6/23/36.png").build()
+        testClient.newCall(req1).execute().close()
+        testClient.newCall(req1).execute().close()
+
+        assertEquals(OpenStreetMapTileConfig.userAgent, capturedUserAgent)
+        val httpSnap = TileTransportDiagnostics.snapshot.value
+        assertEquals(2, httpSnap.osmRequestCount)
+        assertEquals(0, httpSnap.osmSuccessCount)
+        assertEquals(2, httpSnap.osmErrorCount)
+        assertEquals(403, httpSnap.lastOsmStatusCode)
+        assertEquals(TileTransportFailureKind.HTTP_BLOCKED_OR_RATE_LIMIT, httpSnap.lastOsmFailureKind)
+
+        val machine = MapLoadStateMachine("Cidades")
+        machine.beginAttempt(isOnline = true, hasMapReady = true, tileSnapshot = TileTransportDiagnostics.snapshot.value)
+        // Fresh attempt baseline sees 0 errors until 2 new errors occur
+        assertEquals(MapSurfaceLoadState.LoadingStyle, machine.state)
+
+        testClient.newCall(req1).execute().close()
+        testClient.newCall(req1).execute().close()
+        val afterHttpErrors = machine.onTileTransportUpdated(TileTransportDiagnostics.snapshot.value, isOnline = true)
+        assertTrue(afterHttpErrors is MapSurfaceLoadState.RenderError)
+        assertTrue((afterHttpErrors as MapSurfaceLoadState.RenderError).reason.contains("403"))
+
+        // 2. DNS failure
+        TileTransportDiagnostics.reset()
+        throwDns = true
+        val dnsMachine = MapLoadStateMachine("Radar")
+        dnsMachine.beginAttempt(isOnline = true, hasMapReady = true, tileSnapshot = TileTransportDiagnostics.snapshot.value)
+        dnsMachine.onStyleLoaded()
+        repeat(2) {
+            runCatching { testClient.newCall(req1).execute().close() }
+        }
+        val dnsSnap = TileTransportDiagnostics.snapshot.value
+        assertEquals(TileTransportFailureKind.DNS_OR_NETWORK, dnsSnap.lastOsmFailureKind)
+        val afterDns = dnsMachine.onTileTransportUpdated(dnsSnap, isOnline = true)
+        assertTrue(afterDns is MapSurfaceLoadState.ConnectionError)
+        assertTrue((afterDns as MapSurfaceLoadState.ConnectionError).reason.contains("DNS"))
+    }
+
+    @Test
+    fun `Timeout sets TimedOut with knownCause without faking Available and supports late completion and retry`() {
+        val machine = MapLoadStateMachine("Radar")
+        machine.beginAttempt(isOnline = true, hasMapReady = false)
+        assertEquals(MapSurfaceLoadState.Initializing, machine.state)
+
+        // Timeout during INITIALIZING surfaces exact surface cause
+        val initTimeout = machine.onTimeout(TileTransportSnapshotEmpty(), "MapView=0x0, attached=false, textureAvailable=false")
+        assertTrue(initTimeout is MapSurfaceLoadState.TimedOut)
+        initTimeout as MapSurfaceLoadState.TimedOut
+        assertEquals(MapLoadStage.INITIALIZING, initTimeout.stalledStage)
+        assertTrue(initTimeout.knownCause.orEmpty().contains("MapView=0x0"))
+
+        // Late completion after timeout still advances cleanly to Available once style + full render arrive
+        assertEquals(MapSurfaceLoadState.LoadingStyle, machine.onMapReady(isOnline = true))
+        assertEquals(MapSurfaceLoadState.LoadingMap, machine.onStyleLoaded())
+        assertEquals(
+            MapSurfaceLoadState.Available,
+            machine.onMapFinishedRendering(fully = true, tileSnapshot = TileTransportDiagnostics.snapshot.value),
+        )
+
+        // Retry starts a fresh attempt cleanly
+        val prevAttempt = machine.attemptId
+        val retried = machine.beginAttempt(isOnline = true, hasMapReady = true)
+        assertEquals(prevAttempt + 1, machine.attemptId)
+        assertEquals(MapSurfaceLoadState.LoadingStyle, retried)
+        assertFalse(machine.styleLoaded)
+        assertFalse(machine.firstFrameRendered)
+        assertFalse(machine.mapFullyRendered)
+    }
+
+    @Test
+    fun `Radar and Cities state machines stay completely independent`() {
+        val radarMachine = MapLoadStateMachine("Radar")
+        val citiesMachine = MapLoadStateMachine("Cidades")
+
+        radarMachine.beginAttempt(isOnline = true, hasMapReady = true)
+        citiesMachine.beginAttempt(isOnline = true, hasMapReady = true)
+
+        radarMachine.onStyleLoaded()
+        radarMachine.onMapFinishedRendering(fully = true, tileSnapshot = TileTransportDiagnostics.snapshot.value)
+
+        citiesMachine.onStyleFailed("Erro simulado apenas em Cidades", isOnline = true)
+
+        assertEquals(MapSurfaceLoadState.Available, radarMachine.state)
+        assertTrue(citiesMachine.state is MapSurfaceLoadState.StyleError)
     }
 
     @Test
@@ -127,21 +296,17 @@ class MapLibreDiagnosticsAndReliabilityTest {
                 onLowMemory = { events.add("onLowMemory") },
             )
 
-        // Initial sync to RESUMED (like AndroidView.factory)
         controller.syncToLifecycleState(Lifecycle.State.RESUMED)
         assertEquals(listOf("onCreate", "onStart", "onResume"), events)
 
-        // Replay of ON_CREATE/ON_START/ON_RESUME by LifecycleRegistry.addObserver must NOT duplicate calls
         controller.onLifecycleEvent(Lifecycle.Event.ON_CREATE)
         controller.onLifecycleEvent(Lifecycle.Event.ON_START)
         controller.onLifecycleEvent(Lifecycle.Event.ON_RESUME)
         assertEquals(listOf("onCreate", "onStart", "onResume"), events)
 
-        // Low memory forwarded while active
         controller.dispatchLowMemory()
         assertEquals(listOf("onCreate", "onStart", "onResume", "onLowMemory"), events)
 
-        // Background and resume again
         controller.onLifecycleEvent(Lifecycle.Event.ON_PAUSE)
         controller.onLifecycleEvent(Lifecycle.Event.ON_STOP)
         controller.onLifecycleEvent(Lifecycle.Event.ON_START)
@@ -151,7 +316,6 @@ class MapLibreDiagnosticsAndReliabilityTest {
             events,
         )
 
-        // Tab switch dispose followed by stray ON_DESTROY must destroy exactly once
         controller.destroy()
         controller.onLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         controller.dispatchLowMemory()
@@ -175,13 +339,13 @@ class MapLibreDiagnosticsAndReliabilityTest {
     }
 
     @Test
-    fun `MapSurfaceStatusOverlay displays style loading failure and triggers retry callback`() {
+    fun `MapSurfaceStatusOverlay displays style failure and timeout with retry callback`() {
         var retryClicks = 0
 
         composeTestRule.setContent {
             Clima3DTheme(darkTheme = true) {
                 MapSurfaceStatusOverlay(
-                    loadState = MapSurfaceLoadState.Error("Style JSON inválido ou falha de rede"),
+                    loadState = MapSurfaceLoadState.StyleError("Style JSON inválido ou falha de rede"),
                     onRetry = { retryClicks++ },
                     testTagPrefix = "test_map",
                 )
@@ -191,6 +355,30 @@ class MapLibreDiagnosticsAndReliabilityTest {
 
         composeTestRule.onNodeWithTag("test_map_status_error").assertIsDisplayed()
         composeTestRule.onNodeWithTag("test_map_retry_button").assertIsDisplayed().performClick()
+        assertEquals(1, retryClicks)
+    }
+
+    @Test
+    fun `MapSurfaceStatusOverlay displays timeout state with known cause and working retry`() {
+        var retryClicks = 0
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                MapSurfaceStatusOverlay(
+                    loadState =
+                        MapSurfaceLoadState.TimedOut(
+                            stalledStage = MapLoadStage.LOADING_MAP,
+                            knownCause = "Tiles OSM sem resposta (HTTP 429)",
+                        ),
+                    onRetry = { retryClicks++ },
+                    testTagPrefix = "timeout_map",
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("timeout_map_status_timeout").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("timeout_map_retry_button").assertIsDisplayed().performClick()
         assertEquals(1, retryClicks)
     }
 
@@ -257,7 +445,6 @@ class MapLibreDiagnosticsAndReliabilityTest {
         }
         composeTestRule.waitForIdle()
 
-        // Base map container remains mounted and visible even without RainViewer frames
         composeTestRule.onNodeWithTag("radar_map_container").performScrollTo().assertIsDisplayed()
         composeTestRule.onNodeWithTag("radar_map_secondary_notice").performScrollTo().assertIsDisplayed()
         composeTestRule.onNodeWithTag("radar_map_retry_button").performScrollTo().performClick()
@@ -310,19 +497,16 @@ class MapLibreDiagnosticsAndReliabilityTest {
         }
         composeTestRule.waitForIdle()
 
-        // 1. Open Radar
         composeTestRule.onNodeWithTag("nav_tab_radar").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("radar_map_container").performScrollTo().assertIsDisplayed()
 
-        // 2. Switch to Cities & select Map sub-tab
         composeTestRule.onNodeWithTag("nav_tab_cities").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("cities_subtab_map").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("cities_map_section").assertIsDisplayed()
 
-        // 3. Switch back to Radar -> Home -> Radar -> Cities repeatedly
         composeTestRule.onNodeWithTag("nav_tab_radar").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("radar_map_container").performScrollTo().assertIsDisplayed()
@@ -338,4 +522,6 @@ class MapLibreDiagnosticsAndReliabilityTest {
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("cities_map_section").assertIsDisplayed()
     }
+
+    private fun TileTransportSnapshotEmpty() = TileTransportDiagnostics.snapshot.value
 }
