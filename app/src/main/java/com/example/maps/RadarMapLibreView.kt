@@ -1,7 +1,9 @@
 package com.example.maps
 
+import android.annotation.SuppressLint
 import android.content.ComponentCallbacks2
 import android.content.res.Configuration
+import android.view.MotionEvent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +18,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -81,6 +84,7 @@ fun RadarMapLibreView(
 
     var reloadNonce by remember { mutableIntStateOf(0) }
     var rainLayerError by remember { mutableStateOf<String?>(null) }
+    val latestIsOnline by rememberUpdatedState(isOnline)
 
     val mapLibreReady = remember(context) { MapLibreInitializer.ensureInitialized(context) }
 
@@ -161,19 +165,20 @@ fun RadarMapLibreView(
     }
 
     fun applyBaseOsmStyle(map: MapLibreMap) {
-        loadState = if (isOnline) MapSurfaceLoadState.Loading else MapSurfaceLoadState.Offline
+        val onlineNow = latestIsOnline
+        loadState = if (onlineNow) MapSurfaceLoadState.Loading else MapSurfaceLoadState.Offline
         loadedStyleRef = null
         activeRainSourceId = null
         rainLayerError = null
-        ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "Carregando estilo base OSM v8 para Radar.")
+        ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "Carregando estilo base OSM v8 para Radar (online=$onlineNow).")
         runCatching {
             val styleBuilder = OpenStreetMapTileConfig.buildRadarBaseStyleBuilder()
             map.setStyle(styleBuilder) { style ->
                 loadedStyleRef = style
-                loadState = MapSurfaceLoadState.Loaded
+                loadState = if (latestIsOnline) MapSurfaceLoadState.Loaded else MapSurfaceLoadState.Offline
                 ClimaMapLogger.i(
                     ClimaMapLogTags.MAP_STYLE,
-                    "Estilo base OSM do Radar carregado com sucesso (camada=${OpenStreetMapTileConfig.RADAR_OSM_LAYER_ID}).",
+                    "Estilo base OSM do Radar carregado (camada=${OpenStreetMapTileConfig.RADAR_OSM_LAYER_ID}, online=$latestIsOnline).",
                 )
             }
         }.onFailure { err ->
@@ -312,23 +317,40 @@ fun RadarMapLibreView(
                 lifecycleControllerRef = controller
                 mapViewRef = view
 
+                @Suppress("ClickableViewAccessibility")
+                view.setOnTouchListener { v, event ->
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE ->
+                            v.parent?.requestDisallowInterceptTouchEvent(true)
+                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                            v.parent?.requestDisallowInterceptTouchEvent(false)
+                    }
+                    false
+                }
+
                 view.addOnDidFailLoadingMapListener { errorMessage ->
                     val reason = errorMessage.ifBlank { "Erro ao carregar mapa-base OpenStreetMap." }
                     ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, "Falha no carregamento do mapa Radar: $reason")
-                    loadState = if (!isOnline) MapSurfaceLoadState.Offline else MapSurfaceLoadState.Error(reason)
+                    view.post {
+                        loadState = if (!latestIsOnline) MapSurfaceLoadState.Offline else MapSurfaceLoadState.Error(reason)
+                    }
                 }
                 view.addOnDidFinishLoadingStyleListener {
                     ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "Callback onDidFinishLoadingStyle disparado (Radar).")
                 }
                 view.addOnDidFinishLoadingMapListener {
                     ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "Mapa Radar carregado completamente.")
-                    loadState = MapSurfaceLoadState.Loaded
-                }
-                view.addOnDidFinishRenderingFrameListener { _ ->
-                    if (firstFrameLogged.compareAndSet(false, true)) {
-                        ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "Primeiro frame do MapView Radar renderizado.")
+                    view.post {
+                        loadState = if (latestIsOnline) MapSurfaceLoadState.Loaded else MapSurfaceLoadState.Offline
                     }
                 }
+                view.addOnDidFinishRenderingFrameListener(
+                    MapView.OnDidFinishRenderingFrameListener { _, _, _ ->
+                        if (firstFrameLogged.compareAndSet(false, true)) {
+                            ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "Primeiro frame do MapView Radar renderizado.")
+                        }
+                    },
+                )
 
                 view.getMapAsync { map ->
                     mapLibreMapRef = map

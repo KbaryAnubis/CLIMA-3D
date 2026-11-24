@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.location.Location
 import android.location.LocationManager
+import android.view.MotionEvent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -354,6 +355,7 @@ fun CityMapLibreView(
     val latestOnCameraSettled by rememberUpdatedState(onCameraGestureSettled)
 
     var reloadNonce by remember { mutableIntStateOf(0) }
+    val latestIsOnline by rememberUpdatedState(isOnline)
     val mapLibreReady = remember(context) { MapLibreInitializer.ensureInitialized(context) }
 
     if (!mapLibreReady) {
@@ -405,9 +407,10 @@ fun CityMapLibreView(
         }
 
     fun applyCitiesStyle(map: MapLibreMap, viewContext: Context) {
-        loadState = if (isOnline) MapSurfaceLoadState.Loading else MapSurfaceLoadState.Offline
+        val onlineNow = latestIsOnline
+        loadState = if (onlineNow) MapSurfaceLoadState.Loading else MapSurfaceLoadState.Offline
         loadedStyleRef = null
-        ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "Carregando estilo base OSM v8 para Mapa de Cidades.")
+        ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "Carregando estilo base OSM v8 para Mapa de Cidades (online=$onlineNow).")
         runCatching {
             val styleBuilder =
                 OpenStreetMapTileConfig.buildStyleBuilder(
@@ -416,10 +419,10 @@ fun CityMapLibreView(
                 )
             map.setStyle(styleBuilder) { style ->
                 loadedStyleRef = style
-                loadState = MapSurfaceLoadState.Loaded
+                loadState = if (latestIsOnline) MapSurfaceLoadState.Loaded else MapSurfaceLoadState.Offline
                 ClimaMapLogger.i(
                     ClimaMapLogTags.MAP_STYLE,
-                    "Estilo OSM do Mapa de Cidades carregado com sucesso.",
+                    "Estilo OSM do Mapa de Cidades carregado (online=$latestIsOnline).",
                 )
                 if (hasLocationPermission(viewContext)) {
                     enableMapLibreLocationComponent(viewContext, map, style)
@@ -528,23 +531,40 @@ fun CityMapLibreView(
                 lifecycleControllerRef = controller
                 mapViewRef = view
 
+                @Suppress("ClickableViewAccessibility")
+                view.setOnTouchListener { v, event ->
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE ->
+                            v.parent?.requestDisallowInterceptTouchEvent(true)
+                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                            v.parent?.requestDisallowInterceptTouchEvent(false)
+                    }
+                    false
+                }
+
                 view.addOnDidFailLoadingMapListener { errorMessage ->
                     val reason = errorMessage.ifBlank { "Erro ao carregar mapa-base OpenStreetMap." }
                     ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, "Falha no carregamento do Mapa de Cidades: $reason")
-                    loadState = if (!isOnline) MapSurfaceLoadState.Offline else MapSurfaceLoadState.Error(reason)
+                    view.post {
+                        loadState = if (!latestIsOnline) MapSurfaceLoadState.Offline else MapSurfaceLoadState.Error(reason)
+                    }
                 }
                 view.addOnDidFinishLoadingStyleListener {
                     ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "Callback onDidFinishLoadingStyle disparado (Cidades).")
                 }
                 view.addOnDidFinishLoadingMapListener {
                     ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "Mapa de Cidades carregado completamente.")
-                    loadState = MapSurfaceLoadState.Loaded
-                }
-                view.addOnDidFinishRenderingFrameListener { _ ->
-                    if (firstFrameLogged.compareAndSet(false, true)) {
-                        ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "Primeiro frame do MapView de Cidades renderizado.")
+                    view.post {
+                        loadState = if (latestIsOnline) MapSurfaceLoadState.Loaded else MapSurfaceLoadState.Offline
                     }
                 }
+                view.addOnDidFinishRenderingFrameListener(
+                    MapView.OnDidFinishRenderingFrameListener { _, _, _ ->
+                        if (firstFrameLogged.compareAndSet(false, true)) {
+                            ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "Primeiro frame do MapView de Cidades renderizado.")
+                        }
+                    },
+                )
 
                 view.getMapAsync { map ->
                     mapLibreMapRef = map
