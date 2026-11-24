@@ -3,13 +3,19 @@ package com.example
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -18,6 +24,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.ClimaDataContainer
 import com.example.data.local.preferences.AppThemeMode
+import com.example.maps.LocationLookupResult
+import com.example.maps.LocationPermissionCoordinator
 import com.example.maps.MapLibreInitializer
 import com.example.ui.components.ClimaDetailModalHost
 import com.example.ui.components.WeatherPersistentShell
@@ -52,6 +60,7 @@ class MainActivity : ComponentActivity() {
 fun Clima3DApp(
     dataContainer: ClimaDataContainer? = null,
     viewModel: ClimaMainViewModel? = null,
+    onLaunchPermissionRequest: ((Array<String>) -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val resolvedContainer = remember(dataContainer, context) {
@@ -72,13 +81,107 @@ fun Clima3DApp(
             AppThemeMode.AUTO -> systemDark
         }
 
-    // Automatically refresh active location when returning to foreground if enabled in Settings
+    var launchedPermissionInSession by rememberSaveable { mutableStateOf(false) }
+
+    val locationPermissionLauncher =
+        rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestMultiplePermissions(),
+        ) { results ->
+            val resolved =
+                LocationPermissionCoordinator.resolvePermissionCallback(
+                    grantResults = results,
+                    initialPromptShown = true,
+                    canShowRationale =
+                        LocationPermissionCoordinator.canShowAnyLocationRationale(
+                            LocationPermissionCoordinator.findActivity(context),
+                        ),
+                    isLocationServiceEnabled = LocationPermissionCoordinator.isLocationServiceEnabled(context),
+                )
+            val effectiveSnapshot =
+                if (resolved.hasAnyPermission) {
+                    resolved
+                } else {
+                    LocationPermissionCoordinator.inspect(context, initialPromptShown = true)
+                }
+            vm.onLocationPermissionResult(effectiveSnapshot)
+            if (effectiveSnapshot.hasAnyPermission) {
+                LocationPermissionCoordinator.fetchRealLocation(context) { lookup ->
+                    when (lookup) {
+                        is LocationLookupResult.Success -> {
+                            vm.updateCityMapState(
+                                vm.uiState.value.cityMapState.withCurrentLocation(
+                                    coordinate = lookup.coordinate,
+                                    label = context.getString(R.string.cities_map_my_location),
+                                    precision = lookup.precision,
+                                ),
+                            )
+                        }
+
+                        is LocationLookupResult.UnavailableTemporarily -> {
+                            vm.updateCityMapState(
+                                vm.uiState.value.cityMapState.withLocationNotice(lookup.reason),
+                            )
+                        }
+
+                        LocationLookupResult.LocationServiceDisabled -> {
+                            vm.updateCityMapState(
+                                vm.uiState.value.cityMapState.withLocationNotice(
+                                    "Localização do aparelho desativada no sistema.",
+                                ),
+                            )
+                        }
+
+                        LocationLookupResult.PermissionDenied -> Unit
+                    }
+                }
+            }
+        }
+
+    val requestLocationPermissions: () -> Unit = {
+        launchedPermissionInSession = true
+        vm.markLocationPromptHandled()
+        if (onLaunchPermissionRequest != null) {
+            onLaunchPermissionRequest(LocationPermissionCoordinator.REQUIRED_PERMISSIONS)
+        } else {
+            runCatching {
+                locationPermissionLauncher.launch(LocationPermissionCoordinator.REQUIRED_PERMISSIONS)
+            }
+        }
+    }
+
+    // First-open location permission flow: ask once if not granted and never shown before
+    LaunchedEffect(uiState.preferencesLoaded) {
+        if (!uiState.preferencesLoaded) return@LaunchedEffect
+        val snapshot =
+            LocationPermissionCoordinator.inspect(
+                context = context,
+                initialPromptShown = uiState.preferences.locationPermissionPromptShown,
+            )
+        vm.syncLocationPermissionSnapshot(snapshot)
+        if (
+            LocationPermissionCoordinator.shouldLaunchInitialPrompt(
+                preferencesLoaded = true,
+                snapshot = snapshot,
+                launchedInSession = launchedPermissionInSession,
+            )
+        ) {
+            requestLocationPermissions()
+        }
+    }
+
+    // Re-evaluate permissions and refresh active location on resume (including return from Android Settings)
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, vm) {
+    DisposableEffect(lifecycleOwner, vm, context) {
         var firstResumeSkipped = false
         val observer =
             LifecycleEventObserver { _, event ->
                 if (event == Lifecycle.Event.ON_RESUME) {
+                    val currentSnapshot =
+                        LocationPermissionCoordinator.inspect(
+                            context = context,
+                            initialPromptShown = vm.uiState.value.preferences.locationPermissionPromptShown,
+                        )
+                    vm.syncLocationPermissionSnapshot(currentSnapshot)
                     if (firstResumeSkipped) {
                         vm.onAppResumeRefresh()
                     } else {
@@ -146,6 +249,7 @@ fun Clima3DApp(
                         onRemoveSavedLocation = vm::removeSavedLocation,
                         onRetryMap = vm::onPullRefreshCities,
                         onRefreshCities = vm::onPullRefreshCities,
+                        onOpenAppLocationSettings = { LocationPermissionCoordinator.openAppSettings(context) },
                     )
 
                 ClimaTab.SETTINGS ->
@@ -166,6 +270,8 @@ fun Clima3DApp(
                         onSetAutoRefreshOnOpen = vm::setAutoRefreshOnOpen,
                         onOpenCities = { vm.selectTab(ClimaTab.CITIES) },
                         onResetPreferences = vm::resetPreferencesToDefaults,
+                        onRequestLocationPermission = requestLocationPermissions,
+                        onOpenAppLocationSettings = { LocationPermissionCoordinator.openAppSettings(context) },
                     )
 
                 ClimaTab.ALERTS ->

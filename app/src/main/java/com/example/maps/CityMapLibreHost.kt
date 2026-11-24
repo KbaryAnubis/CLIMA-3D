@@ -1,13 +1,8 @@
 package com.example.maps
 
-import android.Manifest
-import android.annotation.SuppressLint
 import android.content.ComponentCallbacks2
 import android.content.Context
-import android.content.pm.PackageManager
 import android.content.res.Configuration
-import android.location.Location
-import android.location.LocationManager
 import android.view.MotionEvent
 import android.view.TextureView
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -30,6 +25,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -53,7 +49,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.R
@@ -66,15 +62,13 @@ import com.example.ui.theme.ClimaTextMutedOnDark
 import com.example.ui.theme.ClimaTextOnDark
 import com.example.ui.theme.ClimaToastEmerald
 import com.example.ui.theme.WeatherGlassSpecs
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
-import com.google.android.gms.tasks.CancellationTokenSource
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.location.LocationComponentActivationOptions
+import org.maplibre.android.location.engine.LocationEngineRequest
 import org.maplibre.android.location.modes.CameraMode
 import org.maplibre.android.location.modes.RenderMode
 import org.maplibre.android.maps.MapLibreMap
@@ -94,18 +88,39 @@ fun CityMapLibreSection(
     modifier: Modifier = Modifier,
     initialState: CityMapUiState = CityMapUiState(),
     isOnline: Boolean = true,
+    isPermanentlyDenied: Boolean = false,
+    onOpenAppSettings: () -> Unit = {},
     onRetryReload: () -> Unit = {},
     onStateChanged: ((CityMapUiState) -> Unit)? = null,
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val spec = remember { WeatherGlassSpecs.forTab(ClimaTab.CITIES) }
     var uiState by remember {
-        val granted = hasLocationPermission(context)
-        mutableStateOf(
-            initialState.withPermissionState(
-                if (granted) LocationPermissionState.GRANTED else initialState.permissionState
+        val snapshot =
+            LocationPermissionCoordinator.inspect(
+                context = context,
+                initialPromptShown = initialState.permissionState == LocationPermissionState.DENIED,
             )
+        mutableStateOf(
+            if (snapshot.hasAnyPermission) {
+                initialState.withPermissionState(
+                    state = LocationPermissionState.GRANTED,
+                    precision = snapshot.precisionLevel,
+                    clearCurrentLocationIfDenied = false,
+                )
+            } else {
+                initialState.withPermissionState(
+                    state = initialState.permissionState,
+                    precision = LocationPrecisionLevel.NONE,
+                )
+            },
         )
+    }
+
+    fun updateState(next: CityMapUiState) {
+        uiState = next
+        onStateChanged?.invoke(next)
     }
 
     LaunchedEffect(initialState.savedMarkers) {
@@ -114,32 +129,150 @@ fun CityMapLibreSection(
         }
     }
 
-    fun updateState(next: CityMapUiState) {
-        uiState = next
-        onStateChanged?.invoke(next)
+    LaunchedEffect(
+        initialState.permissionState,
+        initialState.locationPrecision,
+        initialState.locationStatusNotice,
+    ) {
+        if (
+            uiState.permissionState != initialState.permissionState ||
+                uiState.locationPrecision != initialState.locationPrecision ||
+                uiState.locationStatusNotice != initialState.locationStatusNotice
+        ) {
+            uiState =
+                uiState.withPermissionState(
+                    state = initialState.permissionState,
+                    precision = initialState.locationPrecision,
+                    clearCurrentLocationIfDenied = initialState.permissionState != LocationPermissionState.GRANTED,
+                    notice = initialState.locationStatusNotice,
+                )
+        }
+    }
+
+    LaunchedEffect(initialState.currentUserLocation) {
+        val incoming = initialState.currentUserLocation
+        if (incoming != null && uiState.currentUserLocation != incoming) {
+            uiState =
+                uiState.withCurrentLocation(
+                    coordinate = incoming,
+                    label = uiState.selectedMarker.label,
+                    precision =
+                        if (initialState.locationPrecision != LocationPrecisionLevel.NONE) {
+                            initialState.locationPrecision
+                        } else {
+                            uiState.locationPrecision
+                        },
+                )
+        }
+    }
+
+    // Re-evaluate permissions and GPS status when returning from System Settings without recreating MapView
+    DisposableEffect(lifecycleOwner, context) {
+        val observer =
+            LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) {
+                    val snapshot =
+                        LocationPermissionCoordinator.inspect(
+                            context = context,
+                            initialPromptShown = uiState.permissionState == LocationPermissionState.DENIED,
+                        )
+                    val nextPermState =
+                        if (snapshot.hasAnyPermission) {
+                            LocationPermissionState.GRANTED
+                        } else {
+                            snapshot.mapPermissionState
+                        }
+                    val nextPrecision = snapshot.precisionLevel
+                    val serviceNotice =
+                        if (snapshot.hasAnyPermission && !snapshot.isLocationServiceEnabled) {
+                            "Localização do aparelho desativada no sistema."
+                        } else {
+                            null
+                        }
+                    if (
+                        nextPermState != uiState.permissionState ||
+                            nextPrecision != uiState.locationPrecision ||
+                            serviceNotice != uiState.locationStatusNotice
+                    ) {
+                        updateState(
+                            uiState.withPermissionState(
+                                state = nextPermState,
+                                precision = nextPrecision,
+                                clearCurrentLocationIfDenied = !snapshot.hasAnyPermission,
+                                notice = serviceNotice,
+                            ),
+                        )
+                    }
+                }
+            }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val currentLocationLabel = stringResource(R.string.cities_map_my_location)
 
+    fun handleLocationLookup() {
+        LocationPermissionCoordinator.fetchRealLocation(context) { result ->
+            when (result) {
+                is LocationLookupResult.Success -> {
+                    updateState(
+                        uiState.withCurrentLocation(
+                            coordinate = result.coordinate,
+                            label = currentLocationLabel,
+                            precision = result.precision,
+                        ),
+                    )
+                }
+
+                LocationLookupResult.PermissionDenied -> {
+                    updateState(uiState.withPermissionState(LocationPermissionState.DENIED))
+                }
+
+                LocationLookupResult.LocationServiceDisabled -> {
+                    updateState(
+                        uiState.withLocationNotice(
+                            "Ative o serviço de localização do aparelho para centralizar no mapa.",
+                        ),
+                    )
+                }
+
+                is LocationLookupResult.UnavailableTemporarily -> {
+                    updateState(uiState.withLocationNotice(result.reason))
+                }
+            }
+        }
+    }
+
     val locationPermissionLauncher =
         rememberLauncherForActivityResult(
-            contract = ActivityResultContracts.RequestMultiplePermissions()
+            contract = ActivityResultContracts.RequestMultiplePermissions(),
         ) { results ->
-            val granted =
-                results[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-                    results[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-            if (granted) {
-                updateState(uiState.withPermissionState(LocationPermissionState.GRANTED))
-                fetchLastOrCurrentLocation(context) { coordinate ->
-                    if (coordinate != null) {
-                        updateState(
-                            uiState.withCurrentLocation(
-                                coordinate = coordinate,
-                                label = currentLocationLabel,
-                            )
-                        )
-                    }
+            val resolved =
+                LocationPermissionCoordinator.resolvePermissionCallback(
+                    grantResults = results,
+                    initialPromptShown = true,
+                    canShowRationale =
+                        LocationPermissionCoordinator.canShowAnyLocationRationale(
+                            LocationPermissionCoordinator.findActivity(context),
+                        ),
+                    isLocationServiceEnabled = LocationPermissionCoordinator.isLocationServiceEnabled(context),
+                )
+            val effectiveSnapshot =
+                if (resolved.hasAnyPermission) {
+                    resolved
+                } else {
+                    LocationPermissionCoordinator.inspect(context, initialPromptShown = true)
                 }
+            if (effectiveSnapshot.hasAnyPermission) {
+                updateState(
+                    uiState.withPermissionState(
+                        state = LocationPermissionState.GRANTED,
+                        precision = effectiveSnapshot.precisionLevel,
+                        clearCurrentLocationIfDenied = false,
+                        notice = null,
+                    ),
+                )
+                handleLocationLookup()
             } else {
                 updateState(uiState.withPermissionState(LocationPermissionState.DENIED))
             }
@@ -237,25 +370,23 @@ fun CityMapLibreSection(
                                 ClimaTextOnDark
                             },
                         onClick = {
-                            if (hasLocationPermission(context)) {
-                                updateState(uiState.withPermissionState(LocationPermissionState.GRANTED))
-                                fetchLastOrCurrentLocation(context) { coordinate ->
-                                    if (coordinate != null) {
-                                        updateState(
-                                            uiState.withCurrentLocation(
-                                                coordinate = coordinate,
-                                                label = currentLocationLabel,
-                                            )
-                                        )
-                                    }
-                                }
-                            } else {
-                                locationPermissionLauncher.launch(
-                                    arrayOf(
-                                        Manifest.permission.ACCESS_FINE_LOCATION,
-                                        Manifest.permission.ACCESS_COARSE_LOCATION,
-                                    )
+                            val snapshot =
+                                LocationPermissionCoordinator.inspect(
+                                    context = context,
+                                    initialPromptShown = uiState.permissionState == LocationPermissionState.DENIED,
                                 )
+                            if (snapshot.hasAnyPermission) {
+                                updateState(
+                                    uiState.withPermissionState(
+                                        state = LocationPermissionState.GRANTED,
+                                        precision = snapshot.precisionLevel,
+                                        clearCurrentLocationIfDenied = false,
+                                        notice = null,
+                                    ),
+                                )
+                                handleLocationLookup()
+                            } else {
+                                locationPermissionLauncher.launch(LocationPermissionCoordinator.REQUIRED_PERMISSIONS)
                             }
                         },
                     )
@@ -318,15 +449,47 @@ fun CityMapLibreSection(
             }
 
             if (uiState.permissionState == LocationPermissionState.DENIED) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = stringResource(R.string.cities_map_location_denied),
+                        color = ClimaAlertAttentionAmber,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f).testTag("city_map_location_status"),
+                    )
+                    if (isPermanentlyDenied) {
+                        TextButton(
+                            onClick = onOpenAppSettings,
+                            modifier = Modifier.testTag("city_map_open_settings_button"),
+                        ) {
+                            Text(
+                                text = "Abrir ajustes",
+                                color = ClimaAccentCyan,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+                }
+            } else if (uiState.locationStatusNotice != null) {
                 Text(
-                    text = stringResource(R.string.cities_map_location_denied),
+                    text = uiState.locationStatusNotice.orEmpty(),
                     color = ClimaAlertAttentionAmber,
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.testTag("city_map_location_status"),
                 )
             } else if (uiState.currentUserLocation != null) {
+                val activeLabel =
+                    if (uiState.locationPrecision == LocationPrecisionLevel.APPROXIMATE) {
+                        stringResource(R.string.cities_map_location_approx_active)
+                    } else {
+                        stringResource(R.string.cities_map_location_active)
+                    }
                 Text(
-                    text = "${stringResource(R.string.cities_map_location_active)}: ${uiState.currentUserLocation?.formatted()}",
+                    text = "$activeLabel: ${uiState.currentUserLocation?.formatted()}",
                     color = ClimaToastEmerald,
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.testTag("city_map_location_status"),
@@ -461,9 +624,7 @@ fun CityMapLibreView(
                     ClimaMapLogTags.MAP_STYLE,
                     "Estilo OSM do Mapa de Cidades carregado em ${stateMachine.elapsedMs()}ms (fullyLoaded=${style.isFullyLoaded}).",
                 )
-                if (hasLocationPermission(viewContext)) {
-                    enableMapLibreLocationComponent(viewContext, map, style)
-                }
+                enableMapLibreLocationComponent(viewContext, map, style)
             }
         }.onFailure { err ->
             val msg = "Erro ao aplicar estilo do Mapa de Cidades: ${err.message ?: err.javaClass.simpleName}"
@@ -529,13 +690,11 @@ fun CityMapLibreView(
         map.animateCamera(CameraUpdateFactory.newCameraPosition(position), 300)
     }
 
-    // Activate native MapLibre LocationComponent when permission is granted
-    LaunchedEffect(mapLibreMapRef, loadedStyleRef, state.permissionState) {
+    // Synchronize native MapLibre LocationComponent when map/style are ready or permission/precision changes
+    LaunchedEffect(mapLibreMapRef, loadedStyleRef, state.permissionState, state.locationPrecision) {
         val map = mapLibreMapRef ?: return@LaunchedEffect
         val style = loadedStyleRef ?: return@LaunchedEffect
-        if (state.permissionState == LocationPermissionState.GRANTED && hasLocationPermission(context)) {
-            enableMapLibreLocationComponent(context, map, style)
-        }
+        enableMapLibreLocationComponent(context, map, style)
     }
 
     Box(modifier = modifier.fillMaxSize()) {
@@ -854,79 +1013,185 @@ private fun MapOverlayControlButton(
     }
 }
 
-private fun hasLocationPermission(context: Context): Boolean {
-    val fine =
-        ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
-            PackageManager.PERMISSION_GRANTED
-    val coarse =
-        ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
-            PackageManager.PERMISSION_GRANTED
-    return fine || coarse
+internal enum class LocationComponentSyncResult {
+    ACTIVATED_WITH_FIX,
+    ACTIVATED_AWAITING_FIX,
+    STYLE_NOT_READY,
+    PERMISSION_DENIED,
+    DISABLED_AFTER_REVOCATION,
+    FAILED_NON_FATAL,
 }
 
-@SuppressLint("MissingPermission")
-private fun enableMapLibreLocationComponent(
+internal interface MapLibreLocationGateway {
+    val isStyleFullyLoaded: Boolean
+    val isActivated: Boolean
+    val isEnabled: Boolean
+    fun activate(useHighAccuracy: Boolean)
+    fun applyModes(useHighAccuracy: Boolean)
+    fun disableIfActivated()
+    fun queryLastKnownCoordinate(): CityMapCoordinate?
+}
+
+private class RealMapLibreLocationGateway(
+    private val context: Context,
+    private val map: MapLibreMap,
+    private val style: Style,
+) : MapLibreLocationGateway {
+
+    override val isStyleFullyLoaded: Boolean
+        get() = runCatching { style.isFullyLoaded }.getOrDefault(false)
+
+    override val isActivated: Boolean
+        get() = runCatching { map.locationComponent.isLocationComponentActivated }.getOrDefault(false)
+
+    override val isEnabled: Boolean
+        get() = isActivated && runCatching { map.locationComponent.isLocationComponentEnabled }.getOrDefault(false)
+
+    private fun buildLocationEngineRequest(useHighAccuracy: Boolean): LocationEngineRequest =
+        LocationEngineRequest.Builder(5_000L)
+            .setPriority(
+                if (useHighAccuracy) {
+                    LocationEngineRequest.PRIORITY_HIGH_ACCURACY
+                } else {
+                    LocationEngineRequest.PRIORITY_BALANCED_POWER_ACCURACY
+                },
+            )
+            .setMaxWaitTime(10_000L)
+            .setFastestInterval(2_000L)
+            .build()
+
+    @Suppress("MissingPermission")
+    override fun activate(useHighAccuracy: Boolean) {
+        val options =
+            LocationComponentActivationOptions.builder(context, style)
+                .useDefaultLocationEngine(true)
+                .locationEngineRequest(buildLocationEngineRequest(useHighAccuracy))
+                .build()
+        map.locationComponent.activateLocationComponent(options)
+    }
+
+    @Suppress("MissingPermission")
+    override fun applyModes(useHighAccuracy: Boolean) {
+        val component = map.locationComponent
+        component.isLocationComponentEnabled = true
+        component.cameraMode = CameraMode.NONE
+        component.renderMode =
+            if (useHighAccuracy) {
+                RenderMode.COMPASS
+            } else {
+                RenderMode.NORMAL
+            }
+        runCatching {
+            component.locationEngineRequest = buildLocationEngineRequest(useHighAccuracy)
+        }
+    }
+
+    @Suppress("MissingPermission")
+    override fun disableIfActivated() {
+        val component = map.locationComponent
+        if (component.isLocationComponentActivated && component.isLocationComponentEnabled) {
+            component.isLocationComponentEnabled = false
+        }
+    }
+
+    @Suppress("MissingPermission")
+    override fun queryLastKnownCoordinate(): CityMapCoordinate? {
+        return try {
+            val loc = map.locationComponent.lastKnownLocation
+            if (loc != null && isValidCoordinate(loc.latitude, loc.longitude)) {
+                CityMapCoordinate(loc.latitude, loc.longitude)
+            } else {
+                null
+            }
+        } catch (sec: SecurityException) {
+            ClimaMapLogger.w(ClimaMapLogTags.MAP_RENDER, "Sem permissão ao consultar lastKnownLocation: ${sec.message}")
+            null
+        } catch (err: Exception) {
+            ClimaMapLogger.w(
+                ClimaMapLogTags.MAP_RENDER,
+                "Última localização ainda indisponível (${err.message ?: err.javaClass.simpleName}).",
+            )
+            null
+        }
+    }
+}
+
+private fun isValidCoordinate(lat: Double, lon: Double): Boolean =
+    !lat.isNaN() && !lon.isNaN() && lat in -90.0..90.0 && lon in -180.0..180.0
+
+/**
+ * Pure, unit-testable coordinator for [enableMapLibreLocationComponent].
+ *
+ * Guarantees:
+ * - Never activates [LocationComponent] without `ACCESS_FINE_LOCATION` or `ACCESS_COARSE_LOCATION`.
+ * - Deactivates an already active [LocationComponent] if permissions are revoked while open.
+ * - Requires loaded style before activation.
+ * - Adjusts precision mode (`useHighAccuracy` true for `ACCESS_FINE_LOCATION`, false for `ACCESS_COARSE_LOCATION`).
+ * - Handles missing `lastKnownLocation` ("Last location unavailable") gracefully without throwing or
+ *   propagating false connection/render failures to [MapSurfaceLoadState].
+ */
+internal fun syncMapLibreLocationComponent(
+    context: Context,
+    gateway: MapLibreLocationGateway,
+    onValidLocation: ((CityMapCoordinate) -> Unit)? = null,
+): LocationComponentSyncResult {
+    val fine = LocationPermissionCoordinator.hasFinePermission(context)
+    val coarse = LocationPermissionCoordinator.hasCoarsePermission(context)
+    if (!fine && !coarse) {
+        return if (gateway.isActivated || gateway.isEnabled) {
+            runCatching { gateway.disableIfActivated() }
+            ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "LocationComponent desativado após revogação de permissão.")
+            LocationComponentSyncResult.DISABLED_AFTER_REVOCATION
+        } else {
+            LocationComponentSyncResult.PERMISSION_DENIED
+        }
+    }
+
+    if (!gateway.isStyleFullyLoaded) {
+        return LocationComponentSyncResult.STYLE_NOT_READY
+    }
+
+    val useHighAccuracy = fine
+    val precision =
+        if (useHighAccuracy) LocationPrecisionLevel.PRECISE else LocationPrecisionLevel.APPROXIMATE
+
+    return try {
+        if (!gateway.isActivated) {
+            gateway.activate(useHighAccuracy)
+        }
+        gateway.applyModes(useHighAccuracy)
+
+        val coord =
+            gateway.queryLastKnownCoordinate()
+                ?: LocationPermissionCoordinator.fallbackSystemLastLocation(context, precision)
+
+        if (coord != null && isValidCoordinate(coord.latitude, coord.longitude)) {
+            onValidLocation?.invoke(coord)
+            LocationComponentSyncResult.ACTIVATED_WITH_FIX
+        } else {
+            LocationComponentSyncResult.ACTIVATED_AWAITING_FIX
+        }
+    } catch (sec: SecurityException) {
+        ClimaMapLogger.w(ClimaMapLogTags.MAP_RENDER, "SecurityException no LocationComponent (sem falha fatal): ${sec.message}")
+        runCatching { gateway.disableIfActivated() }
+        LocationComponentSyncResult.PERMISSION_DENIED
+    } catch (err: Exception) {
+        ClimaMapLogger.w(
+            ClimaMapLogTags.MAP_RENDER,
+            "Falha não fatal no LocationComponent (${err.message ?: err.javaClass.simpleName}); mapa OSM mantido.",
+        )
+        LocationComponentSyncResult.FAILED_NON_FATAL
+    }
+}
+
+internal fun enableMapLibreLocationComponent(
     context: Context,
     map: MapLibreMap,
     style: Style,
-) {
-    runCatching {
-        val locationComponent = map.locationComponent
-        if (!locationComponent.isLocationComponentActivated) {
-            val options = LocationComponentActivationOptions.builder(context, style).build()
-            locationComponent.activateLocationComponent(options)
-        }
-        locationComponent.isLocationComponentEnabled = true
-        locationComponent.cameraMode = CameraMode.NONE
-        locationComponent.renderMode = RenderMode.COMPASS
-    }
-}
-
-@SuppressLint("MissingPermission")
-private fun fetchLastOrCurrentLocation(
-    context: Context,
-    onResult: (CityMapCoordinate?) -> Unit,
-) {
-    if (!hasLocationPermission(context)) {
-        onResult(null)
-        return
-    }
-
-    val fusedClient = LocationServices.getFusedLocationProviderClient(context)
-    fusedClient.lastLocation
-        .addOnSuccessListener { lastKnown: Location? ->
-            if (lastKnown != null) {
-                onResult(CityMapCoordinate(lastKnown.latitude, lastKnown.longitude))
-            } else {
-                val cancellation = CancellationTokenSource()
-                fusedClient
-                    .getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, cancellation.token)
-                    .addOnSuccessListener { current ->
-                        if (current != null) {
-                            onResult(CityMapCoordinate(current.latitude, current.longitude))
-                        } else {
-                            onResult(fallbackSystemLastLocation(context))
-                        }
-                    }
-                    .addOnFailureListener {
-                        onResult(fallbackSystemLastLocation(context))
-                    }
-            }
-        }
-        .addOnFailureListener {
-            onResult(fallbackSystemLastLocation(context))
-        }
-}
-
-@SuppressLint("MissingPermission")
-private fun fallbackSystemLastLocation(context: Context): CityMapCoordinate? {
-    return runCatching {
-        val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
-        val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
-        val best =
-            providers
-                .mapNotNull { provider -> runCatching { manager.getLastKnownLocation(provider) }.getOrNull() }
-                .maxByOrNull { it.time }
-        best?.let { CityMapCoordinate(it.latitude, it.longitude) }
-    }.getOrNull()
-}
+    onValidLocation: ((CityMapCoordinate) -> Unit)? = null,
+): LocationComponentSyncResult =
+    syncMapLibreLocationComponent(
+        context = context,
+        gateway = RealMapLibreLocationGateway(context = context, map = map, style = style),
+        onValidLocation = onValidLocation,
+    )

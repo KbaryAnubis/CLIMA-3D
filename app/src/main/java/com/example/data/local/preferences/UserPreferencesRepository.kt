@@ -49,6 +49,7 @@ data class UserPreferences(
     val themeMode: AppThemeMode = AppThemeMode.DARK,
     val showPressureStatus: Boolean = true,
     val widgetPreviewSize: String = "4×2",
+    val locationPermissionPromptShown: Boolean = false,
 )
 
 class UserPreferencesRepository(
@@ -79,6 +80,7 @@ class UserPreferencesRepository(
                 themeMode = parseEnum(prefs[Keys.THEME_MODE], AppThemeMode.DARK),
                 showPressureStatus = prefs[Keys.SHOW_PRESSURE_STATUS] ?: true,
                 widgetPreviewSize = prefs[Keys.WIDGET_PREVIEW_SIZE] ?: "4×2",
+                locationPermissionPromptShown = prefs[Keys.LOCATION_PERMISSION_PROMPT_SHOWN] ?: false,
             )
         }
 
@@ -142,12 +144,20 @@ class UserPreferencesRepository(
         dataStore.edit { it[Keys.WIDGET_PREVIEW_SIZE] = size }
     }
 
+    suspend fun setLocationPermissionPromptShown(shown: Boolean) {
+        dataStore.edit { it[Keys.LOCATION_PERMISSION_PROMPT_SHOWN] = shown }
+    }
+
     suspend fun resetToDefaults() {
         dataStore.edit { prefs ->
             val currentLocation = prefs[Keys.SELECTED_LOCATION_ID]
+            val promptShown = prefs[Keys.LOCATION_PERMISSION_PROMPT_SHOWN]
             prefs.clear()
             if (currentLocation != null) {
                 prefs[Keys.SELECTED_LOCATION_ID] = currentLocation
+            }
+            if (promptShown != null) {
+                prefs[Keys.LOCATION_PERMISSION_PROMPT_SHOWN] = promptShown
             }
         }
     }
@@ -171,5 +181,6 @@ class UserPreferencesRepository(
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val SHOW_PRESSURE_STATUS = booleanPreferencesKey("show_pressure_status")
         val WIDGET_PREVIEW_SIZE = stringPreferencesKey("widget_preview_size")
+        val LOCATION_PERMISSION_PROMPT_SHOWN = booleanPreferencesKey("location_permission_prompt_shown")
     }
 }

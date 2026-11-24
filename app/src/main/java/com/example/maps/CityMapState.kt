@@ -40,6 +40,8 @@ data class CityMapUiState(
     val savedMarkers: List<CityMapMarker> = emptyList(),
     val currentUserLocation: CityMapCoordinate? = null,
     val permissionState: LocationPermissionState = LocationPermissionState.NOT_REQUESTED,
+    val locationPrecision: LocationPrecisionLevel = LocationPrecisionLevel.NONE,
+    val locationStatusNotice: String? = null,
     val cameraMoveVersion: Int = 0,
 ) {
     fun zoomIn(step: Double = 1.0): CityMapUiState {
@@ -95,6 +97,12 @@ data class CityMapUiState(
         coordinate: CityMapCoordinate,
         label: String = "Minha localização",
         targetZoom: Double = 13.0,
+        precision: LocationPrecisionLevel =
+            if (locationPrecision == LocationPrecisionLevel.NONE) {
+                LocationPrecisionLevel.PRECISE
+            } else {
+                locationPrecision
+            },
     ): CityMapUiState {
         val clampedZoom = targetZoom.coerceIn(OpenStreetMapTileConfig.MIN_ZOOM, OpenStreetMapTileConfig.MAX_ZOOM)
         return copy(
@@ -109,12 +117,37 @@ data class CityMapUiState(
                     isCurrentLocation = true,
                 ),
             permissionState = LocationPermissionState.GRANTED,
+            locationPrecision = precision,
+            locationStatusNotice = null,
             cameraMoveVersion = cameraMoveVersion + 1,
         )
     }
 
-    fun withPermissionState(state: LocationPermissionState): CityMapUiState =
-        copy(permissionState = state)
+    fun withPermissionState(
+        state: LocationPermissionState,
+        precision: LocationPrecisionLevel =
+            when (state) {
+                LocationPermissionState.GRANTED ->
+                    if (locationPrecision == LocationPrecisionLevel.NONE) {
+                        LocationPrecisionLevel.APPROXIMATE
+                    } else {
+                        locationPrecision
+                    }
+                LocationPermissionState.NOT_REQUESTED,
+                LocationPermissionState.DENIED -> LocationPrecisionLevel.NONE
+            },
+        clearCurrentLocationIfDenied: Boolean = state != LocationPermissionState.GRANTED,
+        notice: String? = locationStatusNotice,
+    ): CityMapUiState =
+        copy(
+            permissionState = state,
+            locationPrecision = precision,
+            currentUserLocation = if (clearCurrentLocationIfDenied) null else currentUserLocation,
+            locationStatusNotice = if (state == LocationPermissionState.GRANTED) notice else null,
+        )
+
+    fun withLocationNotice(notice: String?): CityMapUiState =
+        copy(locationStatusNotice = notice)
 
     fun formattedZoomLabel(): String = "${(zoom * 10.0).roundToInt() / 10.0}x"
 }

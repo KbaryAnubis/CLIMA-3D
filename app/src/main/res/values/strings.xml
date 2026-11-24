@@ -45,7 +45,11 @@
     <string name="cities_map_selected_point">Ponto selecionado</string>
     <string name="cities_map_location_denied">Permissão de localização não concedida. O mapa permanece navegável manualmente.</string>
     <string name="cities_map_location_active">Localização atual ativa</string>
+    <string name="cities_map_location_approx_active">Localização aproximada ativa</string>
     <string name="cities_map_osm_attribution">© OpenStreetMap contributors</string>
+    <string name="settings_location_permission_title">Permissão de localização do Android</string>
+    <string name="settings_location_permission_request">Solicitar permissão de localização</string>
+    <string name="settings_location_permission_open_settings">Abrir configurações do app</string>
     <string name="radar_layer_title">Camada meteorológica do Radar</string>
     <string name="radar_layer_note">MeteorologicalRadarTileProvider integrado ao RainViewer sobre MapLibre + OpenStreetMap (quadros históricos reais).</string>
     <string name="stage2a_tab_placeholder">Fundo climático persistente ativo nesta aba.</string>

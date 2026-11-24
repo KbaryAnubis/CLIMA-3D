@@ -12,6 +12,7 @@ import com.example.data.model.SavedLocation
 import com.example.data.model.WeatherForecastBundle
 import com.example.maps.CityMapCoordinate
 import com.example.maps.CityMapUiState
+import com.example.maps.LocationPermissionSnapshot
 import com.example.maps.RadarBaseStyle
 import com.example.media.WeatherCondition
 import com.example.ui.theme.ClimaTab
@@ -56,6 +57,8 @@ data class SavedLocationWeatherSummary(
 data class ClimaUiState(
     val activeTab: ClimaTab = ClimaTab.HOME,
     val preferences: UserPreferences = UserPreferences(),
+    val preferencesLoaded: Boolean = false,
+    val locationPermissionSnapshot: LocationPermissionSnapshot = LocationPermissionSnapshot(),
     val isOnline: Boolean = true,
     val isRefreshing: Boolean = false,
     val isRefreshingCities: Boolean = false,

@@ -21,6 +21,9 @@ import com.example.data.model.WeatherResult
 import com.example.data.model.WindSpeedUnit
 import com.example.maps.CityMapCoordinate
 import com.example.maps.CityMapUiState
+import com.example.maps.LocationPermissionSnapshot
+import com.example.maps.LocationPermissionState
+import com.example.maps.LocationPrecisionLevel
 import com.example.maps.OpenStreetMapTileConfig
 import com.example.maps.RadarBaseStyle
 import com.example.ui.theme.ClimaTab
@@ -65,7 +68,17 @@ class ClimaMainViewModel(
     private fun observePreferences() {
         viewModelScope.launch {
             container.preferencesRepository.preferencesFlow.collect { prefs ->
-                _uiState.update { it.copy(preferences = prefs) }
+                _uiState.update { state ->
+                    val updatedSnapshot =
+                        state.locationPermissionSnapshot.copy(
+                            initialPromptShown = prefs.locationPermissionPromptShown || state.locationPermissionSnapshot.initialPromptShown,
+                        )
+                    state.copy(
+                        preferences = prefs,
+                        preferencesLoaded = true,
+                        locationPermissionSnapshot = updatedSnapshot,
+                    )
+                }
             }
         }
     }
@@ -704,6 +717,63 @@ class ClimaMainViewModel(
     }
 
     // --- Cities & Map Management ---
+
+    fun markLocationPromptHandled() {
+        _uiState.update { state ->
+            state.copy(
+                preferences = state.preferences.copy(locationPermissionPromptShown = true),
+                locationPermissionSnapshot = state.locationPermissionSnapshot.copy(initialPromptShown = true),
+            )
+        }
+        viewModelScope.launch {
+            container.preferencesRepository.setLocationPermissionPromptShown(true)
+        }
+    }
+
+    fun syncLocationPermissionSnapshot(snapshot: LocationPermissionSnapshot) {
+        _uiState.update { state ->
+            val effectivePromptShown =
+                snapshot.initialPromptShown || state.preferences.locationPermissionPromptShown
+            val normalizedSnapshot = snapshot.copy(initialPromptShown = effectivePromptShown)
+            val updatedMapState =
+                if (normalizedSnapshot.hasAnyPermission) {
+                    val serviceNotice =
+                        if (normalizedSnapshot.isLocationServiceEnabled) {
+                            state.cityMapState.locationStatusNotice
+                        } else {
+                            "Localização do aparelho desativada no sistema."
+                        }
+                    state.cityMapState.withPermissionState(
+                        state = LocationPermissionState.GRANTED,
+                        precision = normalizedSnapshot.precisionLevel,
+                        clearCurrentLocationIfDenied = false,
+                        notice = serviceNotice,
+                    )
+                } else {
+                    val mapPermState =
+                        if (effectivePromptShown) {
+                            LocationPermissionState.DENIED
+                        } else {
+                            LocationPermissionState.NOT_REQUESTED
+                        }
+                    state.cityMapState.withPermissionState(
+                        state = mapPermState,
+                        precision = LocationPrecisionLevel.NONE,
+                        clearCurrentLocationIfDenied = true,
+                    )
+                }
+            state.copy(
+                locationPermissionSnapshot = normalizedSnapshot,
+                cityMapState = updatedMapState,
+            )
+        }
+    }
+
+    fun onLocationPermissionResult(snapshot: LocationPermissionSnapshot) {
+        val withPromptFlag = snapshot.copy(initialPromptShown = true)
+        markLocationPromptHandled()
+        syncLocationPermissionSnapshot(withPromptFlag)
+    }
 
     fun selectCitiesSubTab(subTab: CitiesSubTab) {
         _uiState.update { it.copy(citiesSubTab = subTab) }

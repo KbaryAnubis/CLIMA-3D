@@ -87,6 +87,7 @@ fun CitiesScreen(
     onRemoveSavedLocation: (SavedLocation) -> Unit,
     onRetryMap: () -> Unit = {},
     onRefreshCities: () -> Unit = {},
+    onOpenAppLocationSettings: () -> Unit = {},
 ) {
     val tabSpec = remember { WeatherGlassSpecs.forTab(com.example.ui.theme.ClimaTab.CITIES) }
     val dark = LocalClimaDarkTheme.current
@@ -140,6 +141,8 @@ fun CitiesScreen(
                     CityMapLibreSection(
                         initialState = uiState.cityMapState,
                         isOnline = uiState.isOnline,
+                        isPermanentlyDenied = uiState.locationPermissionSnapshot.permanentlyDenied,
+                        onOpenAppSettings = onOpenAppLocationSettings,
                         onRetryReload = onRetryMap,
                         onStateChanged = onMapStateChanged,
                     )

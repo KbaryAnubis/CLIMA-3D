@@ -45,6 +45,7 @@ import com.example.data.model.TimeFormatPreference
 import com.example.data.model.VisibilityUnit
 import com.example.data.model.WeatherUnitConverter
 import com.example.data.model.WindSpeedUnit
+import com.example.maps.LocationPrecisionLevel
 import com.example.media.ClimaUiIcons
 import com.example.media.WeatherIconSize
 import com.example.ui.components.AnimatedWeatherIcon
@@ -59,10 +60,12 @@ import com.example.ui.components.V53SwitchRow
 import com.example.ui.state.ClimaUiState
 import com.example.ui.state.InAppWeatherAlertEngine
 import com.example.ui.theme.ClimaAccentCyan
+import com.example.ui.theme.ClimaAlertAttentionAmber
 import com.example.ui.theme.ClimaButtonGradientEnd
 import com.example.ui.theme.ClimaButtonGradientStart
 import com.example.ui.theme.ClimaTab
 import com.example.ui.theme.ClimaTextOnDark
+import com.example.ui.theme.ClimaToastEmerald
 import com.example.ui.theme.LocalClimaDarkTheme
 import com.example.ui.theme.WeatherGlassSpecs
 
@@ -90,6 +93,8 @@ fun SettingsScreen(
     onSetAutoRefreshOnOpen: (Boolean) -> Unit,
     onOpenCities: () -> Unit,
     onResetPreferences: () -> Unit,
+    onRequestLocationPermission: () -> Unit = {},
+    onOpenAppLocationSettings: () -> Unit = {},
 ) {
     val tabSpec = remember { WeatherGlassSpecs.forTab(ClimaTab.SETTINGS) }
     val dark = LocalClimaDarkTheme.current
@@ -418,6 +423,7 @@ fun SettingsScreen(
 
             // 8. Localizações
             item(key = "setting_locations") {
+                val permSnapshot = uiState.locationPermissionSnapshot
                 SettingCardBlock(
                     title = stringResource(R.string.settings_locations),
                     description = "Gerencie suas ${uiState.savedLocations.size} localizações salvas e pontos marcados no mapa.",
@@ -430,6 +436,66 @@ fun SettingsScreen(
                         onClick = onOpenCities,
                         modifier = Modifier.testTag("setting_open_cities_button"),
                     )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (dark) Color(0x8808233E) else Color(0xFFE3F1FC),
+                        border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor(dark)),
+                        modifier = Modifier.fillMaxWidth().testTag("setting_location_permission_card"),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = stringResource(R.string.settings_location_permission_title),
+                                color = WeatherGlassSpecs.primaryTextColor(dark),
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                text = permSnapshot.statusSummaryPt,
+                                color =
+                                    when {
+                                        permSnapshot.precisionLevel != LocationPrecisionLevel.NONE && permSnapshot.isLocationServiceEnabled ->
+                                            if (dark) ClimaToastEmerald else Color(0xFF0E7C56)
+                                        else ->
+                                            if (dark) ClimaAlertAttentionAmber else Color(0xFF9C5700)
+                                    },
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.testTag("setting_location_permission_status"),
+                            )
+
+                            if (!permSnapshot.hasAnyPermission) {
+                                if (permSnapshot.permanentlyDenied) {
+                                    V53PrimaryButton(
+                                        text = stringResource(R.string.settings_location_permission_open_settings),
+                                        iconRes = ClimaUiIcons.Settings,
+                                        secondary = true,
+                                        onClick = onOpenAppLocationSettings,
+                                        modifier = Modifier.testTag("setting_open_app_settings_button"),
+                                    )
+                                } else {
+                                    V53PrimaryButton(
+                                        text = stringResource(R.string.settings_location_permission_request),
+                                        iconRes = ClimaUiIcons.Location,
+                                        secondary = true,
+                                        onClick = onRequestLocationPermission,
+                                        modifier = Modifier.testTag("setting_request_location_permission_button"),
+                                    )
+                                }
+                            } else if (!permSnapshot.isLocationServiceEnabled) {
+                                Text(
+                                    text = "A localização do Android está desativada nas configurações do aparelho.",
+                                    color = WeatherGlassSpecs.mutedTextColor(dark),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    modifier = Modifier.testTag("setting_location_service_disabled_hint"),
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
