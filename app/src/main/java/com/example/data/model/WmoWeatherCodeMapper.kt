@@ -55,8 +55,7 @@ object WmoWeatherCodeMapper {
             71, 73, 75, 77, 85, 86 ->
                 if (isDay) WeatherCondition.NEVE else WeatherCondition.NEVE_NOITE
             95 -> WeatherCondition.TEMPESTADE
-            96 -> WeatherCondition.GRANIZO
-            99 -> WeatherCondition.TEMPESTADE_FORTE
+            96, 99 -> WeatherCondition.GRANIZO
             else -> if (isDay) WeatherCondition.SOL_NUVENS else WeatherCondition.NOITE_PARCIAL
         }
 }

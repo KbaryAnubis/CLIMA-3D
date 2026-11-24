@@ -71,9 +71,16 @@ class WeatherModelsAndUtilsTest {
 
         assertEquals(WeatherCondition.CHUVA, WmoWeatherCodeMapper.toVisualCondition(63, isDay = true))
         assertEquals(WeatherCondition.NOITE_CHUVA, WmoWeatherCodeMapper.toVisualCondition(63, isDay = false))
+        assertEquals(WeatherCondition.CHUVA, WmoWeatherCodeMapper.toVisualCondition(65, isDay = true))
+        assertEquals(WeatherCondition.NOITE_CHUVA, WmoWeatherCodeMapper.toVisualCondition(82, isDay = false))
         assertEquals(WeatherCondition.TEMPESTADE, WmoWeatherCodeMapper.toVisualCondition(95, isDay = true))
+        assertEquals(WeatherCondition.TEMPESTADE, WmoWeatherCodeMapper.toVisualCondition(95, isDay = false))
         assertEquals(WeatherCondition.GRANIZO, WmoWeatherCodeMapper.toVisualCondition(96, isDay = true))
-        assertEquals(WeatherCondition.TEMPESTADE_FORTE, WmoWeatherCodeMapper.toVisualCondition(99, isDay = false))
+        assertEquals(WeatherCondition.GRANIZO, WmoWeatherCodeMapper.toVisualCondition(96, isDay = false))
+        assertEquals(WeatherCondition.GRANIZO, WmoWeatherCodeMapper.toVisualCondition(99, isDay = true))
+        assertEquals(WeatherCondition.GRANIZO, WmoWeatherCodeMapper.toVisualCondition(99, isDay = false))
+        assertEquals("Tempestade com granizo leve", WmoWeatherCodeMapper.descriptionPt(96, isDay = true))
+        assertEquals("Tempestade com granizo forte", WmoWeatherCodeMapper.descriptionPt(99, isDay = false))
         assertEquals(WeatherCondition.NEVE_NOITE, WmoWeatherCodeMapper.toVisualCondition(73, isDay = false))
 
         assertEquals("Condição indisponível", WmoWeatherCodeMapper.descriptionPt(null, isDay = true))

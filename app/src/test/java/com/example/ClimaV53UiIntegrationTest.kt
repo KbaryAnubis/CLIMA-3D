@@ -460,6 +460,143 @@ class ClimaV53UiIntegrationTest {
         }
     }
 
+    @Test
+    fun `Tempestade com granizo icon integrates animated WebP resource, static fallback, WMO 96 and 99 mapping, and renders across Home, hourly, daily, and modals`() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+
+        // 1. Validate AnimatedWeatherWebp.TEMPESTADE_COM_GRANIZO and WeatherCondition.GRANIZO contract
+        val hailWebp = com.example.media.AnimatedWeatherWebp.TEMPESTADE_COM_GRANIZO
+        assertEquals("tempestade_com_granizo", hailWebp.key)
+        assertEquals(R.drawable.wx_icon_tempestade_com_granizo, hailWebp.drawableRes)
+        assertEquals(hailWebp, WeatherCondition.GRANIZO.animatedWebp)
+        assertEquals(R.drawable.wx_fallback_granizo, WeatherCondition.GRANIZO.fallbackVectorRes)
+
+        // Verify other storm/rain conditions remain intact
+        assertEquals(com.example.media.AnimatedWeatherWebp.TEMPESTADE_COM_CHUVA, WeatherCondition.TEMPESTADE.animatedWebp)
+        assertEquals(com.example.media.AnimatedWeatherWebp.TEMPESTADE_FORTE, WeatherCondition.TEMPESTADE_FORTE.animatedWebp)
+        assertEquals(com.example.media.AnimatedWeatherWebp.CHUVA_MODERADA, WeatherCondition.CHUVA.animatedWebp)
+
+        // 2. Validate physical VP8X animated WebP resource (420x420 1:1, alpha + animation flags, 30 frames) and static fallback drawable
+        val webpBytes = context.resources.openRawResource(R.drawable.wx_icon_tempestade_com_granizo).use { it.readBytes() }
+        assertTrue("Animated WebP resource must not be empty", webpBytes.size > 30)
+        assertEquals("RIFF", String(webpBytes, 0, 4, Charsets.US_ASCII))
+        assertEquals("WEBPVP8X", String(webpBytes, 8, 8, Charsets.US_ASCII))
+        val vp8xFlags = webpBytes[20].toInt() and 0xFF
+        assertTrue("VP8X animation bit (0x02) must be set", (vp8xFlags and 0x02) != 0)
+        assertTrue("VP8X alpha bit (0x10) must be set", (vp8xFlags and 0x10) != 0)
+        val canvasWidth = 1 + ((webpBytes[24].toInt() and 0xFF) or ((webpBytes[25].toInt() and 0xFF) shl 8) or ((webpBytes[26].toInt() and 0xFF) shl 16))
+        val canvasHeight = 1 + ((webpBytes[27].toInt() and 0xFF) or ((webpBytes[28].toInt() and 0xFF) shl 8) or ((webpBytes[29].toInt() and 0xFF) shl 16))
+        assertEquals(420, canvasWidth)
+        assertEquals(420, canvasHeight)
+        val fallbackDrawable = androidx.core.content.ContextCompat.getDrawable(context, R.drawable.wx_fallback_granizo)
+        org.junit.Assert.assertNotNull(fallbackDrawable)
+
+        // 3. Validate WeatherImageLoader & buildWeatherWebpRequest across all V53 icon slots
+        val iconSlots = listOf(
+            com.example.media.WeatherIconSize.Hero,
+            com.example.media.WeatherIconSize.Hourly,
+            com.example.media.WeatherIconSize.Daily,
+            com.example.media.WeatherIconSize.Radar,
+            com.example.media.WeatherIconSize.Alert,
+            com.example.media.WeatherIconSize.Modal,
+            com.example.media.WeatherIconSize.Widget,
+        )
+        for (slotDp in iconSlots) {
+            val req = com.example.ui.components.buildWeatherWebpRequest(
+                context = context,
+                drawableRes = hailWebp.drawableRes,
+                targetSizePx = slotDp.value.toInt(),
+            )
+            assertEquals(hailWebp.drawableRes, req.data)
+            assertFalse(req.allowHardware)
+            assertEquals(-1, req.parameters.value<Int>("coil#repeat_count"))
+        }
+
+        // 4. Validate UI rendering across Home Hero, 37h hourly strip, 16-day forecast, detail modals, and unit conversions (°C/°F, km/h/mph)
+        val hailForecast = sampleForecast(weatherCode = 96, precipMm = 18.0, windGustsKmh = 64.0, uv = 7.0).let { base ->
+            base.copy(
+                current = base.current.copy(
+                    weatherCode = 96,
+                    weatherDescriptionPt = com.example.data.model.WmoWeatherCodeMapper.descriptionPt(96, isDay = true),
+                    visualConditionKey = com.example.data.model.WmoWeatherCodeMapper.toVisualCondition(96, isDay = true).key,
+                ),
+                hourly = base.hourly.mapIndexed { idx, h ->
+                    val code = if (idx % 2 == 0) 96 else 99
+                    h.copy(
+                        weatherCode = code,
+                        weatherDescriptionPt = com.example.data.model.WmoWeatherCodeMapper.descriptionPt(code, isDay = idx % 3 != 0),
+                        visualConditionKey = com.example.data.model.WmoWeatherCodeMapper.toVisualCondition(code, isDay = idx % 3 != 0).key,
+                    )
+                },
+                daily = base.daily.mapIndexed { idx, d ->
+                    val code = if (idx % 2 == 0) 96 else 99
+                    d.copy(
+                        weatherCode = code,
+                        weatherDescriptionPt = com.example.data.model.WmoWeatherCodeMapper.descriptionPt(code, isDay = true),
+                        visualConditionKey = com.example.data.model.WmoWeatherCodeMapper.toVisualCondition(code, isDay = true).key,
+                    )
+                },
+            )
+        }
+
+        val stateHolder = androidx.compose.runtime.mutableStateOf(
+            ClimaUiState(
+                activeLocation = sampleSavedLocation(),
+                forecast = hailForecast,
+                preferences = UserPreferences(
+                    temperatureUnit = TemperatureUnit.FAHRENHEIT,
+                    windSpeedUnit = WindSpeedUnit.MPH,
+                ),
+                alerts = InAppWeatherAlertEngine.evaluateAlerts("São Paulo", hailForecast, sampleAirQuality(usAqi = 50)),
+            ),
+        )
+
+        composeTestRule.setContent {
+            val state = stateHolder.value
+            Clima3DTheme(darkTheme = true) {
+                HomeScreen(
+                    uiState = state,
+                    contentPadding = PaddingValues(12.dp),
+                    onOpenCities = {},
+                    onOpenSettings = {},
+                    onOpenAlerts = {},
+                    onRefresh = {},
+                    onToggleDaysExpanded = {},
+                    onHourClick = { idx, point ->
+                        stateHolder.value = state.copy(activeModal = ClimaActiveModal.HourDetail(idx, point))
+                    },
+                    onDayClick = { idx, point ->
+                        stateHolder.value = state.copy(activeModal = ClimaActiveModal.DayDetail(idx, point))
+                    },
+                    onMetricClick = {},
+                )
+                ClimaDetailModalHost(
+                    uiState = state,
+                    onDismiss = { stateHolder.value = state.copy(activeModal = ClimaActiveModal.None) },
+                    onOpenPressureInfo = {},
+                )
+                // Also render static fallback mode explicitly to verify static vector compatibility
+                com.example.ui.components.AnimatedWeatherIcon(
+                    condition = WeatherCondition.GRANIZO,
+                    size = com.example.media.WeatherIconSize.Alert,
+                    preferStaticFallback = true,
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("home_hero_weather_icon").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("home_current_temperature").assertTextContains("75°F")
+        composeTestRule.onNodeWithText("Tempestade com granizo leve").assertIsDisplayed()
+
+        // Verify hourly card tap opens HourDetail modal with hailstorm icon
+        composeTestRule.onNodeWithTag("home_hourly_panel").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("home_hour_card_1").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("hour_detail_modal_content").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Tempestade com granizo forte").assertIsDisplayed()
+    }
+
     private fun sampleSavedLocation(): SavedLocation =
         SavedLocation(
             id = 1L,

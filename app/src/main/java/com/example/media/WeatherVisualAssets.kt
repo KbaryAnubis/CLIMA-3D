@@ -22,7 +22,7 @@ object WeatherIconSize {
 }
 
 /**
- * Represents the 10 official 420x420 animated VP8X WebP icons extracted from CLIMA 3D V53.
+ * Represents the 11 official 420x420 animated VP8X WebP icons for CLIMA 3D V53.
  */
 enum class AnimatedWeatherWebp(
     val key: String,
@@ -42,6 +42,11 @@ enum class AnimatedWeatherWebp(
         "tempestade_com_chuva",
         R.drawable.wx_icon_tempestade_com_chuva,
         R.string.wx_tempestade,
+    ),
+    TEMPESTADE_COM_GRANIZO(
+        "tempestade_com_granizo",
+        R.drawable.wx_icon_tempestade_com_granizo,
+        R.string.wx_granizo,
     ),
     TROVOADA("trovoada", R.drawable.wx_icon_trovoada, R.string.wx_trovoada),
     TEMPESTADE_FORTE(
@@ -227,7 +232,7 @@ enum class WeatherCondition(
     GRANIZO(
         key = "granizo",
         labelRes = R.string.wx_granizo,
-        animatedWebp = null,
+        animatedWebp = AnimatedWeatherWebp.TEMPESTADE_COM_GRANIZO,
         fallbackVectorRes = R.drawable.wx_fallback_granizo,
         backgroundVideo = WeatherBackgroundVideo.THUNDER,
         staticWallpaperRes = R.drawable.wx_wall_tempestade,

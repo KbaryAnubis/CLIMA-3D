@@ -55,18 +55,27 @@ fun AnimatedWeatherIcon(
     modifier: Modifier = Modifier,
     size: Dp = WeatherIconSize.Hero,
     contentDescription: String? = stringResource(condition.labelRes),
+    preferStaticFallback: Boolean = false,
 ) {
     val webp = condition.animatedWebp
-    if (webp != null) {
+    val fallbackRes = condition.fallbackVectorRes
+    if (preferStaticFallback && fallbackRes != null) {
+        FallbackWeatherVector(
+            drawableRes = fallbackRes,
+            size = size,
+            contentDescription = contentDescription,
+            modifier = modifier,
+        )
+    } else if (webp != null) {
         AnimatedWeatherWebpImage(
             webp = webp,
             size = size,
             contentDescription = contentDescription,
             modifier = modifier,
         )
-    } else if (condition.fallbackVectorRes != null) {
+    } else if (fallbackRes != null) {
         FallbackWeatherVector(
-            drawableRes = condition.fallbackVectorRes,
+            drawableRes = fallbackRes,
             size = size,
             contentDescription = contentDescription,
             modifier = modifier,
