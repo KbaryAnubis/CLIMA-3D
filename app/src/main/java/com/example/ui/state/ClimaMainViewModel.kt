@@ -27,8 +27,11 @@ import com.example.maps.LocationPrecisionLevel
 import com.example.maps.OpenStreetMapTileConfig
 import com.example.maps.RadarBaseStyle
 import com.example.ui.theme.ClimaTab
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,6 +41,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Primary MVVM ViewModel coordinating Clima 3D's complete V53 native UI with
@@ -46,6 +50,7 @@ import kotlinx.coroutines.launch
 class ClimaMainViewModel(
     private val container: ClimaDataContainer,
     private val autoBootstrapOnInit: Boolean = true,
+    private val cpuDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(ClimaUiState())
@@ -190,26 +195,36 @@ class ClimaMainViewModel(
     }
 
     private fun hydrateCachedSummariesForSavedLocations(locations: List<SavedLocation>) {
+        if (locations.isEmpty()) return
         viewModelScope.launch {
-            val summaries = mutableMapOf<Long, SavedLocationWeatherSummary>()
-            locations.forEach { loc ->
-                val cached =
-                    container.weatherRepository.getForecast(
-                        latitude = loc.latitude,
-                        longitude = loc.longitude,
-                        policy = CachePolicy.CacheOnly,
-                    )
-                if (cached is WeatherResult.Success) {
-                    val bundle = cached.data
-                    summaries[loc.id] =
-                        SavedLocationWeatherSummary(
-                            temperatureC = bundle.current.temperatureC,
-                            descriptionPt = bundle.current.weatherDescriptionPt,
-                            condition = bundle.current.visualCondition,
-                            isFromCache = true,
-                        )
+            val summaries =
+                coroutineScope {
+                    locations
+                        .map { loc ->
+                            async {
+                                val cached =
+                                    container.weatherRepository.getForecast(
+                                        latitude = loc.latitude,
+                                        longitude = loc.longitude,
+                                        policy = CachePolicy.CacheOnly,
+                                    )
+                                if (cached is WeatherResult.Success) {
+                                    val bundle = cached.data
+                                    loc.id to
+                                        SavedLocationWeatherSummary(
+                                            temperatureC = bundle.current.temperatureC,
+                                            descriptionPt = bundle.current.weatherDescriptionPt,
+                                            condition = bundle.current.visualCondition,
+                                            isFromCache = true,
+                                        )
+                                } else {
+                                    null
+                                }
+                            }
+                        }.awaitAll()
+                        .filterNotNull()
+                        .toMap()
                 }
-            }
             if (summaries.isNotEmpty()) {
                 _uiState.update { state ->
                     state.copy(savedLocationSummaries = state.savedLocationSummaries + summaries)
@@ -260,6 +275,26 @@ class ClimaMainViewModel(
                             timeFormat = prefs.timeFormat,
                             policy = policy,
                         )
+
+                    val snapshotBeforeUpdate = _uiState.value
+                    val resolvedForecast =
+                        when (val res = report.forecast) {
+                            is WeatherResult.Success -> res.data
+                            is WeatherResult.Failure -> snapshotBeforeUpdate.forecast
+                        }
+                    val resolvedAirQuality =
+                        when (val res = report.airQuality) {
+                            is WeatherResult.Success -> res.data
+                            is WeatherResult.Failure -> snapshotBeforeUpdate.airQuality
+                        }
+                    val evaluatedAlerts =
+                        withContext(cpuDispatcher) {
+                            InAppWeatherAlertEngine.evaluateAlerts(
+                                locationName = location.name,
+                                forecast = resolvedForecast,
+                                airQuality = resolvedAirQuality,
+                            )
+                        }
 
                     _uiState.update { state ->
                         val newForecast =
@@ -319,13 +354,6 @@ class ClimaMainViewModel(
                                 is WeatherResult.Success -> null
                                 is WeatherResult.Failure -> res.error.userMessagePt
                             }
-
-                        val evaluatedAlerts =
-                            InAppWeatherAlertEngine.evaluateAlerts(
-                                locationName = location.name,
-                                forecast = newForecast,
-                                airQuality = newAirQuality,
-                            )
 
                         val updatedSummaries =
                             if (newForecast != null) {
@@ -513,6 +541,26 @@ class ClimaMainViewModel(
                         }
                     }
 
+                    val snapshotBeforeUpdate = _uiState.value
+                    val activeLocation = snapshotBeforeUpdate.activeLocation
+                    val resolvedForecast =
+                        when (val activeResult = activeForecastResult) {
+                            is WeatherResult.Success -> activeResult.data
+                            else -> snapshotBeforeUpdate.forecast
+                        }
+                    val evaluatedAlerts =
+                        withContext(cpuDispatcher) {
+                            if (activeLocation != null && resolvedForecast != null) {
+                                InAppWeatherAlertEngine.evaluateAlerts(
+                                    locationName = activeLocation.name,
+                                    forecast = resolvedForecast,
+                                    airQuality = snapshotBeforeUpdate.airQuality,
+                                )
+                            } else {
+                                snapshotBeforeUpdate.alerts
+                            }
+                        }
+
                     _uiState.update { state ->
                         val mergedSummaries = state.savedLocationSummaries + updatedSummaries
                         val activeResult = activeForecastResult
@@ -535,16 +583,6 @@ class ClimaMainViewModel(
                             when (activeResult) {
                                 is WeatherResult.Success -> activeResult.staleReason?.userMessagePt
                                 else -> state.forecastStaleNotice
-                            }
-                        val evaluatedAlerts =
-                            if (state.activeLocation != null && updatedForecast != null) {
-                                InAppWeatherAlertEngine.evaluateAlerts(
-                                    locationName = state.activeLocation.name,
-                                    forecast = updatedForecast,
-                                    airQuality = state.airQuality,
-                                )
-                            } else {
-                                state.alerts
                             }
 
                         state.copy(
@@ -578,7 +616,10 @@ class ClimaMainViewModel(
 
     fun onAppResumeRefresh() {
         if (_uiState.value.preferences.autoRefreshOnOpen && _uiState.value.activeLocation != null) {
-            refreshActiveLocation(policy = CachePolicy.NetworkFirst)
+            refreshActiveLocation(
+                policy = CachePolicy.NetworkFirst,
+                preventDuplicate = true,
+            )
         }
     }
 

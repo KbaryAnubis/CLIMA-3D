@@ -446,6 +446,23 @@ fun V53PullToRefreshBox(
 object ClimaDateLabels {
     private val ptBr = Locale("pt", "BR")
 
+    private val isoDateParser = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat =
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { isLenient = false }
+    }
+
+    private val dayMonthFormatter = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat = SimpleDateFormat("dd/MM", ptBr)
+    }
+
+    private val epochTimeFormatter = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat = SimpleDateFormat("HH:mm", ptBr)
+    }
+
+    private val calendarHolder = object : ThreadLocal<Calendar>() {
+        override fun initialValue(): Calendar = Calendar.getInstance()
+    }
+
     fun formatHourLabel(
         index: Int,
         isoTime: String,
@@ -467,18 +484,25 @@ object ClimaDateLabels {
     }
 
     fun formatDailyWeekdayAndDate(index: Int, dateIso: String): Pair<String, String> {
+        val defaultTz = java.util.TimeZone.getDefault()
+        val parser = isoDateParser.get()!!.apply {
+            timeZone = defaultTz
+            isLenient = false
+        }
         val parsed =
-            runCatching {
-                SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { isLenient = false }.parse(dateIso)
-            }.getOrNull() ?: return Pair(if (index == 0) "Hoje" else dateIso, dateIso)
+            runCatching { parser.parse(dateIso) }.getOrNull()
+                ?: return Pair(if (index == 0) "Hoje" else dateIso, dateIso)
 
-        val datePart = SimpleDateFormat("dd/MM", ptBr).format(parsed)
+        val datePart = dayMonthFormatter.get()!!.apply { timeZone = defaultTz }.format(parsed)
         val weekday =
             when (index) {
                 0 -> "Hoje"
                 1 -> "Amanhã"
                 else -> {
-                    val cal = Calendar.getInstance().apply { time = parsed }
+                    val cal = calendarHolder.get()!!.apply {
+                        timeZone = defaultTz
+                        time = parsed
+                    }
                     when (cal.get(Calendar.DAY_OF_WEEK)) {
                         Calendar.SUNDAY -> "Domingo"
                         Calendar.MONDAY -> "Segunda"
@@ -517,7 +541,7 @@ object ClimaDateLabels {
         timezoneId: String?,
         utcOffsetSeconds: Int,
     ): String {
-        val formatter = SimpleDateFormat("HH:mm", ptBr).apply {
+        val formatter = epochTimeFormatter.get()!!.apply {
             timeZone = WeatherTimeUtils.resolveTimeZone(timezoneId, utcOffsetSeconds)
         }
         return formatter.format(Date(epochMillis))

@@ -16,6 +16,24 @@ object WeatherTimeUtils {
     private const val PATTERN_ISO_LOCAL_DATE_TIME_SEC = "yyyy-MM-dd'T'HH:mm:ss"
     private const val PATTERN_ISO_LOCAL_DATE = "yyyy-MM-dd"
 
+    private val formatterCache = object : ThreadLocal<MutableMap<String, SimpleDateFormat>>() {
+        override fun initialValue(): MutableMap<String, SimpleDateFormat> = HashMap()
+    }
+
+    private fun obtainFormatter(
+        pattern: String,
+        locale: Locale,
+        timeZone: TimeZone,
+        lenient: Boolean = true,
+    ): SimpleDateFormat {
+        val map = formatterCache.get()!!
+        val key = "${pattern}_${locale.toLanguageTag()}"
+        val formatter = map.getOrPut(key) { SimpleDateFormat(pattern, locale) }
+        formatter.timeZone = timeZone
+        formatter.isLenient = lenient
+        return formatter
+    }
+
     /**
      * Resolves a city's local [TimeZone] from Open-Meteo's IANA [timezoneId] (e.g. "America/Sao_Paulo"),
      * falling back to a fixed offset [SimpleTimeZone] using [utcOffsetSeconds] if the IANA ID is
@@ -59,10 +77,7 @@ object WeatherTimeUtils {
             PATTERN_ISO_LOCAL_DATE,
         )
         for (pattern in patterns) {
-            val parser = SimpleDateFormat(pattern, Locale.US).apply {
-                isLenient = false
-                timeZone = tz
-            }
+            val parser = obtainFormatter(pattern = pattern, locale = Locale.US, timeZone = tz, lenient = false)
             try {
                 val parsed = parser.parse(raw)
                 if (parsed != null) return parsed.time
@@ -87,9 +102,11 @@ object WeatherTimeUtils {
             TimeFormatPreference.H24 -> "HH:mm"
             TimeFormatPreference.H12 -> "hh:mm a"
         }
-        val formatter = SimpleDateFormat(pattern, locale).apply {
-            timeZone = resolveTimeZone(timezoneId, utcOffsetSeconds)
-        }
+        val formatter = obtainFormatter(
+            pattern = pattern,
+            locale = locale,
+            timeZone = resolveTimeZone(timezoneId, utcOffsetSeconds),
+        )
         return formatter.format(Date(epochMillis))
     }
 
@@ -102,9 +119,11 @@ object WeatherTimeUtils {
         utcOffsetSeconds: Int = 0,
         locale: Locale = Locale("pt", "BR"),
     ): String {
-        val formatter = SimpleDateFormat("dd/MM HH:mm", locale).apply {
-            timeZone = resolveTimeZone(timezoneId, utcOffsetSeconds)
-        }
+        val formatter = obtainFormatter(
+            pattern = "dd/MM HH:mm",
+            locale = locale,
+            timeZone = resolveTimeZone(timezoneId, utcOffsetSeconds),
+        )
         return formatter.format(Date(epochMillis))
     }
 

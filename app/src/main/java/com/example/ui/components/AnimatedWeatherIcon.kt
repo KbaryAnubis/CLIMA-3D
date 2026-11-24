@@ -14,16 +14,33 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.Dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.request.repeatCount
+import coil.size.Precision
 import com.example.media.AnimatedWeatherWebp
 import com.example.media.WeatherCondition
 import com.example.media.WeatherIconSize
 import com.example.media.WeatherImageLoader
+
+internal fun buildWeatherWebpRequest(
+    context: android.content.Context,
+    @DrawableRes drawableRes: Int,
+    targetSizePx: Int,
+): ImageRequest {
+    val clampedPx = targetSizePx.coerceAtLeast(1)
+    return ImageRequest.Builder(context)
+        .data(drawableRes)
+        .size(clampedPx, clampedPx)
+        .precision(Precision.INEXACT)
+        .repeatCount(-1) // Infinite loop matching V53 animated WebP behavior
+        .allowHardware(false) // Required for AnimatedImageDrawable compatibility across GPUs
+        .build()
+}
 
 /**
  * Displays a V53 3D weather icon (animated VP8X WebP or fallback VectorDrawable)
@@ -65,14 +82,16 @@ fun AnimatedWeatherWebpImage(
     contentDescription: String? = stringResource(webp.labelRes),
 ) {
     val context = LocalContext.current
+    val density = LocalDensity.current
+    val targetSizePx = with(density) { size.roundToPx().coerceAtLeast(1) }
     val imageLoader = remember(context) { WeatherImageLoader.get(context) }
     val request =
-        remember(context, webp.drawableRes) {
-            ImageRequest.Builder(context)
-                .data(webp.drawableRes)
-                .repeatCount(-1) // Infinite loop matching V53 animated WebP behavior
-                .allowHardware(false) // Required for AnimatedImageDrawable compatibility across GPUs
-                .build()
+        remember(context, webp.drawableRes, targetSizePx) {
+            buildWeatherWebpRequest(
+                context = context,
+                drawableRes = webp.drawableRes,
+                targetSizePx = targetSizePx,
+            )
         }
 
     Box(

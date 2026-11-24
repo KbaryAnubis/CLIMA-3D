@@ -15,8 +15,11 @@ import com.example.data.remote.OpenMeteoAirQualityMapper
 import com.example.data.remote.RemoteCallOutcome
 import com.example.data.remote.SafeApiExecutor
 import com.squareup.moshi.Moshi
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 
 /**
  * Offline-first repository for Open-Meteo Air Quality data.
@@ -28,6 +31,8 @@ class AirQualityRepository(
     private val connectivityObserver: ConnectivityObserver,
     private val moshi: Moshi,
     private val clock: () -> Long = { System.currentTimeMillis() },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val cpuDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) {
     private val snapshotAdapter = moshi.adapter(AirQualitySnapshot::class.java)
 
@@ -37,7 +42,7 @@ class AirQualityRepository(
     ): Flow<CachedRecord<AirQualitySnapshot>?> {
         val key = SavedLocation.buildCoordinateKey(latitude, longitude)
         return cacheDao.observeAirQuality(key).map { entity ->
-            entity?.let { decodeEntity(it) }
+            entity?.let { withContext(cpuDispatcher) { decodeEntity(it) } }
         }
     }
 
@@ -47,7 +52,8 @@ class AirQualityRepository(
         policy: CachePolicy = CachePolicy.NetworkFirst,
     ): WeatherResult<AirQualitySnapshot> {
         val locationKey = SavedLocation.buildCoordinateKey(latitude, longitude)
-        val cachedRecord = cacheDao.getAirQuality(locationKey)?.let { decodeEntity(it) }
+        val cachedEntity = withContext(ioDispatcher) { cacheDao.getAirQuality(locationKey) }
+        val cachedRecord = cachedEntity?.let { withContext(cpuDispatcher) { decodeEntity(it) } }
         val now = clock()
 
         when (policy) {
@@ -94,28 +100,32 @@ class AirQualityRepository(
 
         return when (remoteOutcome) {
             is RemoteCallOutcome.Success -> {
-                val mapped = OpenMeteoAirQualityMapper.toDomain(
-                    dto = remoteOutcome.body,
-                    requestedLatitude = latitude,
-                    requestedLongitude = longitude,
-                    fetchedAtEpochMillis = now,
-                )
+                val mapped = withContext(cpuDispatcher) {
+                    OpenMeteoAirQualityMapper.toDomain(
+                        dto = remoteOutcome.body,
+                        requestedLatitude = latitude,
+                        requestedLongitude = longitude,
+                        fetchedAtEpochMillis = now,
+                    )
+                }
                 if (mapped == null) {
                     fallbackToCacheOrFail(
                         cachedRecord,
                         WeatherError.EmptyResponseError(OpenMeteoAirQualityApi.PROVIDER_NAME),
                     )
                 } else {
-                    val serialized = snapshotAdapter.toJson(mapped)
-                    cacheDao.upsertAirQuality(
-                        AirQualityCacheEntity(
-                            locationKey = locationKey,
-                            latitude = mapped.latitude,
-                            longitude = mapped.longitude,
-                            payloadJson = serialized,
-                            fetchedAtEpochMillis = now,
-                        ),
-                    )
+                    val serialized = withContext(cpuDispatcher) { snapshotAdapter.toJson(mapped) }
+                    withContext(ioDispatcher) {
+                        cacheDao.upsertAirQuality(
+                            AirQualityCacheEntity(
+                                locationKey = locationKey,
+                                latitude = mapped.latitude,
+                                longitude = mapped.longitude,
+                                payloadJson = serialized,
+                                fetchedAtEpochMillis = now,
+                            ),
+                        )
+                    }
                     WeatherResult.Success(
                         data = mapped,
                         origin = DataSourceOrigin.LIVE_NETWORK,

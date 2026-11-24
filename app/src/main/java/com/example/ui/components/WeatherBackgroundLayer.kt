@@ -51,18 +51,20 @@ fun WeatherBackgroundLayer(
 ) {
     val context = LocalContext.current
     val systemReducedMotion = remember(context) { isSystemReducedMotionEnabled(context) }
-    val shouldPlayVideo = animatedEnabled && !systemReducedMotion
+    val shouldMountVideo = animatedEnabled && !systemReducedMotion
+    val isMapTabActive = shouldPauseBackgroundMotionForTab(activeTab)
+    val shouldPlayVideoNow = shouldMountVideo && !isMapTabActive
 
     var firstFrameReady by remember(condition.backgroundVideo) { mutableStateOf(false) }
 
-    LaunchedEffect(shouldPlayVideo) {
-        if (!shouldPlayVideo) {
+    LaunchedEffect(shouldMountVideo) {
+        if (!shouldMountVideo) {
             firstFrameReady = false
         }
     }
 
     val videoAlpha by animateFloatAsState(
-        targetValue = if (shouldPlayVideo && firstFrameReady) 1f else 0f,
+        targetValue = if (shouldPlayVideoNow && firstFrameReady) 1f else 0f,
         animationSpec = tween(durationMillis = 280),
         label = "weather_video_fade",
     )
@@ -78,19 +80,19 @@ fun WeatherBackgroundLayer(
             modifier = Modifier.fillMaxSize(),
         )
 
-        // Layer 2: Media3 looping muted MP4 video
-        if (shouldPlayVideo) {
+        // Layer 2: Media3 looping muted MP4 video (paused while MapLibre TextureView tabs are active)
+        if (shouldMountVideo) {
             WeatherVideoBackground(
                 videoResId = condition.backgroundVideo.rawRes,
                 playbackSpeed = condition.videoPlaybackSpeed,
-                isPlaying = true,
+                isPlaying = shouldPlayVideoNow,
                 onFirstFrameRendered = { firstFrameReady = true },
                 modifier = Modifier.fillMaxSize().alpha(videoAlpha),
             )
         }
 
         // Layer 3: Night rain procedural overlay matching V53's `noite_chuva` over `cloudy_night`
-        if (condition.needsNightRainOverlay && shouldPlayVideo) {
+        if (condition.needsNightRainOverlay && shouldPlayVideoNow) {
             NightRainOverlay(modifier = Modifier.fillMaxSize())
         }
 
@@ -167,3 +169,7 @@ private fun isSystemReducedMotionEnabled(context: Context): Boolean {
         scale == 0f
     }.getOrDefault(false)
 }
+
+internal fun shouldPauseBackgroundMotionForTab(tab: ClimaTab): Boolean =
+    tab == ClimaTab.RADAR || tab == ClimaTab.CITIES
+

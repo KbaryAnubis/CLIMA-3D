@@ -18,8 +18,11 @@ import com.example.data.remote.SafeApiExecutor
 import com.example.maps.ClimaMapLogTags
 import com.example.maps.ClimaMapLogger
 import com.squareup.moshi.Moshi
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 
 /**
  * Offline-first repository for RainViewer historical radar metadata and 9-frame animation timeline.
@@ -32,12 +35,14 @@ class RadarRepository(
     private val connectivityObserver: ConnectivityObserver,
     private val moshi: Moshi,
     private val clock: () -> Long = { System.currentTimeMillis() },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val cpuDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) {
     private val snapshotAdapter = moshi.adapter(RadarTimelineSnapshot::class.java)
 
     fun observeCachedRadar(): Flow<CachedRecord<RadarTimelineSnapshot>?> =
         cacheDao.observeRadar().map { entity ->
-            entity?.let { decodeEntity(it) }
+            entity?.let { withContext(cpuDispatcher) { decodeEntity(it) } }
         }
 
     suspend fun getRadarTimeline(
@@ -46,15 +51,20 @@ class RadarRepository(
         timeFormat: TimeFormatPreference = TimeFormatPreference.H24,
         policy: CachePolicy = CachePolicy.NetworkFirst,
     ): WeatherResult<RadarTimelineSnapshot> {
-        val cachedRecord = cacheDao.getRadar()?.let { decodeEntity(it) }?.let { record ->
-            record.copy(
-                data = reformatFrameTimes(
-                    snapshot = record.data,
-                    displayTimezoneId = displayTimezoneId,
-                    displayUtcOffsetSeconds = displayUtcOffsetSeconds,
-                    timeFormat = timeFormat,
-                ),
-            )
+        val cachedEntity = withContext(ioDispatcher) { cacheDao.getRadar() }
+        val cachedRecord = cachedEntity?.let { entity ->
+            withContext(cpuDispatcher) {
+                decodeEntity(entity)?.let { record ->
+                    record.copy(
+                        data = reformatFrameTimes(
+                            snapshot = record.data,
+                            displayTimezoneId = displayTimezoneId,
+                            displayUtcOffsetSeconds = displayUtcOffsetSeconds,
+                            timeFormat = timeFormat,
+                        ),
+                    )
+                }
+            }
         }
         val now = clock()
 
@@ -103,14 +113,16 @@ class RadarRepository(
 
         return when (outcome) {
             is RemoteCallOutcome.Success -> {
-                val mapped = RainViewerMapper.toDomain(
-                    dto = outcome.body,
-                    fetchedAtEpochMillis = now,
-                    displayTimezoneId = displayTimezoneId,
-                    displayUtcOffsetSeconds = displayUtcOffsetSeconds,
-                    timeFormat = timeFormat,
-                    maxFrames = RadarTimelineSnapshot.V53_TARGET_FRAME_COUNT,
-                )
+                val mapped = withContext(cpuDispatcher) {
+                    RainViewerMapper.toDomain(
+                        dto = outcome.body,
+                        fetchedAtEpochMillis = now,
+                        displayTimezoneId = displayTimezoneId,
+                        displayUtcOffsetSeconds = displayUtcOffsetSeconds,
+                        timeFormat = timeFormat,
+                        maxFrames = RadarTimelineSnapshot.V53_TARGET_FRAME_COUNT,
+                    )
+                }
                 if (mapped == null || mapped.frames.isEmpty()) {
                     ClimaMapLogger.w(
                         ClimaMapLogTags.RADAR_FRAMES,
@@ -125,14 +137,16 @@ class RadarRepository(
                         ClimaMapLogTags.RADAR_FRAMES,
                         "RainViewer retornou ${mapped.frames.size} frames históricos reais (host=${mapped.host}, maxZoom=${mapped.maxSupportedZoom}).",
                     )
-                    val serialized = snapshotAdapter.toJson(mapped)
-                    cacheDao.upsertRadar(
-                        RadarTimelineCacheEntity(
-                            cacheKey = RadarTimelineCacheEntity.DEFAULT_CACHE_KEY,
-                            payloadJson = serialized,
-                            fetchedAtEpochMillis = now,
-                        ),
-                    )
+                    val serialized = withContext(cpuDispatcher) { snapshotAdapter.toJson(mapped) }
+                    withContext(ioDispatcher) {
+                        cacheDao.upsertRadar(
+                            RadarTimelineCacheEntity(
+                                cacheKey = RadarTimelineCacheEntity.DEFAULT_CACHE_KEY,
+                                payloadJson = serialized,
+                                fetchedAtEpochMillis = now,
+                            ),
+                        )
+                    }
                     WeatherResult.Success(
                         data = mapped,
                         origin = DataSourceOrigin.LIVE_NETWORK,

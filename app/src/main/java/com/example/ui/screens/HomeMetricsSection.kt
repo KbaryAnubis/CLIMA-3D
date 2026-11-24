@@ -21,6 +21,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -83,7 +84,10 @@ fun HomeTemperatureEvolutionSection(
 ) {
     val dark = LocalClimaDarkTheme.current
     val prefs = uiState.preferences
-    val points = forecast.hourly.take(12).filter { it.temperatureC != null }
+    val points =
+        remember(forecast.hourly) {
+            forecast.hourly.take(12).filter { it.temperatureC != null }
+        }
 
     V53GlassCard(
         alpha = cardAlpha,
@@ -105,12 +109,14 @@ fun HomeTemperatureEvolutionSection(
         }
 
         val temps =
-            points.map { point ->
-                WeatherUnitConverter.convertTemperature(point.temperatureC!!, prefs.temperatureUnit)
+            remember(points, prefs.temperatureUnit) {
+                points.map { point ->
+                    WeatherUnitConverter.convertTemperature(point.temperatureC!!, prefs.temperatureUnit)
+                }
             }
-        val minT = temps.minOrNull() ?: 0.0
-        val maxT = temps.maxOrNull() ?: (minT + 1.0)
-        val range = (maxT - minT).coerceAtLeast(1.0)
+        val minT = remember(temps) { temps.minOrNull() ?: 0.0 }
+        val maxT = remember(temps, minT) { temps.maxOrNull() ?: (minT + 1.0) }
+        val range = remember(minT, maxT) { (maxT - minT).coerceAtLeast(1.0) }
 
         Surface(
             shape = RoundedCornerShape(15.dp),
@@ -202,24 +208,36 @@ fun HomeTemperatureEvolutionSection(
                 }
 
                 // Sampled time & temperature axis labels (start, midpoints, end)
-                val labelIndices = listOf(0, points.size / 3, (points.size * 2) / 3, points.lastIndex).distinct()
+                val axisLabels =
+                    remember(
+                        points,
+                        forecast.timezoneId,
+                        forecast.utcOffsetSeconds,
+                        prefs.temperatureUnit,
+                        prefs.timeFormat,
+                    ) {
+                        val labelIndices = listOf(0, points.size / 3, (points.size * 2) / 3, points.lastIndex).distinct()
+                        labelIndices.map { idx ->
+                            val p = points[idx]
+                            val timeText =
+                                ClimaDateLabels.formatHourLabel(
+                                    index = idx,
+                                    isoTime = p.timeIso,
+                                    epochMillis = p.epochMillis,
+                                    timezoneId = forecast.timezoneId,
+                                    utcOffsetSeconds = forecast.utcOffsetSeconds,
+                                    timeFormat = prefs.timeFormat,
+                                )
+                            val tempText =
+                                WeatherUnitConverter.formatTemperature(p.temperatureC, prefs.temperatureUnit) ?: "—"
+                            tempText to timeText
+                        }
+                    }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    labelIndices.forEach { idx ->
-                        val p = points[idx]
-                        val timeText =
-                            ClimaDateLabels.formatHourLabel(
-                                index = idx,
-                                isoTime = p.timeIso,
-                                epochMillis = p.epochMillis,
-                                timezoneId = forecast.timezoneId,
-                                utcOffsetSeconds = forecast.utcOffsetSeconds,
-                                timeFormat = prefs.timeFormat,
-                            )
-                        val tempText =
-                            WeatherUnitConverter.formatTemperature(p.temperatureC, prefs.temperatureUnit) ?: "—"
+                    axisLabels.forEach { (tempText, timeText) ->
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text(
                                 text = tempText,
@@ -427,23 +445,24 @@ private fun MetricDialCard(
                     val innerRadius = outerRadius - 7.dp.toPx()
 
                     // Repeating radial tick marks reproducing V53 .wx27-dial::before
-                    for (deg in 0 until 360 step 10) {
-                        val rad = deg * PI / 180.0
+                    val majorWidth = 2.2.dp.toPx()
+                    val minorWidth = 1.2.dp.toPx()
+                    DIAL_UNIT_TICKS.forEach { tick ->
                         val start =
                             Offset(
-                                x = center.x + (innerRadius * cos(rad)).toFloat(),
-                                y = center.y + (innerRadius * sin(rad)).toFloat(),
+                                x = center.x + innerRadius * tick.cos,
+                                y = center.y + innerRadius * tick.sin,
                             )
                         val end =
                             Offset(
-                                x = center.x + (outerRadius * cos(rad)).toFloat(),
-                                y = center.y + (outerRadius * sin(rad)).toFloat(),
+                                x = center.x + outerRadius * tick.cos,
+                                y = center.y + outerRadius * tick.sin,
                             )
                         drawLine(
                             color = tickColor,
                             start = start,
                             end = end,
-                            strokeWidth = if (deg % 30 == 0) 2.2.dp.toPx() else 1.2.dp.toPx(),
+                            strokeWidth = if (tick.isMajor) majorWidth else minorWidth,
                             cap = StrokeCap.Round,
                         )
                     }
@@ -919,3 +938,20 @@ fun HomeAlertsSummarySection(
         }
     }
 }
+
+private data class DialUnitTick(
+    val cos: Float,
+    val sin: Float,
+    val isMajor: Boolean,
+)
+
+private val DIAL_UNIT_TICKS: List<DialUnitTick> =
+    (0 until 360 step 10).map { deg ->
+        val rad = deg * PI / 180.0
+        DialUnitTick(
+            cos = cos(rad).toFloat(),
+            sin = sin(rad).toFloat(),
+            isMajor = deg % 30 == 0,
+        )
+    }
+

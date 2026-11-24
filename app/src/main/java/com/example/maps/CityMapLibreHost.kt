@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -62,6 +63,7 @@ import com.example.ui.theme.ClimaTextMutedOnDark
 import com.example.ui.theme.ClimaTextOnDark
 import com.example.ui.theme.ClimaToastEmerald
 import com.example.ui.theme.WeatherGlassSpecs
+import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 import org.maplibre.android.camera.CameraPosition
@@ -210,13 +212,20 @@ fun CityMapLibreSection(
     }
 
     val currentLocationLabel = stringResource(R.string.cities_map_my_location)
+    val latestUiState by rememberUpdatedState(uiState)
+    val latestPermanentlyDenied by rememberUpdatedState(isPermanentlyDenied)
+    var localPermanentlyDenied by remember { mutableStateOf(false) }
 
     fun handleLocationLookup() {
+        val currentState = latestUiState
+        if (currentState.isLocatingUser) return
+        updateState(currentState.withLocatingUser(true))
         LocationPermissionCoordinator.fetchRealLocation(context) { result ->
+            val currentAfterLookup = latestUiState
             when (result) {
                 is LocationLookupResult.Success -> {
                     updateState(
-                        uiState.withCurrentLocation(
+                        currentAfterLookup.withCurrentLocation(
                             coordinate = result.coordinate,
                             label = currentLocationLabel,
                             precision = result.precision,
@@ -225,19 +234,19 @@ fun CityMapLibreSection(
                 }
 
                 LocationLookupResult.PermissionDenied -> {
-                    updateState(uiState.withPermissionState(LocationPermissionState.DENIED))
+                    updateState(currentAfterLookup.withPermissionState(LocationPermissionState.DENIED))
                 }
 
                 LocationLookupResult.LocationServiceDisabled -> {
                     updateState(
-                        uiState.withLocationNotice(
+                        currentAfterLookup.withLocationNotice(
                             "Ative o serviço de localização do aparelho para centralizar no mapa.",
                         ),
                     )
                 }
 
                 is LocationLookupResult.UnavailableTemporarily -> {
-                    updateState(uiState.withLocationNotice(result.reason))
+                    updateState(currentAfterLookup.withLocationNotice(result.reason))
                 }
             }
         }
@@ -247,14 +256,15 @@ fun CityMapLibreSection(
         rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestMultiplePermissions(),
         ) { results ->
+            val canRationale =
+                LocationPermissionCoordinator.canShowAnyLocationRationale(
+                    LocationPermissionCoordinator.findActivity(context),
+                )
             val resolved =
                 LocationPermissionCoordinator.resolvePermissionCallback(
                     grantResults = results,
                     initialPromptShown = true,
-                    canShowRationale =
-                        LocationPermissionCoordinator.canShowAnyLocationRationale(
-                            LocationPermissionCoordinator.findActivity(context),
-                        ),
+                    canShowRationale = canRationale,
                     isLocationServiceEnabled = LocationPermissionCoordinator.isLocationServiceEnabled(context),
                 )
             val effectiveSnapshot =
@@ -264,8 +274,9 @@ fun CityMapLibreSection(
                     LocationPermissionCoordinator.inspect(context, initialPromptShown = true)
                 }
             if (effectiveSnapshot.hasAnyPermission) {
+                localPermanentlyDenied = false
                 updateState(
-                    uiState.withPermissionState(
+                    latestUiState.withPermissionState(
                         state = LocationPermissionState.GRANTED,
                         precision = effectiveSnapshot.precisionLevel,
                         clearCurrentLocationIfDenied = false,
@@ -274,7 +285,8 @@ fun CityMapLibreSection(
                 )
                 handleLocationLookup()
             } else {
-                updateState(uiState.withPermissionState(LocationPermissionState.DENIED))
+                localPermanentlyDenied = effectiveSnapshot.permanentlyDenied
+                updateState(latestUiState.withPermissionState(LocationPermissionState.DENIED))
             }
         }
 
@@ -363,6 +375,8 @@ fun CityMapLibreSection(
                         iconRes = ClimaUiIcons.Location,
                         contentDescription = stringResource(R.string.cities_map_my_location),
                         testTag = "city_map_my_location",
+                        isLoading = uiState.isLocatingUser,
+                        loadingIndicatorTestTag = "city_map_locating_indicator",
                         tint =
                             if (uiState.permissionState == LocationPermissionState.GRANTED) {
                                 ClimaToastEmerald
@@ -376,8 +390,9 @@ fun CityMapLibreSection(
                                     initialPromptShown = uiState.permissionState == LocationPermissionState.DENIED,
                                 )
                             if (snapshot.hasAnyPermission) {
+                                localPermanentlyDenied = false
                                 updateState(
-                                    uiState.withPermissionState(
+                                    latestUiState.withPermissionState(
                                         state = LocationPermissionState.GRANTED,
                                         precision = snapshot.precisionLevel,
                                         clearCurrentLocationIfDenied = false,
@@ -385,8 +400,13 @@ fun CityMapLibreSection(
                                     ),
                                 )
                                 handleLocationLookup()
+                            } else if (latestPermanentlyDenied || localPermanentlyDenied || snapshot.permanentlyDenied) {
+                                localPermanentlyDenied = true
+                                updateState(latestUiState.withPermissionState(LocationPermissionState.DENIED))
                             } else {
-                                locationPermissionLauncher.launch(LocationPermissionCoordinator.REQUIRED_PERMISSIONS)
+                                runCatching {
+                                    locationPermissionLauncher.launch(LocationPermissionCoordinator.REQUIRED_PERMISSIONS)
+                                }
                             }
                         },
                     )
@@ -448,6 +468,7 @@ fun CityMapLibreSection(
                 }
             }
 
+            val effectivePermanentlyDenied = isPermanentlyDenied || localPermanentlyDenied
             if (uiState.permissionState == LocationPermissionState.DENIED) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -460,7 +481,7 @@ fun CityMapLibreSection(
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.weight(1f).testTag("city_map_location_status"),
                     )
-                    if (isPermanentlyDenied) {
+                    if (effectivePermanentlyDenied) {
                         TextButton(
                             onClick = onOpenAppSettings,
                             modifier = Modifier.testTag("city_map_open_settings_button"),
@@ -474,6 +495,13 @@ fun CityMapLibreSection(
                         }
                     }
                 }
+            } else if (uiState.isLocatingUser) {
+                Text(
+                    text = "Obtendo localização atual…",
+                    color = ClimaAccentCyan,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.testTag("city_map_location_status"),
+                )
             } else if (uiState.locationStatusNotice != null) {
                 Text(
                     text = uiState.locationStatusNotice.orEmpty(),
@@ -575,6 +603,9 @@ fun CityMapLibreView(
     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
     var mapLibreMapRef by remember { mutableStateOf<MapLibreMap?>(null) }
     var loadedStyleRef by remember { mutableStateOf<Style?>(null) }
+    val sessionDisposedRef = remember(viewRecreationNonce) { AtomicBoolean(false) }
+    var lastAppliedMoveVersion by remember(viewRecreationNonce) { mutableIntStateOf(state.cameraMoveVersion) }
+    val latestCameraState by rememberUpdatedState(state)
     var loadState by remember {
         mutableStateOf(
             stateMachine.beginAttempt(
@@ -593,7 +624,8 @@ fun CityMapLibreView(
         return "MapView=${view.width}x${view.height}, attached=${view.isAttachedToWindow}, textureAvailable=$textureAvailable"
     }
 
-    fun applyCitiesStyle(map: MapLibreMap, viewContext: Context) {
+    fun applyCitiesStyle(map: MapLibreMap) {
+        if (sessionDisposedRef.get()) return
         val onlineNow = latestIsOnline
         loadedStyleRef = null
         loadState = stateMachine.beginAttempt(
@@ -609,7 +641,7 @@ fun CityMapLibreView(
         loadState = stateMachine.onStyleRequested(isOnline = true)
         ClimaMapLogger.i(
             ClimaMapLogTags.MAP_STYLE,
-            "Estilo base OSM v8 solicitado (Cidades, coords=${state.cameraCenter.formatted()}, zoom=${state.zoom}).",
+            "Estilo base OSM v8 solicitado (Cidades, coords=${latestCameraState.cameraCenter.formatted()}, zoom=${latestCameraState.zoom}).",
         )
         runCatching {
             val styleBuilder =
@@ -618,15 +650,16 @@ fun CityMapLibreView(
                     selectedMarkerGeoJson = latestSelectedMarkerJson,
                 )
             map.setStyle(styleBuilder) { style ->
+                if (sessionDisposedRef.get()) return@setStyle
                 loadedStyleRef = style
                 loadState = stateMachine.onStyleLoaded()
                 ClimaMapLogger.i(
                     ClimaMapLogTags.MAP_STYLE,
                     "Estilo OSM do Mapa de Cidades carregado em ${stateMachine.elapsedMs()}ms (fullyLoaded=${style.isFullyLoaded}).",
                 )
-                enableMapLibreLocationComponent(viewContext, map, style)
             }
         }.onFailure { err ->
+            if (sessionDisposedRef.get()) return@onFailure
             val msg = "Erro ao aplicar estilo do Mapa de Cidades: ${err.message ?: err.javaClass.simpleName}"
             ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, msg, err)
             loadState = stateMachine.onStyleFailed(msg, isOnline = latestIsOnline)
@@ -646,6 +679,7 @@ fun CityMapLibreView(
         }
         val trackedAttempt = attemptKey
         delay(MapLoadStateMachine.INITIAL_LOAD_TIMEOUT_MS)
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         if (stateMachine.attemptId == trackedAttempt && stateMachine.state.isLoading) {
             val surfaceInfo = inspectSurfaceInfo(mapViewRef)
             val timedOutState = stateMachine.onTimeout(TileTransportDiagnostics.snapshot.value, surfaceInfo)
@@ -660,17 +694,19 @@ fun CityMapLibreView(
 
     // Reload style when connectivity returns or user triggers a soft retry
     LaunchedEffect(mapLibreMapRef, reloadNonce, isOnline) {
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         val map = mapLibreMapRef ?: return@LaunchedEffect
         if (!isOnline && loadedStyleRef == null) {
             loadState = stateMachine.beginAttempt(isOnline = false, hasMapReady = true, tileSnapshot = TileTransportDiagnostics.snapshot.value)
             attemptKey = stateMachine.attemptId
         } else if (reloadNonce > 0 || (isOnline && loadState is MapSurfaceLoadState.ConnectionError)) {
-            applyCitiesStyle(map, context)
+            applyCitiesStyle(map)
         }
     }
 
     // Update marker GeoJSON layers whenever marker state changes
     LaunchedEffect(loadedStyleRef, savedMarkersJson, selectedMarkerJson) {
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         val style = loadedStyleRef ?: return@LaunchedEffect
         if (!style.isFullyLoaded) return@LaunchedEffect
         style.getSourceAs<GeoJsonSource>(OpenStreetMapTileConfig.SAVED_MARKERS_SOURCE_ID)
@@ -679,19 +715,25 @@ fun CityMapLibreView(
             ?.setGeoJson(selectedMarkerJson)
     }
 
-    // Sync programmatic zoom/pan/location camera commands to MapLibreMap
+    // Sync programmatic zoom/pan/location camera commands to MapLibreMap cleanly without side effects
     LaunchedEffect(mapLibreMapRef, state.cameraMoveVersion) {
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         val map = mapLibreMapRef ?: return@LaunchedEffect
+        if (state.cameraMoveVersion == lastAppliedMoveVersion) return@LaunchedEffect
+        lastAppliedMoveVersion = state.cameraMoveVersion
         val position =
             CameraPosition.Builder()
                 .target(LatLng(state.cameraCenter.latitude, state.cameraCenter.longitude))
                 .zoom(state.zoom)
                 .build()
-        map.animateCamera(CameraUpdateFactory.newCameraPosition(position), 300)
+        runCatching {
+            map.animateCamera(CameraUpdateFactory.newCameraPosition(position), 260)
+        }
     }
 
-    // Synchronize native MapLibre LocationComponent when map/style are ready or permission/precision changes
+    // Synchronize native MapLibre LocationComponent ONLY when map/style/permission/precision changes
     LaunchedEffect(mapLibreMapRef, loadedStyleRef, state.permissionState, state.locationPrecision) {
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         val map = mapLibreMapRef ?: return@LaunchedEffect
         val style = loadedStyleRef ?: return@LaunchedEffect
         enableMapLibreLocationComponent(context, map, style)
@@ -722,8 +764,10 @@ fun CityMapLibreView(
                 lifecycleOwner.lifecycle.addObserver(observer)
                 context.applicationContext?.registerComponentCallbacks(lowMemoryCallbacks)
                 onDispose {
+                    sessionDisposedRef.set(true)
                     lifecycleOwner.lifecycle.removeObserver(observer)
                     context.applicationContext?.unregisterComponentCallbacks(lowMemoryCallbacks)
+                    runCatching { mapLibreMapRef?.cancelTransitions() }
                     sessionHolder?.dispose()
                     sessionHolder = null
                     mapViewRef = null
@@ -786,6 +830,7 @@ fun CityMapLibreView(
                                 "onDidFinishLoadingMap disparado (Cidades, ${stateMachine.elapsedMs()}ms).",
                             )
                             view.post {
+                                if (sessionDisposedRef.get()) return@post
                                 loadState = stateMachine.onMapLoadedCallback(
                                     TileTransportDiagnostics.snapshot.value,
                                     latestIsOnline,
@@ -797,6 +842,7 @@ fun CityMapLibreView(
                             val reason = errorMessage.ifBlank { "Erro ao carregar mapa-base OpenStreetMap." }
                             ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, "Falha no estilo/mapa Cidades: $reason")
                             view.post {
+                                if (sessionDisposedRef.get()) return@post
                                 loadState = stateMachine.onStyleFailed(reason, isOnline = latestIsOnline)
                             }
                         }
@@ -816,6 +862,7 @@ fun CityMapLibreView(
                                     "Primeiro quadro do MapView de Cidades renderizado em ${stateMachine.elapsedMs()}ms.",
                                 )
                                 view.post {
+                                    if (sessionDisposedRef.get()) return@post
                                     loadState = stateMachine.onFirstFrameRendered(TileTransportDiagnostics.snapshot.value)
                                 }
                             }
@@ -830,6 +877,7 @@ fun CityMapLibreView(
                                     )
                                 }
                                 view.post {
+                                    if (sessionDisposedRef.get()) return@post
                                     loadState = stateMachine.onMapFinishedRendering(
                                         fully = true,
                                         tileSnapshot = TileTransportDiagnostics.snapshot.value,
@@ -837,6 +885,7 @@ fun CityMapLibreView(
                                 }
                             } else {
                                 view.post {
+                                    if (sessionDisposedRef.get()) return@post
                                     loadState = stateMachine.onMapFinishedRendering(
                                         fully = false,
                                         tileSnapshot = TileTransportDiagnostics.snapshot.value,
@@ -848,6 +897,7 @@ fun CityMapLibreView(
                         MapView.OnRenderErrorListener {
                             ClimaMapLogger.e(ClimaMapLogTags.MAP_RENDER, "Erro nativo de renderização no MapView de Cidades.")
                             view.post {
+                                if (sessionDisposedRef.get()) return@post
                                 loadState = stateMachine.onRenderError("Erro nativo de renderização OpenGL/TextureView em Cidades.")
                             }
                         }
@@ -855,6 +905,7 @@ fun CityMapLibreView(
                         MapView.OnShaderCompileFailedListener { id, type, _ ->
                             ClimaMapLogger.e(ClimaMapLogTags.MAP_RENDER, "Falha ao compilar shader MapLibre Cidades (id=$id, type=$type).")
                             view.post {
+                                if (sessionDisposedRef.get()) return@post
                                 loadState = stateMachine.onRenderError("Falha ao compilar shader OpenGL (id=$id).")
                             }
                         }
@@ -888,6 +939,7 @@ fun CityMapLibreView(
                     mapViewRef = view
 
                     view.getMapAsync { map ->
+                        if (sessionDisposedRef.get()) return@getMapAsync
                         mapLibreMapRef = map
                         stateMachine.updateSurfaceDiagnostics(inspectSurfaceInfo(view))
                         loadState = stateMachine.onMapReady(latestIsOnline)
@@ -905,20 +957,24 @@ fun CityMapLibreView(
                             isAttributionEnabled = false
                         }
 
+                        val initialCamera = latestCameraState
+                        lastAppliedMoveVersion = initialCamera.cameraMoveVersion
                         map.cameraPosition =
                             CameraPosition.Builder()
-                                .target(LatLng(state.cameraCenter.latitude, state.cameraCenter.longitude))
-                                .zoom(state.zoom)
+                                .target(LatLng(initialCamera.cameraCenter.latitude, initialCamera.cameraCenter.longitude))
+                                .zoom(initialCamera.zoom)
                                 .build()
 
-                        applyCitiesStyle(map, viewContext)
+                        applyCitiesStyle(map)
 
                         map.addOnMapClickListener { point ->
+                            if (sessionDisposedRef.get()) return@addOnMapClickListener false
                             latestOnMapTap(CityMapCoordinate(point.latitude, point.longitude))
                             true
                         }
 
                         map.addOnCameraIdleListener {
+                            if (sessionDisposedRef.get()) return@addOnCameraIdleListener
                             val target = map.cameraPosition.target ?: return@addOnCameraIdleListener
                             latestOnCameraSettled(
                                 CityMapCoordinate(target.latitude, target.longitude),
@@ -982,6 +1038,8 @@ private fun MapOverlayControlButton(
     testTag: String,
     onClick: () -> Unit,
     textGlyph: String? = null,
+    isLoading: Boolean = false,
+    loadingIndicatorTestTag: String? = null,
     tint: Color = ClimaTextOnDark,
 ) {
     Surface(
@@ -994,7 +1052,18 @@ private fun MapOverlayControlButton(
             onClick = onClick,
             modifier = Modifier.size(48.dp).testTag(testTag),
         ) {
-            if (iconRes != null) {
+            if (isLoading) {
+                CircularProgressIndicator(
+                    color = ClimaAccentCyan,
+                    strokeWidth = 2.dp,
+                    modifier =
+                        Modifier
+                            .size(18.dp)
+                            .let { mod ->
+                                if (loadingIndicatorTestTag != null) mod.testTag(loadingIndicatorTestTag) else mod
+                            },
+                )
+            } else if (iconRes != null) {
                 Icon(
                     painter = painterResource(iconRes),
                     contentDescription = contentDescription,
@@ -1016,6 +1085,7 @@ private fun MapOverlayControlButton(
 internal enum class LocationComponentSyncResult {
     ACTIVATED_WITH_FIX,
     ACTIVATED_AWAITING_FIX,
+    ALREADY_ACTIVE,
     STYLE_NOT_READY,
     PERMISSION_DENIED,
     DISABLED_AFTER_REVOCATION,
@@ -1026,11 +1096,17 @@ internal interface MapLibreLocationGateway {
     val isStyleFullyLoaded: Boolean
     val isActivated: Boolean
     val isEnabled: Boolean
+    fun matchesConfiguration(useHighAccuracy: Boolean): Boolean = false
     fun activate(useHighAccuracy: Boolean)
     fun applyModes(useHighAccuracy: Boolean)
     fun disableIfActivated()
     fun queryLastKnownCoordinate(): CityMapCoordinate?
 }
+
+private data class AppliedLocationConfig(
+    val styleIdentity: Int,
+    val useHighAccuracy: Boolean,
+)
 
 private class RealMapLibreLocationGateway(
     private val context: Context,
@@ -1046,6 +1122,13 @@ private class RealMapLibreLocationGateway(
 
     override val isEnabled: Boolean
         get() = isActivated && runCatching { map.locationComponent.isLocationComponentEnabled }.getOrDefault(false)
+
+    override fun matchesConfiguration(useHighAccuracy: Boolean): Boolean {
+        if (!isActivated || !isEnabled) return false
+        val applied = appliedConfigs[map] ?: return false
+        return applied.styleIdentity == System.identityHashCode(style) &&
+            applied.useHighAccuracy == useHighAccuracy
+    }
 
     private fun buildLocationEngineRequest(useHighAccuracy: Boolean): LocationEngineRequest =
         LocationEngineRequest.Builder(5_000L)
@@ -1084,10 +1167,16 @@ private class RealMapLibreLocationGateway(
         runCatching {
             component.locationEngineRequest = buildLocationEngineRequest(useHighAccuracy)
         }
+        appliedConfigs[map] =
+            AppliedLocationConfig(
+                styleIdentity = System.identityHashCode(style),
+                useHighAccuracy = useHighAccuracy,
+            )
     }
 
     @Suppress("MissingPermission")
     override fun disableIfActivated() {
+        appliedConfigs.remove(map)
         val component = map.locationComponent
         if (component.isLocationComponentActivated && component.isLocationComponentEnabled) {
             component.isLocationComponentEnabled = false
@@ -1114,10 +1203,14 @@ private class RealMapLibreLocationGateway(
             null
         }
     }
+
+    companion object {
+        private val appliedConfigs = WeakHashMap<MapLibreMap, AppliedLocationConfig>()
+    }
 }
 
 private fun isValidCoordinate(lat: Double, lon: Double): Boolean =
-    !lat.isNaN() && !lon.isNaN() && lat in -90.0..90.0 && lon in -180.0..180.0
+    lat.isFinite() && lon.isFinite() && lat in -90.0..90.0 && lon in -180.0..180.0
 
 /**
  * Pure, unit-testable coordinator for [enableMapLibreLocationComponent].
@@ -1126,6 +1219,7 @@ private fun isValidCoordinate(lat: Double, lon: Double): Boolean =
  * - Never activates [LocationComponent] without `ACCESS_FINE_LOCATION` or `ACCESS_COARSE_LOCATION`.
  * - Deactivates an already active [LocationComponent] if permissions are revoked while open.
  * - Requires loaded style before activation.
+ * - Idempotent when already active for the same style + accuracy configuration (avoids duplicate GPS/mode resets).
  * - Adjusts precision mode (`useHighAccuracy` true for `ACCESS_FINE_LOCATION`, false for `ACCESS_COARSE_LOCATION`).
  * - Handles missing `lastKnownLocation` ("Last location unavailable") gracefully without throwing or
  *   propagating false connection/render failures to [MapSurfaceLoadState].
@@ -1155,14 +1249,22 @@ internal fun syncMapLibreLocationComponent(
     val precision =
         if (useHighAccuracy) LocationPrecisionLevel.PRECISE else LocationPrecisionLevel.APPROXIMATE
 
+    if (gateway.isActivated && gateway.isEnabled && gateway.matchesConfiguration(useHighAccuracy)) {
+        return LocationComponentSyncResult.ALREADY_ACTIVE
+    }
+
     return try {
-        if (!gateway.isActivated) {
+        val wasActivated = gateway.isActivated
+        val configChanged = !gateway.matchesConfiguration(useHighAccuracy)
+        if (!wasActivated) {
             gateway.activate(useHighAccuracy)
         }
-        gateway.applyModes(useHighAccuracy)
+        if (!wasActivated || !gateway.isEnabled || configChanged) {
+            gateway.applyModes(useHighAccuracy)
+        }
 
         val coord =
-            gateway.queryLastKnownCoordinate()
+            runCatching { gateway.queryLastKnownCoordinate() }.getOrNull()
                 ?: LocationPermissionCoordinator.fallbackSystemLastLocation(context, precision)
 
         if (coord != null && isValidCoordinate(coord.latitude, coord.longitude)) {

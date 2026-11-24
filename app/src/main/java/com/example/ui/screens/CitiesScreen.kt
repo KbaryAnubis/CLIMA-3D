@@ -257,7 +257,7 @@ fun CitiesScreen(
                             location = loc,
                             isActive = loc.id == uiState.activeLocation?.id,
                             summary = uiState.savedLocationSummaries[loc.id],
-                            uiState = uiState,
+                            temperatureUnit = uiState.preferences.temperatureUnit,
                             onSelect = { onSelectSavedLocation(loc) },
                             onRemove = { onRemoveSavedLocation(loc) },
                         )
@@ -446,7 +446,7 @@ private fun SavedLocationCard(
     location: SavedLocation,
     isActive: Boolean,
     summary: SavedLocationWeatherSummary?,
-    uiState: ClimaUiState,
+    temperatureUnit: com.example.data.model.TemperatureUnit,
     onSelect: () -> Unit,
     onRemove: () -> Unit,
 ) {
@@ -580,7 +580,7 @@ private fun SavedLocationCard(
 
             if (summary?.temperatureC != null) {
                 Text(
-                    text = WeatherUnitConverter.formatTemperature(summary.temperatureC, uiState.preferences.temperatureUnit) ?: "—",
+                    text = WeatherUnitConverter.formatTemperature(summary.temperatureC, temperatureUnit) ?: "—",
                     color = WeatherGlassSpecs.primaryTextColor(dark),
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.ExtraBold,

@@ -53,21 +53,30 @@ fun WeatherVideoBackground(
             }
         }
 
-    LaunchedEffect(videoResId, playbackSpeed) {
+    LaunchedEffect(videoResId) {
         val uri = Uri.parse("android.resource://${context.packageName}/$videoResId")
         exoPlayer.stop()
         exoPlayer.setMediaItem(MediaItem.fromUri(uri))
-        exoPlayer.playbackParameters = PlaybackParameters(playbackSpeed.coerceIn(0.25f, 2.0f))
         exoPlayer.volume = 0f
         exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
         exoPlayer.playWhenReady = latestIsPlaying
         exoPlayer.prepare()
     }
 
+    LaunchedEffect(playbackSpeed) {
+        exoPlayer.playbackParameters = PlaybackParameters(playbackSpeed.coerceIn(0.25f, 2.0f))
+    }
+
     LaunchedEffect(isPlaying) {
         exoPlayer.playWhenReady = isPlaying
-        if (isPlaying && exoPlayer.playbackState == Player.STATE_IDLE) {
-            exoPlayer.prepare()
+        if (isPlaying) {
+            if (exoPlayer.playbackState == Player.STATE_IDLE) {
+                exoPlayer.prepare()
+            } else {
+                exoPlayer.play()
+            }
+        } else {
+            exoPlayer.pause()
         }
     }
 
@@ -88,6 +97,7 @@ fun WeatherVideoBackground(
         val observer =
             LifecycleEventObserver { _, event ->
                 when (event) {
+                    Lifecycle.Event.ON_START,
                     Lifecycle.Event.ON_RESUME -> {
                         if (latestIsPlaying) {
                             exoPlayer.playWhenReady = true
@@ -95,7 +105,9 @@ fun WeatherVideoBackground(
                         }
                     }
 
-                    Lifecycle.Event.ON_PAUSE -> {
+                    Lifecycle.Event.ON_PAUSE,
+                    Lifecycle.Event.ON_STOP -> {
+                        exoPlayer.playWhenReady = false
                         exoPlayer.pause()
                     }
 

@@ -528,14 +528,31 @@ private fun HomeHourlyForecastPanel(
                 itemsIndexed(hours, key = { idx, item -> "${idx}_${item.timeIso}" }) { index, point ->
                     val isCurrent = index == 0
                     val timeLabel =
-                        ClimaDateLabels.formatHourLabel(
-                            index = index,
-                            isoTime = point.timeIso,
-                            epochMillis = point.epochMillis,
-                            timezoneId = forecast.timezoneId,
-                            utcOffsetSeconds = forecast.utcOffsetSeconds,
-                            timeFormat = prefs.timeFormat,
-                        )
+                        remember(
+                            index,
+                            point.timeIso,
+                            point.epochMillis,
+                            forecast.timezoneId,
+                            forecast.utcOffsetSeconds,
+                            prefs.timeFormat,
+                        ) {
+                            ClimaDateLabels.formatHourLabel(
+                                index = index,
+                                isoTime = point.timeIso,
+                                epochMillis = point.epochMillis,
+                                timezoneId = forecast.timezoneId,
+                                utcOffsetSeconds = forecast.utcOffsetSeconds,
+                                timeFormat = prefs.timeFormat,
+                            )
+                        }
+                    val tempLabel =
+                        remember(point.temperatureC, prefs.temperatureUnit) {
+                            WeatherUnitConverter.formatTemperature(point.temperatureC, prefs.temperatureUnit) ?: "—"
+                        }
+                    val rainLabel =
+                        remember(point.precipitationProbabilityPercent) {
+                            point.precipitationProbabilityPercent?.let { "$it%" } ?: "—"
+                        }
                     val cardBg =
                         when {
                             isCurrent && dark -> Brush.verticalGradient(listOf(ClimaHourActiveTop, ClimaHourActiveBottom))
@@ -582,7 +599,7 @@ private fun HomeHourlyForecastPanel(
                                 size = WeatherIconSize.Hourly,
                             )
                             Text(
-                                text = WeatherUnitConverter.formatTemperature(point.temperatureC, prefs.temperatureUnit) ?: "—",
+                                text = tempLabel,
                                 color = cardTextColor,
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.ExtraBold,
@@ -599,7 +616,7 @@ private fun HomeHourlyForecastPanel(
                                     modifier = Modifier.size(12.dp),
                                 )
                                 Text(
-                                    text = point.precipitationProbabilityPercent?.let { "$it%" } ?: "—",
+                                    text = rainLabel,
                                     color = rainTextColor,
                                     style = MaterialTheme.typography.labelMedium,
                                     fontWeight = FontWeight.Bold,
@@ -627,7 +644,10 @@ private fun HomeDailyForecastSection(
     val allDays = forecast.daily
     val totalDays = allDays.size
     val defaultVisible = minOf(7, totalDays)
-    val visibleDays = if (uiState.daysExpanded) allDays else allDays.take(defaultVisible)
+    val visibleDays =
+        remember(allDays, uiState.daysExpanded, defaultVisible) {
+            if (uiState.daysExpanded) allDays else allDays.take(defaultVisible)
+        }
     val extraCount = (totalDays - defaultVisible).coerceAtLeast(0)
     val chevronRotation by animateFloatAsState(
         targetValue = if (uiState.daysExpanded) 180f else 0f,
@@ -645,14 +665,32 @@ private fun HomeDailyForecastSection(
         )
         Spacer(modifier = Modifier.height(10.dp))
 
+        val rowBrush =
+            remember(dark) {
+                if (dark) {
+                    Brush.linearGradient(listOf(ClimaDayRowStart, ClimaDayRowEnd))
+                } else {
+                    Brush.linearGradient(listOf(Color(0xFFE7F2FC), Color(0xFFD8EAF9)))
+                }
+            }
+
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             visibleDays.forEachIndexed { index, day ->
-                val (weekday, dateText) = ClimaDateLabels.formatDailyWeekdayAndDate(index, day.dateIso)
-                val rowBrush =
-                    if (dark) {
-                        Brush.linearGradient(listOf(ClimaDayRowStart, ClimaDayRowEnd))
-                    } else {
-                        Brush.linearGradient(listOf(Color(0xFFE7F2FC), Color(0xFFD8EAF9)))
+                val (weekday, dateText) =
+                    remember(index, day.dateIso) {
+                        ClimaDateLabels.formatDailyWeekdayAndDate(index, day.dateIso)
+                    }
+                val maxTempText =
+                    remember(day.temperatureMaxC, prefs.temperatureUnit) {
+                        "↑ ${WeatherUnitConverter.formatTemperature(day.temperatureMaxC, prefs.temperatureUnit) ?: "—"}"
+                    }
+                val minTempText =
+                    remember(day.temperatureMinC, prefs.temperatureUnit) {
+                        "↓ ${WeatherUnitConverter.formatTemperature(day.temperatureMinC, prefs.temperatureUnit) ?: "—"}"
+                    }
+                val precipSumText =
+                    remember(day.precipitationSumMm, prefs.precipitationUnit) {
+                        WeatherUnitConverter.formatPrecipitation(day.precipitationSumMm, prefs.precipitationUnit) ?: "—"
                     }
 
                 Surface(
@@ -706,14 +744,14 @@ private fun HomeDailyForecastSection(
                             verticalArrangement = Arrangement.spacedBy(6.dp),
                         ) {
                             Text(
-                                text = "↑ ${WeatherUnitConverter.formatTemperature(day.temperatureMaxC, prefs.temperatureUnit) ?: "—"}",
+                                text = maxTempText,
                                 color = if (dark) ClimaTempMaxCoral else Color(0xFFC0394B),
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.Bold,
                                 maxLines = 1,
                             )
                             Text(
-                                text = "↓ ${WeatherUnitConverter.formatTemperature(day.temperatureMinC, prefs.temperatureUnit) ?: "—"}",
+                                text = minTempText,
                                 color = if (dark) ClimaTempMinCyan else Color(0xFF0E6CB8),
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.Bold,
@@ -746,7 +784,7 @@ private fun HomeDailyForecastSection(
                                 )
                             }
                             Text(
-                                text = WeatherUnitConverter.formatPrecipitation(day.precipitationSumMm, prefs.precipitationUnit) ?: "—",
+                                text = precipSumText,
                                 color = WeatherGlassSpecs.mutedTextColor(dark),
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold,

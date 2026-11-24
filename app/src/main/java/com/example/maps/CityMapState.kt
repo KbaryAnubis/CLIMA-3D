@@ -42,15 +42,18 @@ data class CityMapUiState(
     val permissionState: LocationPermissionState = LocationPermissionState.NOT_REQUESTED,
     val locationPrecision: LocationPrecisionLevel = LocationPrecisionLevel.NONE,
     val locationStatusNotice: String? = null,
+    val isLocatingUser: Boolean = false,
     val cameraMoveVersion: Int = 0,
 ) {
     fun zoomIn(step: Double = 1.0): CityMapUiState {
         val nextZoom = (zoom + step).coerceIn(OpenStreetMapTileConfig.MIN_ZOOM, OpenStreetMapTileConfig.MAX_ZOOM)
+        if (nextZoom == zoom) return this
         return copy(zoom = nextZoom, cameraMoveVersion = cameraMoveVersion + 1)
     }
 
     fun zoomOut(step: Double = 1.0): CityMapUiState {
         val nextZoom = (zoom - step).coerceIn(OpenStreetMapTileConfig.MIN_ZOOM, OpenStreetMapTileConfig.MAX_ZOOM)
+        if (nextZoom == zoom) return this
         return copy(zoom = nextZoom, cameraMoveVersion = cameraMoveVersion + 1)
     }
 
@@ -93,6 +96,12 @@ data class CityMapUiState(
     fun withSavedMarkers(markers: List<CityMapMarker>): CityMapUiState =
         copy(savedMarkers = markers)
 
+    fun withLocatingUser(locating: Boolean): CityMapUiState =
+        copy(
+            isLocatingUser = locating,
+            locationStatusNotice = if (locating) null else locationStatusNotice,
+        )
+
     fun withCurrentLocation(
         coordinate: CityMapCoordinate,
         label: String = "Minha localização",
@@ -119,6 +128,7 @@ data class CityMapUiState(
             permissionState = LocationPermissionState.GRANTED,
             locationPrecision = precision,
             locationStatusNotice = null,
+            isLocatingUser = false,
             cameraMoveVersion = cameraMoveVersion + 1,
         )
     }
@@ -144,10 +154,14 @@ data class CityMapUiState(
             locationPrecision = precision,
             currentUserLocation = if (clearCurrentLocationIfDenied) null else currentUserLocation,
             locationStatusNotice = if (state == LocationPermissionState.GRANTED) notice else null,
+            isLocatingUser = if (state == LocationPermissionState.GRANTED) isLocatingUser else false,
         )
 
     fun withLocationNotice(notice: String?): CityMapUiState =
-        copy(locationStatusNotice = notice)
+        copy(
+            locationStatusNotice = notice,
+            isLocatingUser = false,
+        )
 
     fun formattedZoomLabel(): String = "${(zoom * 10.0).roundToInt() / 10.0}x"
 }

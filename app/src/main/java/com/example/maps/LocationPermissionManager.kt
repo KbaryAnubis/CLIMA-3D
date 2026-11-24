@@ -206,9 +206,18 @@ object LocationPermissionCoordinator {
             true
         }.getOrDefault(false)
 
+    const val DEFAULT_LOCATION_LOOKUP_TIMEOUT_MS: Long = 10_000L
+
+    fun isValidCoordinate(latitude: Double, longitude: Double): Boolean =
+        latitude.isFinite() &&
+            longitude.isFinite() &&
+            latitude in -90.0..90.0 &&
+            longitude in -180.0..180.0
+
     @SuppressLint("MissingPermission")
     fun fetchRealLocation(
         context: Context,
+        timeoutMs: Long = DEFAULT_LOCATION_LOOKUP_TIMEOUT_MS,
         onResult: (LocationLookupResult) -> Unit,
     ) {
         val fine = hasFinePermission(context)
@@ -232,10 +241,29 @@ object LocationPermissionCoordinator {
         }
 
         val completed = AtomicBoolean(false)
+        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        val fusedTokenSource = CancellationTokenSource()
+        val platformSignalRef = java.util.concurrent.atomic.AtomicReference<CancellationSignal?>(null)
+        lateinit var timeoutRunnable: Runnable
+
         fun deliverOnce(result: LocationLookupResult) {
             if (completed.compareAndSet(false, true)) {
+                mainHandler.removeCallbacks(timeoutRunnable)
+                runCatching { fusedTokenSource.cancel() }
+                runCatching { platformSignalRef.get()?.cancel() }
                 onResult(result)
             }
+        }
+
+        timeoutRunnable = Runnable {
+            deliverOnce(
+                LocationLookupResult.UnavailableTemporarily(
+                    "Tempo limite ao obter localização. Verifique o sinal de GPS e tente novamente.",
+                ),
+            )
+        }
+        if (timeoutMs > 0L) {
+            mainHandler.postDelayed(timeoutRunnable, timeoutMs)
         }
 
         val fusedPriority =
@@ -247,53 +275,71 @@ object LocationPermissionCoordinator {
 
         val fusedClient = runCatching { LocationServices.getFusedLocationProviderClient(context) }.getOrNull()
         if (fusedClient == null) {
-            fetchPlatformLocation(context, precision, ::deliverOnce)
+            fetchPlatformLocation(context, precision, platformSignalRef, ::deliverOnce)
             return
         }
 
-        fusedClient.lastLocation
-            .addOnSuccessListener { lastKnown: Location? ->
-                if (lastKnown != null) {
-                    deliverOnce(
-                        LocationLookupResult.Success(
-                            coordinate = CityMapCoordinate(lastKnown.latitude, lastKnown.longitude),
-                            precision = precision,
-                        ),
-                    )
-                } else {
-                    val tokenSource = CancellationTokenSource()
-                    fusedClient
-                        .getCurrentLocation(fusedPriority, tokenSource.token)
-                        .addOnSuccessListener { current ->
-                            if (current != null) {
-                                deliverOnce(
-                                    LocationLookupResult.Success(
-                                        coordinate = CityMapCoordinate(current.latitude, current.longitude),
-                                        precision = precision,
-                                    ),
-                                )
-                            } else {
-                                fetchPlatformLocation(context, precision, ::deliverOnce)
-                            }
+        runCatching {
+            fusedClient.lastLocation
+                .addOnSuccessListener { lastKnown: Location? ->
+                    if (completed.get()) return@addOnSuccessListener
+                    if (lastKnown != null && isValidCoordinate(lastKnown.latitude, lastKnown.longitude)) {
+                        deliverOnce(
+                            LocationLookupResult.Success(
+                                coordinate = CityMapCoordinate(lastKnown.latitude, lastKnown.longitude),
+                                precision = precision,
+                            ),
+                        )
+                    } else {
+                        runCatching {
+                            fusedClient
+                                .getCurrentLocation(fusedPriority, fusedTokenSource.token)
+                                .addOnSuccessListener { current ->
+                                    if (completed.get()) return@addOnSuccessListener
+                                    if (current != null && isValidCoordinate(current.latitude, current.longitude)) {
+                                        deliverOnce(
+                                            LocationLookupResult.Success(
+                                                coordinate = CityMapCoordinate(current.latitude, current.longitude),
+                                                precision = precision,
+                                            ),
+                                        )
+                                    } else {
+                                        fetchPlatformLocation(context, precision, platformSignalRef, ::deliverOnce)
+                                    }
+                                }
+                                .addOnFailureListener {
+                                    if (!completed.get()) {
+                                        fetchPlatformLocation(context, precision, platformSignalRef, ::deliverOnce)
+                                    }
+                                }
+                        }.onFailure {
+                            fetchPlatformLocation(context, precision, platformSignalRef, ::deliverOnce)
                         }
-                        .addOnFailureListener {
-                            fetchPlatformLocation(context, precision, ::deliverOnce)
-                        }
+                    }
                 }
+                .addOnFailureListener {
+                    if (!completed.get()) {
+                        fetchPlatformLocation(context, precision, platformSignalRef, ::deliverOnce)
+                    }
+                }
+        }.onFailure { err ->
+            if (err is SecurityException) {
+                deliverOnce(LocationLookupResult.PermissionDenied)
+            } else {
+                fetchPlatformLocation(context, precision, platformSignalRef, ::deliverOnce)
             }
-            .addOnFailureListener {
-                fetchPlatformLocation(context, precision, ::deliverOnce)
-            }
+        }
     }
 
     @SuppressLint("MissingPermission")
     private fun fetchPlatformLocation(
         context: Context,
         precision: LocationPrecisionLevel,
+        platformSignalRef: java.util.concurrent.atomic.AtomicReference<CancellationSignal?>,
         deliverOnce: (LocationLookupResult) -> Unit,
     ) {
         val lastPlatform = fallbackSystemLastLocation(context, precision)
-        if (lastPlatform != null) {
+        if (lastPlatform != null && isValidCoordinate(lastPlatform.latitude, lastPlatform.longitude)) {
             deliverOnce(LocationLookupResult.Success(lastPlatform, precision))
             return
         }
@@ -321,13 +367,14 @@ object LocationPermissionCoordinator {
         if (provider == null) {
             deliverOnce(
                 LocationLookupResult.UnavailableTemporarily(
-                    "Última localização indisponível e sem sinal ativo no momento.",
+                    "Última localização indisponível e sem sinal ativo no momento. Tente novamente em local aberto.",
                 ),
             )
             return
         }
 
         val signal = CancellationSignal()
+        platformSignalRef.set(signal)
         runCatching {
             LocationManagerCompat.getCurrentLocation(
                 manager,
@@ -335,7 +382,7 @@ object LocationPermissionCoordinator {
                 signal,
                 ContextCompat.getMainExecutor(context),
             ) { location ->
-                if (location != null) {
+                if (location != null && isValidCoordinate(location.latitude, location.longitude)) {
                     deliverOnce(
                         LocationLookupResult.Success(
                             coordinate = CityMapCoordinate(location.latitude, location.longitude),
@@ -350,12 +397,16 @@ object LocationPermissionCoordinator {
                     )
                 }
             }
-        }.onFailure {
-            deliverOnce(
-                LocationLookupResult.UnavailableTemporarily(
-                    "Não foi possível obter nova posição agora. O mapa permanece navegável.",
-                ),
-            )
+        }.onFailure { err ->
+            if (err is SecurityException) {
+                deliverOnce(LocationLookupResult.PermissionDenied)
+            } else {
+                deliverOnce(
+                    LocationLookupResult.UnavailableTemporarily(
+                        "Não foi possível obter nova posição agora. O mapa permanece navegável.",
+                    ),
+                )
+            }
         }
     }
 

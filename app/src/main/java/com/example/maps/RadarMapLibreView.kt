@@ -42,13 +42,129 @@ import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
+import org.maplibre.android.style.layers.Property
 import org.maplibre.android.style.layers.PropertyFactory.rasterOpacity
+import org.maplibre.android.style.layers.PropertyFactory.visibility
 import org.maplibre.android.style.layers.RasterLayer
 import org.maplibre.android.style.sources.RasterSource
 import org.maplibre.android.style.sources.TileSet
 
 private const val RADAR_RAIN_SOURCE_PREFIX = "clima-radar-rainviewer-source-"
-private const val RADAR_RAIN_LAYER_ID = "clima-radar-rainviewer-layer"
+private const val RADAR_RAIN_LAYER_PREFIX = "clima-radar-rainviewer-layer-"
+
+/**
+ * Tracks attached RainViewer RasterSource/RasterLayer pairs keyed by stable frame identity
+ * so 650ms timeline animation toggles layer visibility in-place without rebuilding sources/layers.
+ */
+internal class RadarLayerPoolState {
+    private val attachedEntries = linkedMapOf<String, Pair<String, String>>() // poolKey -> (sourceId, layerId)
+    var activePoolKey: String? = null
+        private set
+
+    val attachedCount: Int
+        get() = attachedEntries.size
+
+    fun sourceIdFor(poolKey: String): String? = attachedEntries[poolKey]?.first
+    fun layerIdFor(poolKey: String): String? = attachedEntries[poolKey]?.second
+
+    fun attachedKeys(): Set<String> = attachedEntries.keys.toSet()
+
+    fun syncPool(
+        frames: List<RainViewerRadarFrame>,
+        activeFrame: RainViewerRadarFrame?,
+        layerStyle: RadarBaseStyle,
+        maxRadarZoom: Int,
+        addSourceAndLayer: (poolKey: String, sourceId: String, layerId: String, frame: RainViewerRadarFrame, isVisible: Boolean) -> Unit,
+        setLayerVisibility: (layerId: String, isVisible: Boolean) -> Unit,
+        removeSourceAndLayer: (sourceId: String, layerId: String) -> Unit,
+    ): RadarLayerPoolDiff {
+        if (layerStyle != RadarBaseStyle.PRECIPITATION_MAP || frames.isEmpty()) {
+            var removed = 0
+            attachedEntries.values.toList().forEach { (sourceId, layerId) ->
+                removeSourceAndLayer(sourceId, layerId)
+                removed++
+            }
+            attachedEntries.clear()
+            activePoolKey = null
+            return RadarLayerPoolDiff(addedCount = 0, removedCount = removed, visibilityUpdates = 0)
+        }
+
+        val desired = linkedMapOf<String, RainViewerRadarFrame>()
+        frames.forEach { frame ->
+            val provider = frame.toTileProvider()
+            if (provider.isValidTemplate()) {
+                val key = buildPoolKey(frame, maxRadarZoom)
+                desired[key] = frame
+            }
+        }
+
+        var removed = 0
+        val staleKeys = attachedEntries.keys.filter { it !in desired.keys }
+        staleKeys.forEach { key ->
+            val (sourceId, layerId) = attachedEntries.remove(key) ?: return@forEach
+            removeSourceAndLayer(sourceId, layerId)
+            removed++
+            if (activePoolKey == key) activePoolKey = null
+        }
+
+        val targetActiveKey = activeFrame?.let { buildPoolKey(it, maxRadarZoom) }?.takeIf { it in desired.keys }
+        var added = 0
+        var visibilityUpdates = 0
+
+        desired.forEach { (key, frame) ->
+            val shouldBeVisible = key == targetActiveKey
+            if (key !in attachedEntries) {
+                val suffix = "${frame.timestampSeconds}_${key.hashCode().toUInt()}"
+                val sourceId = "$RADAR_RAIN_SOURCE_PREFIX$suffix"
+                val layerId = "$RADAR_RAIN_LAYER_PREFIX$suffix"
+                addSourceAndLayer(key, sourceId, layerId, frame, shouldBeVisible)
+                attachedEntries[key] = sourceId to layerId
+                added++
+            }
+        }
+
+        if (activePoolKey != targetActiveKey) {
+            val prevKey = activePoolKey
+            if (prevKey != null) {
+                attachedEntries[prevKey]?.second?.let { prevLayerId ->
+                    setLayerVisibility(prevLayerId, false)
+                    visibilityUpdates++
+                }
+            }
+            if (targetActiveKey != null) {
+                attachedEntries[targetActiveKey]?.second?.let { nextLayerId ->
+                    setLayerVisibility(nextLayerId, true)
+                    visibilityUpdates++
+                }
+            }
+            activePoolKey = targetActiveKey
+        } else if (added > 0) {
+            // Ensure freshly attached batch has coherent visibility even if active key matched prior epoch
+            attachedEntries.forEach { (key, pair) ->
+                setLayerVisibility(pair.second, key == targetActiveKey)
+                visibilityUpdates++
+            }
+        }
+
+        return RadarLayerPoolDiff(addedCount = added, removedCount = removed, visibilityUpdates = visibilityUpdates)
+    }
+
+    fun clearTrackingOnly() {
+        attachedEntries.clear()
+        activePoolKey = null
+    }
+
+    companion object {
+        fun buildPoolKey(frame: RainViewerRadarFrame, maxRadarZoom: Int): String =
+            "${frame.timestampSeconds}|${frame.tileUrlTemplate}|$maxRadarZoom"
+    }
+}
+
+internal data class RadarLayerPoolDiff(
+    val addedCount: Int,
+    val removedCount: Int,
+    val visibilityUpdates: Int,
+)
 
 /**
  * Native MapLibre + OpenStreetMap map host for the Radar screen that dynamically overlays
@@ -56,6 +172,8 @@ private const val RADAR_RAIN_LAYER_ID = "clima-radar-rainviewer-layer"
  *
  * Key guarantees:
  * - Decouples base OSM map from RainViewer so RainViewer errors never hide or stall the base map.
+ * - Pools timeline frame RasterSources/RasterLayers and toggles layer visibility on 650ms ticks
+ *   without rebuilding sources/layers every frame.
  * - Tracks Initialization, Style Load, First Frame, and Full Render separately via [MapLoadStateMachine].
  * - Enforces an explicit initial load timeout with real diagnostic cause and clean retry without duplicates.
  * - Uses `textureMode(true)` (TextureView) and symmetrical [MapViewLifecycleController] + listener cleanup.
@@ -68,6 +186,7 @@ fun RadarMapLibreView(
     layerStyle: RadarBaseStyle,
     maxRadarZoom: Int,
     modifier: Modifier = Modifier,
+    frames: List<RainViewerRadarFrame> = listOfNotNull(activeFrame),
     isOnline: Boolean = true,
     radarErrorMessage: String? = null,
     onRetryReload: () -> Unit = {},
@@ -75,14 +194,11 @@ fun RadarMapLibreView(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
+    val effectiveFrames = remember(frames, activeFrame) {
+        if (frames.isNotEmpty()) frames else listOfNotNull(activeFrame)
+    }
     val tileProvider = remember(activeFrame?.tileUrlTemplate) {
         activeFrame?.toTileProvider()
-    }
-    val layerSpec = remember(activeFrame?.tileUrlTemplate, layerStyle) {
-        activeFrame?.toLayerSpec(
-            transparency = RainViewerPaletteSpec.DEFAULT_OVERLAY_TRANSPARENCY,
-            baseStyle = layerStyle,
-        )
     }
 
     var reloadNonce by remember { mutableIntStateOf(0) }
@@ -161,11 +277,17 @@ fun RadarMapLibreView(
 
     val stateMachine = remember { MapLoadStateMachine(screenName = "Radar") }
     val tileSnapshot by TileTransportDiagnostics.snapshot.collectAsState()
+    val layerPool = remember { RadarLayerPoolState() }
 
     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
     var mapLibreMapRef by remember { mutableStateOf<MapLibreMap?>(null) }
     var loadedStyleRef by remember { mutableStateOf<Style?>(null) }
-    var activeRainSourceId by remember { mutableStateOf<String?>(null) }
+    val sessionDisposedRef = remember(viewRecreationNonce) { AtomicBoolean(false) }
+    var appliedCameraSignature by remember(viewRecreationNonce) {
+        mutableStateOf<Triple<Double, Double, Double>?>(null)
+    }
+    val latestCenter by rememberUpdatedState(center)
+    val latestZoom by rememberUpdatedState(zoom)
     var loadState by remember {
         mutableStateOf(
             stateMachine.beginAttempt(
@@ -185,9 +307,10 @@ fun RadarMapLibreView(
     }
 
     fun applyBaseOsmStyle(map: MapLibreMap) {
+        if (sessionDisposedRef.get()) return
         val onlineNow = latestIsOnline
         loadedStyleRef = null
-        activeRainSourceId = null
+        layerPool.clearTrackingOnly()
         rainLayerError = null
         loadState = stateMachine.beginAttempt(
             isOnline = onlineNow,
@@ -202,11 +325,13 @@ fun RadarMapLibreView(
         loadState = stateMachine.onStyleRequested(isOnline = true)
         ClimaMapLogger.i(
             ClimaMapLogTags.MAP_STYLE,
-            "Estilo base OSM v8 solicitado (Radar, coords=${center.formatted()}, zoom=$zoom).",
+            "Estilo base OSM v8 solicitado (Radar, coords=${latestCenter.formatted()}, zoom=$latestZoom).",
         )
         runCatching {
             val styleBuilder = OpenStreetMapTileConfig.buildRadarBaseStyleBuilder()
             map.setStyle(styleBuilder) { style ->
+                if (sessionDisposedRef.get()) return@setStyle
+                layerPool.clearTrackingOnly()
                 loadedStyleRef = style
                 loadState = stateMachine.onStyleLoaded()
                 ClimaMapLogger.i(
@@ -215,6 +340,7 @@ fun RadarMapLibreView(
                 )
             }
         }.onFailure { err ->
+            if (sessionDisposedRef.get()) return@onFailure
             val msg = "Erro ao aplicar estilo do Radar: ${err.message ?: err.javaClass.simpleName}"
             ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, msg, err)
             loadState = stateMachine.onStyleFailed(msg, isOnline = latestIsOnline)
@@ -234,6 +360,7 @@ fun RadarMapLibreView(
         }
         val trackedAttempt = attemptKey
         delay(MapLoadStateMachine.INITIAL_LOAD_TIMEOUT_MS)
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         if (stateMachine.attemptId == trackedAttempt && stateMachine.state.isLoading) {
             val surfaceInfo = inspectSurfaceInfo(mapViewRef)
             val timedOutState = stateMachine.onTimeout(TileTransportDiagnostics.snapshot.value, surfaceInfo)
@@ -248,6 +375,7 @@ fun RadarMapLibreView(
 
     // Reload base OSM style when connectivity returns or user triggers a soft retry
     LaunchedEffect(mapLibreMapRef, reloadNonce, isOnline) {
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         val map = mapLibreMapRef ?: return@LaunchedEffect
         if (!isOnline && loadedStyleRef == null) {
             loadState = stateMachine.beginAttempt(isOnline = false, hasMapReady = true, tileSnapshot = TileTransportDiagnostics.snapshot.value)
@@ -257,63 +385,80 @@ fun RadarMapLibreView(
         }
     }
 
-    // Update camera when city or zoom changes
+    // Update camera ONLY when target coordinates or zoom actually change after initial camera setup
     LaunchedEffect(mapLibreMapRef, center.latitude, center.longitude, zoom) {
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         val map = mapLibreMapRef ?: return@LaunchedEffect
+        val targetSignature = Triple(center.latitude, center.longitude, zoom)
+        if (appliedCameraSignature == targetSignature) return@LaunchedEffect
+        appliedCameraSignature = targetSignature
         val position =
             CameraPosition.Builder()
                 .target(LatLng(center.latitude, center.longitude))
                 .zoom(zoom)
                 .build()
-        map.animateCamera(CameraUpdateFactory.newCameraPosition(position), 280)
+        runCatching {
+            map.animateCamera(CameraUpdateFactory.newCameraPosition(position), 260)
+        }
     }
 
-    // Dynamically swap RainViewer raster layer AFTER base OSM style is loaded; never attaches on failed base map
-    LaunchedEffect(loadedStyleRef, loadState.isFailure, activeFrame?.tileUrlTemplate, layerStyle, maxRadarZoom) {
+    // Pooled RainViewer raster layer sync: adds sources/layers once per timeline and toggles visibility on ticks
+    LaunchedEffect(loadedStyleRef, loadState.isFailure, effectiveFrames, activeFrame?.timestampSeconds, layerStyle, maxRadarZoom) {
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         val style = loadedStyleRef ?: return@LaunchedEffect
         if (!style.isFullyLoaded) return@LaunchedEffect
-        if (loadState is MapSurfaceLoadState.ConnectionError ||
-            loadState is MapSurfaceLoadState.StyleError ||
-            loadState is MapSurfaceLoadState.RenderError
-        ) {
-            runCatching {
-                style.removeLayer(RADAR_RAIN_LAYER_ID)
-                activeRainSourceId?.let { style.removeSource(it) }
-                activeRainSourceId = null
-            }
-            return@LaunchedEffect
-        }
+
+        val isBaseError =
+            loadState is MapSurfaceLoadState.ConnectionError ||
+                loadState is MapSurfaceLoadState.StyleError ||
+                loadState is MapSurfaceLoadState.RenderError
 
         runCatching {
-            style.removeLayer(RADAR_RAIN_LAYER_ID)
-            activeRainSourceId?.let { previousId -> style.removeSource(previousId) }
-            activeRainSourceId = null
             rainLayerError = null
+            val targetOpacity = RainViewerPaletteSpec.DEFAULT_OVERLAY_OPACITY
+            val diff =
+                layerPool.syncPool(
+                    frames = if (isBaseError) emptyList() else effectiveFrames,
+                    activeFrame = if (isBaseError) null else activeFrame,
+                    layerStyle = layerStyle,
+                    maxRadarZoom = maxRadarZoom,
+                    addSourceAndLayer = { _, sourceId, layerId, frame, isVisible ->
+                        val provider = frame.toTileProvider()
+                        val tileSet =
+                            TileSet("2.2", provider.tileUrlTemplate).apply {
+                                minZoom = 0f
+                                maxZoom = maxRadarZoom.toFloat()
+                                attribution = RainViewerRadarFrame.ATTRIBUTION
+                            }
+                        style.addSource(RasterSource(sourceId, tileSet, provider.tileWidthPx))
+                        val rainLayer =
+                            RasterLayer(layerId, sourceId).withProperties(
+                                rasterOpacity(targetOpacity),
+                                visibility(if (isVisible) Property.VISIBLE else Property.NONE),
+                            )
+                        if (style.getLayer(OpenStreetMapTileConfig.RADAR_OSM_LAYER_ID) != null) {
+                            style.addLayerAbove(rainLayer, OpenStreetMapTileConfig.RADAR_OSM_LAYER_ID)
+                        } else {
+                            style.addLayer(rainLayer)
+                        }
+                    },
+                    setLayerVisibility = { layerId, isVisible ->
+                        style.getLayerAs<RasterLayer>(layerId)?.setProperties(
+                            visibility(if (isVisible) Property.VISIBLE else Property.NONE),
+                        )
+                    },
+                    removeSourceAndLayer = { sourceId, layerId ->
+                        style.removeLayer(layerId)
+                        style.removeSource(sourceId)
+                    },
+                )
 
-            if (layerStyle == RadarBaseStyle.PRECIPITATION_MAP && tileProvider != null && tileProvider.isValidTemplate() && layerSpec != null) {
-                val sourceId = "$RADAR_RAIN_SOURCE_PREFIX${activeFrame?.timestampSeconds ?: 0L}"
-                val tileSet =
-                    TileSet("2.2", tileProvider.tileUrlTemplate).apply {
-                        minZoom = 0f
-                        maxZoom = maxRadarZoom.toFloat()
-                        attribution = RainViewerRadarFrame.ATTRIBUTION
-                    }
-                style.addSource(RasterSource(sourceId, tileSet, tileProvider.tileWidthPx))
-                val rainLayer =
-                    RasterLayer(RADAR_RAIN_LAYER_ID, sourceId).withProperties(
-                        rasterOpacity(layerSpec.opacity),
-                    )
-                if (style.getLayer(OpenStreetMapTileConfig.RADAR_OSM_LAYER_ID) != null) {
-                    style.addLayerAbove(rainLayer, OpenStreetMapTileConfig.RADAR_OSM_LAYER_ID)
-                } else {
-                    style.addLayer(rainLayer)
-                }
-                activeRainSourceId = sourceId
+            if (diff.addedCount > 0) {
                 ClimaMapLogger.i(
                     ClimaMapLogTags.RAINVIEWER_TILES,
-                    "Camada RainViewer aplicada acima do OSM base (frame=${activeFrame?.formattedLocalTime}, maxZoom=$maxRadarZoom).",
+                    "Pool RainViewer sincronizado (adicionados=${diff.addedCount}, removidos=${diff.removedCount}, maxZoom=$maxRadarZoom).",
                 )
-            } else if (layerStyle == RadarBaseStyle.PRECIPITATION_MAP) {
+            } else if (layerStyle == RadarBaseStyle.PRECIPITATION_MAP && effectiveFrames.isEmpty() && !isBaseError) {
                 ClimaMapLogger.w(
                     ClimaMapLogTags.RADAR_FRAMES,
                     "Nenhum frame histórico válido do RainViewer disponível; mantendo mapa-base OSM visível.",
@@ -355,14 +500,16 @@ fun RadarMapLibreView(
                 lifecycleOwner.lifecycle.addObserver(observer)
                 context.applicationContext?.registerComponentCallbacks(lowMemoryCallbacks)
                 onDispose {
+                    sessionDisposedRef.set(true)
                     lifecycleOwner.lifecycle.removeObserver(observer)
                     context.applicationContext?.unregisterComponentCallbacks(lowMemoryCallbacks)
+                    runCatching { mapLibreMapRef?.cancelTransitions() }
                     sessionHolder?.dispose()
                     sessionHolder = null
                     mapViewRef = null
                     mapLibreMapRef = null
                     loadedStyleRef = null
-                    activeRainSourceId = null
+                    layerPool.clearTrackingOnly()
                     ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "MapView do Radar destruído e listeners removidos.")
                 }
             }
@@ -420,6 +567,7 @@ fun RadarMapLibreView(
                                 "onDidFinishLoadingMap disparado (Radar, ${stateMachine.elapsedMs()}ms).",
                             )
                             view.post {
+                                if (sessionDisposedRef.get()) return@post
                                 loadState = stateMachine.onMapLoadedCallback(
                                     TileTransportDiagnostics.snapshot.value,
                                     latestIsOnline,
@@ -431,6 +579,7 @@ fun RadarMapLibreView(
                             val reason = errorMessage.ifBlank { "Erro ao carregar mapa-base OpenStreetMap." }
                             ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, "Falha no estilo/mapa Radar: $reason")
                             view.post {
+                                if (sessionDisposedRef.get()) return@post
                                 loadState = stateMachine.onStyleFailed(reason, isOnline = latestIsOnline)
                             }
                         }
@@ -450,6 +599,7 @@ fun RadarMapLibreView(
                                     "Primeiro quadro do MapView Radar renderizado em ${stateMachine.elapsedMs()}ms.",
                                 )
                                 view.post {
+                                    if (sessionDisposedRef.get()) return@post
                                     loadState = stateMachine.onFirstFrameRendered(TileTransportDiagnostics.snapshot.value)
                                 }
                             }
@@ -464,6 +614,7 @@ fun RadarMapLibreView(
                                     )
                                 }
                                 view.post {
+                                    if (sessionDisposedRef.get()) return@post
                                     loadState = stateMachine.onMapFinishedRendering(
                                         fully = true,
                                         tileSnapshot = TileTransportDiagnostics.snapshot.value,
@@ -471,6 +622,7 @@ fun RadarMapLibreView(
                                 }
                             } else {
                                 view.post {
+                                    if (sessionDisposedRef.get()) return@post
                                     loadState = stateMachine.onMapFinishedRendering(
                                         fully = false,
                                         tileSnapshot = TileTransportDiagnostics.snapshot.value,
@@ -482,6 +634,7 @@ fun RadarMapLibreView(
                         MapView.OnRenderErrorListener {
                             ClimaMapLogger.e(ClimaMapLogTags.MAP_RENDER, "Erro nativo de renderização no MapView Radar.")
                             view.post {
+                                if (sessionDisposedRef.get()) return@post
                                 loadState = stateMachine.onRenderError("Erro nativo de renderização OpenGL/TextureView no Radar.")
                             }
                         }
@@ -489,6 +642,7 @@ fun RadarMapLibreView(
                         MapView.OnShaderCompileFailedListener { id, type, _ ->
                             ClimaMapLogger.e(ClimaMapLogTags.MAP_RENDER, "Falha ao compilar shader MapLibre Radar (id=$id, type=$type).")
                             view.post {
+                                if (sessionDisposedRef.get()) return@post
                                 loadState = stateMachine.onRenderError("Falha ao compilar shader OpenGL (id=$id).")
                             }
                         }
@@ -522,6 +676,7 @@ fun RadarMapLibreView(
                     mapViewRef = view
 
                     view.getMapAsync { map ->
+                        if (sessionDisposedRef.get()) return@getMapAsync
                         mapLibreMapRef = map
                         stateMachine.updateSurfaceDiagnostics(inspectSurfaceInfo(view))
                         loadState = stateMachine.onMapReady(latestIsOnline)
@@ -539,10 +694,13 @@ fun RadarMapLibreView(
                             isAttributionEnabled = false
                         }
 
+                        val initCenter = latestCenter
+                        val initZoom = latestZoom
+                        appliedCameraSignature = Triple(initCenter.latitude, initCenter.longitude, initZoom)
                         map.cameraPosition =
                             CameraPosition.Builder()
-                                .target(LatLng(center.latitude, center.longitude))
-                                .zoom(zoom)
+                                .target(LatLng(initCenter.latitude, initCenter.longitude))
+                                .zoom(initZoom)
                                 .build()
 
                         applyBaseOsmStyle(map)

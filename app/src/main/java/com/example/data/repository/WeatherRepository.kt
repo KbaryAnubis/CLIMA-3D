@@ -15,8 +15,11 @@ import com.example.data.remote.OpenMeteoForecastMapper
 import com.example.data.remote.RemoteCallOutcome
 import com.example.data.remote.SafeApiExecutor
 import com.squareup.moshi.Moshi
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 
 /**
  * Offline-first repository for Open-Meteo Forecast data (current conditions, 37h hourly, 16d daily).
@@ -28,6 +31,8 @@ class WeatherRepository(
     private val connectivityObserver: ConnectivityObserver,
     private val moshi: Moshi,
     private val clock: () -> Long = { System.currentTimeMillis() },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val cpuDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) {
     private val bundleAdapter = moshi.adapter(WeatherForecastBundle::class.java)
 
@@ -37,7 +42,7 @@ class WeatherRepository(
     ): Flow<CachedRecord<WeatherForecastBundle>?> {
         val key = SavedLocation.buildCoordinateKey(latitude, longitude)
         return cacheDao.observeForecast(key).map { entity ->
-            entity?.let { decodeEntity(it) }
+            entity?.let { withContext(cpuDispatcher) { decodeEntity(it) } }
         }
     }
 
@@ -47,7 +52,8 @@ class WeatherRepository(
         policy: CachePolicy = CachePolicy.NetworkFirst,
     ): WeatherResult<WeatherForecastBundle> {
         val locationKey = SavedLocation.buildCoordinateKey(latitude, longitude)
-        val cachedRecord = cacheDao.getForecast(locationKey)?.let { decodeEntity(it) }
+        val cachedEntity = withContext(ioDispatcher) { cacheDao.getForecast(locationKey) }
+        val cachedRecord = cachedEntity?.let { withContext(cpuDispatcher) { decodeEntity(it) } }
         val now = clock()
 
         when (policy) {
@@ -94,30 +100,34 @@ class WeatherRepository(
 
         return when (remoteOutcome) {
             is RemoteCallOutcome.Success -> {
-                val mapped = OpenMeteoForecastMapper.toDomain(
-                    dto = remoteOutcome.body,
-                    requestedLatitude = latitude,
-                    requestedLongitude = longitude,
-                    fetchedAtEpochMillis = now,
-                )
+                val mapped = withContext(cpuDispatcher) {
+                    OpenMeteoForecastMapper.toDomain(
+                        dto = remoteOutcome.body,
+                        requestedLatitude = latitude,
+                        requestedLongitude = longitude,
+                        fetchedAtEpochMillis = now,
+                    )
+                }
                 if (mapped == null) {
                     fallbackToCacheOrFail(
                         cachedRecord,
                         WeatherError.EmptyResponseError(OpenMeteoForecastApi.PROVIDER_NAME),
                     )
                 } else {
-                    val serialized = bundleAdapter.toJson(mapped)
-                    cacheDao.upsertForecast(
-                        WeatherForecastCacheEntity(
-                            locationKey = locationKey,
-                            latitude = mapped.latitude,
-                            longitude = mapped.longitude,
-                            timezoneId = mapped.timezoneId,
-                            utcOffsetSeconds = mapped.utcOffsetSeconds,
-                            payloadJson = serialized,
-                            fetchedAtEpochMillis = now,
-                        ),
-                    )
+                    val serialized = withContext(cpuDispatcher) { bundleAdapter.toJson(mapped) }
+                    withContext(ioDispatcher) {
+                        cacheDao.upsertForecast(
+                            WeatherForecastCacheEntity(
+                                locationKey = locationKey,
+                                latitude = mapped.latitude,
+                                longitude = mapped.longitude,
+                                timezoneId = mapped.timezoneId,
+                                utcOffsetSeconds = mapped.utcOffsetSeconds,
+                                payloadJson = serialized,
+                                fetchedAtEpochMillis = now,
+                            ),
+                        )
+                    }
                     WeatherResult.Success(
                         data = mapped,
                         origin = DataSourceOrigin.LIVE_NETWORK,
