@@ -1,9 +1,11 @@
 package com.example.ui.state
 
+import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.data.ClimaDataContainer
+import com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics
 import com.example.data.local.preferences.AppThemeMode
 import com.example.data.model.CachePolicy
 import com.example.data.model.CitySearchResult
@@ -254,6 +256,9 @@ class ClimaMainViewModel(
             return
         }
         refreshJob?.cancel()
+        val refreshStartMs = SystemClock.elapsedRealtime()
+        val refreshReason = if (showFeedbackOnFailure) "manual_pull_refresh" else "auto_or_resume_refresh"
+        ClimaGraphicsLifecycleDiagnostics.logRefreshStarted(refreshReason, location.id)
         refreshJob =
             viewModelScope.launch {
                 _uiState.update {
@@ -264,6 +269,7 @@ class ClimaMainViewModel(
                     )
                 }
 
+                var outcome = "canceled"
                 try {
                     val prefs = _uiState.value.preferences
                     val report =
@@ -442,8 +448,16 @@ class ClimaMainViewModel(
                             showToast(feedback)
                         }
                     }
+                    outcome = "completed"
                 } finally {
                     _uiState.update { it.copy(isRefreshing = false) }
+                    val elapsedMs = (SystemClock.elapsedRealtime() - refreshStartMs).coerceAtLeast(0L)
+                    ClimaGraphicsLifecycleDiagnostics.logRefreshFinished(
+                        reason = refreshReason,
+                        locationId = location.id,
+                        durationMs = elapsedMs,
+                        outcome = outcome,
+                    )
                 }
             }
     }
@@ -493,9 +507,12 @@ class ClimaMainViewModel(
             return
         }
 
+        val citiesStartMs = SystemClock.elapsedRealtime()
+        ClimaGraphicsLifecycleDiagnostics.logRefreshStarted("cities_pull_refresh", _uiState.value.activeLocation?.id)
         citiesRefreshJob =
             viewModelScope.launch {
                 _uiState.update { it.copy(isRefreshingCities = true) }
+                var citiesOutcome = "canceled"
                 try {
                     val activeId = _uiState.value.activeLocation?.id
                     var activeForecastResult: WeatherResult<com.example.data.model.WeatherForecastBundle>? = null
@@ -608,8 +625,16 @@ class ClimaMainViewModel(
                             }
                         showToast(feedback)
                     }
+                    citiesOutcome = "completed"
                 } finally {
                     _uiState.update { it.copy(isRefreshingCities = false) }
+                    val elapsedMs = (SystemClock.elapsedRealtime() - citiesStartMs).coerceAtLeast(0L)
+                    ClimaGraphicsLifecycleDiagnostics.logRefreshFinished(
+                        reason = "cities_pull_refresh",
+                        locationId = _uiState.value.activeLocation?.id,
+                        durationMs = elapsedMs,
+                        outcome = citiesOutcome,
+                    )
                 }
             }
     }
@@ -626,6 +651,10 @@ class ClimaMainViewModel(
     // --- Navigation & Back Handling ---
 
     fun selectTab(tab: ClimaTab) {
+        val previousTab = _uiState.value.activeTab
+        if (previousTab != tab) {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(previousTab, tab)
+        }
         if (tab != ClimaTab.RADAR) {
             stopRadarPlayback()
         }

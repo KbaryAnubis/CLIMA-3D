@@ -49,6 +49,23 @@ fun WeatherBackgroundLayer(
     animatedEnabled: Boolean,
     modifier: Modifier = Modifier,
 ) {
+    WeatherBackgroundLayerImpl(
+        condition = condition,
+        activeTab = activeTab,
+        animatedEnabled = animatedEnabled,
+        modifier = modifier,
+    )
+}
+
+@Composable
+internal fun WeatherBackgroundLayerImpl(
+    condition: WeatherCondition,
+    activeTab: ClimaTab,
+    animatedEnabled: Boolean,
+    modifier: Modifier = Modifier,
+    playerBridgeFactory: ((Context) -> WeatherVideoPlayerBridge)? = null,
+    surfaceBridgeFactory: ((Context) -> WeatherVideoSurfaceBridge)? = null,
+) {
     val context = LocalContext.current
     val systemReducedMotion = remember(context) { isSystemReducedMotionEnabled(context) }
     val shouldMountVideo = animatedEnabled && !systemReducedMotion
@@ -82,12 +99,14 @@ fun WeatherBackgroundLayer(
 
         // Layer 2: Media3 looping muted MP4 video (paused while MapLibre TextureView tabs are active)
         if (shouldMountVideo) {
-            WeatherVideoBackground(
+            WeatherVideoBackgroundImpl(
                 videoResId = condition.backgroundVideo.rawRes,
                 playbackSpeed = condition.videoPlaybackSpeed,
                 isPlaying = shouldPlayVideoNow,
                 onFirstFrameRendered = { firstFrameReady = true },
                 modifier = Modifier.fillMaxSize().alpha(videoAlpha),
+                playerBridgeFactory = playerBridgeFactory,
+                surfaceBridgeFactory = surfaceBridgeFactory,
             )
         }
 

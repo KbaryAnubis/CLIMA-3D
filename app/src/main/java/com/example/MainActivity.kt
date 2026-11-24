@@ -24,6 +24,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.ClimaDataContainer
 import com.example.data.local.preferences.AppThemeMode
+import com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics
 import com.example.maps.LocationLookupResult
 import com.example.maps.LocationPermissionCoordinator
 import com.example.maps.MapLibreInitializer
@@ -175,6 +176,7 @@ fun Clima3DApp(
         var firstResumeSkipped = false
         val observer =
             LifecycleEventObserver { _, event ->
+                ClimaGraphicsLifecycleDiagnostics.logActivityLifecycle(event)
                 if (event == Lifecycle.Event.ON_RESUME) {
                     val currentSnapshot =
                         LocationPermissionCoordinator.inspect(

@@ -734,10 +734,15 @@ class MapViewLifecycleController(
         }
     }
 
-    fun destroy() {
+    fun stopIfActive() {
         if (currentStage == Stage.UNINITIALIZED || currentStage == Stage.DESTROYED) return
         moveToPaused()
         moveToStopped()
+    }
+
+    fun destroy() {
+        if (currentStage == Stage.UNINITIALIZED || currentStage == Stage.DESTROYED) return
+        stopIfActive()
         onDestroy()
         currentStage = Stage.DESTROYED
     }

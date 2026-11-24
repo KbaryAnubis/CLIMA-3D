@@ -1,9 +1,8 @@
 package com.example.maps
 
 import android.content.ComponentCallbacks2
+import android.content.Context
 import android.content.res.Configuration
-import android.view.MotionEvent
-import android.view.TextureView
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,22 +31,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.data.model.RainViewerRadarFrame
+import com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics
 import com.example.ui.theme.ClimaAccentCyan
 import com.example.ui.theme.ClimaTextMutedOnDark
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
-import org.maplibre.android.camera.CameraPosition
-import org.maplibre.android.camera.CameraUpdateFactory
-import org.maplibre.android.geometry.LatLng
-import org.maplibre.android.maps.MapLibreMap
-import org.maplibre.android.maps.MapView
-import org.maplibre.android.maps.Style
-import org.maplibre.android.style.layers.Property
-import org.maplibre.android.style.layers.PropertyFactory.rasterOpacity
-import org.maplibre.android.style.layers.PropertyFactory.visibility
-import org.maplibre.android.style.layers.RasterLayer
-import org.maplibre.android.style.sources.RasterSource
-import org.maplibre.android.style.sources.TileSet
 
 private const val RADAR_RAIN_SOURCE_PREFIX = "clima-radar-rainviewer-source-"
 private const val RADAR_RAIN_LAYER_PREFIX = "clima-radar-rainviewer-layer-"
@@ -191,6 +179,34 @@ fun RadarMapLibreView(
     radarErrorMessage: String? = null,
     onRetryReload: () -> Unit = {},
 ) {
+    RadarMapLibreViewImpl(
+        center = center,
+        zoom = zoom,
+        activeFrame = activeFrame,
+        layerStyle = layerStyle,
+        maxRadarZoom = maxRadarZoom,
+        modifier = modifier,
+        frames = frames,
+        isOnline = isOnline,
+        radarErrorMessage = radarErrorMessage,
+        onRetryReload = onRetryReload,
+    )
+}
+
+@Composable
+internal fun RadarMapLibreViewImpl(
+    center: CityMapCoordinate,
+    zoom: Double,
+    activeFrame: RainViewerRadarFrame?,
+    layerStyle: RadarBaseStyle,
+    maxRadarZoom: Int,
+    modifier: Modifier = Modifier,
+    frames: List<RainViewerRadarFrame> = listOfNotNull(activeFrame),
+    isOnline: Boolean = true,
+    radarErrorMessage: String? = null,
+    onRetryReload: () -> Unit = {},
+    surfacePortFactory: ((Context) -> MapViewSurfacePort)? = null,
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
@@ -207,7 +223,10 @@ fun RadarMapLibreView(
     val latestIsOnline by rememberUpdatedState(isOnline)
     val latestOnRetryReload by rememberUpdatedState(onRetryReload)
 
-    val mapLibreReady = remember(context) { MapLibreInitializer.ensureInitialized(context) }
+    val mapLibreReady =
+        remember(context, surfacePortFactory) {
+            surfacePortFactory != null || MapLibreInitializer.ensureInitialized(context)
+        }
 
     val radarUnavailableNotice =
         remember(layerStyle, activeFrame, radarErrorMessage, rainLayerError, isOnline) {
@@ -279,9 +298,9 @@ fun RadarMapLibreView(
     val tileSnapshot by TileTransportDiagnostics.snapshot.collectAsState()
     val layerPool = remember { RadarLayerPoolState() }
 
-    var mapViewRef by remember { mutableStateOf<MapView?>(null) }
-    var mapLibreMapRef by remember { mutableStateOf<MapLibreMap?>(null) }
-    var loadedStyleRef by remember { mutableStateOf<Style?>(null) }
+    var mapViewRef by remember { mutableStateOf<MapViewSurfacePort?>(null) }
+    var mapLibreMapRef by remember { mutableStateOf<MapLibreControllerPort?>(null) }
+    var loadedStyleRef by remember { mutableStateOf<MapStylePort?>(null) }
     val sessionDisposedRef = remember(viewRecreationNonce) { AtomicBoolean(false) }
     var appliedCameraSignature by remember(viewRecreationNonce) {
         mutableStateOf<Triple<Double, Double, Double>?>(null)
@@ -299,14 +318,7 @@ fun RadarMapLibreView(
     }
     var attemptKey by remember { mutableIntStateOf(stateMachine.attemptId) }
 
-    fun inspectSurfaceInfo(view: MapView?): String {
-        if (view == null) return "MapView=null"
-        val renderView = runCatching { view.renderView }.getOrNull()
-        val textureAvailable = (renderView as? TextureView)?.isAvailable
-        return "MapView=${view.width}x${view.height}, attached=${view.isAttachedToWindow}, textureAvailable=$textureAvailable"
-    }
-
-    fun applyBaseOsmStyle(map: MapLibreMap) {
+    fun applyBaseOsmStyle(map: MapLibreControllerPort) {
         if (sessionDisposedRef.get()) return
         val onlineNow = latestIsOnline
         loadedStyleRef = null
@@ -328,8 +340,7 @@ fun RadarMapLibreView(
             "Estilo base OSM v8 solicitado (Radar, coords=${latestCenter.formatted()}, zoom=$latestZoom).",
         )
         runCatching {
-            val styleBuilder = OpenStreetMapTileConfig.buildRadarBaseStyleBuilder()
-            map.setStyle(styleBuilder) { style ->
+            map.setStyle(MapStyleSpecRequest.RadarBase) { style ->
                 if (sessionDisposedRef.get()) return@setStyle
                 layerPool.clearTrackingOnly()
                 loadedStyleRef = style
@@ -349,11 +360,13 @@ fun RadarMapLibreView(
 
     // Feed real OkHttp tile transport telemetry into the Radar map state machine
     LaunchedEffect(tileSnapshot, isOnline) {
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         loadState = stateMachine.onTileTransportUpdated(tileSnapshot, isOnline)
     }
 
     // Initial load timeout guard: never freezes in "Carregando mapa..." and never fakes Available
     LaunchedEffect(attemptKey, isOnline) {
+        if (sessionDisposedRef.get()) return@LaunchedEffect
         if (!isOnline) {
             loadState = stateMachine.onTileTransportUpdated(TileTransportDiagnostics.snapshot.value, isOnline = false)
             return@LaunchedEffect
@@ -362,7 +375,7 @@ fun RadarMapLibreView(
         delay(MapLoadStateMachine.INITIAL_LOAD_TIMEOUT_MS)
         if (sessionDisposedRef.get()) return@LaunchedEffect
         if (stateMachine.attemptId == trackedAttempt && stateMachine.state.isLoading) {
-            val surfaceInfo = inspectSurfaceInfo(mapViewRef)
+            val surfaceInfo = mapViewRef?.inspectSurfaceInfo() ?: "MapView=null"
             val timedOutState = stateMachine.onTimeout(TileTransportDiagnostics.snapshot.value, surfaceInfo)
             loadState = timedOutState
             val cause = (timedOutState as? MapSurfaceLoadState.TimedOut)?.knownCause.orEmpty()
@@ -392,13 +405,13 @@ fun RadarMapLibreView(
         val targetSignature = Triple(center.latitude, center.longitude, zoom)
         if (appliedCameraSignature == targetSignature) return@LaunchedEffect
         appliedCameraSignature = targetSignature
-        val position =
-            CameraPosition.Builder()
-                .target(LatLng(center.latitude, center.longitude))
-                .zoom(zoom)
-                .build()
         runCatching {
-            map.animateCamera(CameraUpdateFactory.newCameraPosition(position), 260)
+            map.animateCamera(
+                latitude = center.latitude,
+                longitude = center.longitude,
+                zoom = zoom,
+                durationMs = 260,
+            )
         }
     }
 
@@ -423,33 +436,21 @@ fun RadarMapLibreView(
                     layerStyle = layerStyle,
                     maxRadarZoom = maxRadarZoom,
                     addSourceAndLayer = { _, sourceId, layerId, frame, isVisible ->
-                        val provider = frame.toTileProvider()
-                        val tileSet =
-                            TileSet("2.2", provider.tileUrlTemplate).apply {
-                                minZoom = 0f
-                                maxZoom = maxRadarZoom.toFloat()
-                                attribution = RainViewerRadarFrame.ATTRIBUTION
-                            }
-                        style.addSource(RasterSource(sourceId, tileSet, provider.tileWidthPx))
-                        val rainLayer =
-                            RasterLayer(layerId, sourceId).withProperties(
-                                rasterOpacity(targetOpacity),
-                                visibility(if (isVisible) Property.VISIBLE else Property.NONE),
-                            )
-                        if (style.getLayer(OpenStreetMapTileConfig.RADAR_OSM_LAYER_ID) != null) {
-                            style.addLayerAbove(rainLayer, OpenStreetMapTileConfig.RADAR_OSM_LAYER_ID)
-                        } else {
-                            style.addLayer(rainLayer)
-                        }
-                    },
-                    setLayerVisibility = { layerId, isVisible ->
-                        style.getLayerAs<RasterLayer>(layerId)?.setProperties(
-                            visibility(if (isVisible) Property.VISIBLE else Property.NONE),
+                        style.addRainViewerSourceAndLayer(
+                            sourceId = sourceId,
+                            layerId = layerId,
+                            frame = frame,
+                            maxRadarZoom = maxRadarZoom,
+                            opacity = targetOpacity,
+                            isVisible = isVisible,
+                            aboveLayerId = OpenStreetMapTileConfig.RADAR_OSM_LAYER_ID,
                         )
                     },
+                    setLayerVisibility = { layerId, isVisible ->
+                        style.setLayerVisibility(layerId, isVisible)
+                    },
                     removeSourceAndLayer = { sourceId, layerId ->
-                        style.removeLayer(layerId)
-                        style.removeSource(sourceId)
+                        style.removeSourceAndLayer(sourceId, layerId)
                     },
                 )
 
@@ -477,7 +478,7 @@ fun RadarMapLibreView(
 
     Box(modifier = modifier.fillMaxSize()) {
         key(viewRecreationNonce) {
-            var sessionHolder by remember { mutableStateOf<RadarMapViewSession?>(null) }
+            var sessionHolder by remember { mutableStateOf<MapViewSessionHandle?>(null) }
 
             DisposableEffect(lifecycleOwner, context) {
                 val observer =
@@ -503,209 +504,165 @@ fun RadarMapLibreView(
                     sessionDisposedRef.set(true)
                     lifecycleOwner.lifecycle.removeObserver(observer)
                     context.applicationContext?.unregisterComponentCallbacks(lowMemoryCallbacks)
-                    runCatching { mapLibreMapRef?.cancelTransitions() }
-                    sessionHolder?.dispose()
-                    sessionHolder = null
+                    sessionHolder?.pauseAndStopBeforeDetach("onDispose")
                     mapViewRef = null
                     mapLibreMapRef = null
                     loadedStyleRef = null
                     layerPool.clearTrackingOnly()
-                    ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "MapView do Radar destruído e listeners removidos.")
                 }
             }
 
             AndroidView(
                 modifier = Modifier.fillMaxSize().testTag("radar_maplibre_native_view"),
                 factory = { viewContext ->
-                    val options = MapLibreInitializer.createTextureMapOptions(viewContext)
+                    val sessionId = ClimaGraphicsLifecycleDiagnostics.nextSessionId("radar_map")
+                    val port = surfacePortFactory?.invoke(viewContext) ?: RealMapViewSurfacePort(viewContext)
                     ClimaMapLogger.i(
                         ClimaMapLogTags.MAP_RENDER,
                         "Criando MapView do Radar (TextureView, OpenGL ES, tentativa=${viewRecreationNonce + 1}).",
                     )
-                    val view = MapView(viewContext, options)
+                    ClimaGraphicsLifecycleDiagnostics.logMapViewCreated(
+                        screen = "Radar",
+                        sessionId = sessionId,
+                        viewIdentity = port.viewIdentity,
+                        attempt = viewRecreationNonce + 1,
+                    )
                     val firstFrameLogged = AtomicBoolean(false)
                     val fullyRenderedLogged = AtomicBoolean(false)
 
                     val controller =
                         MapViewLifecycleController(
-                            onCreate = { view.onCreate(null) },
-                            onStart = { view.onStart() },
-                            onResume = { view.onResume() },
-                            onPause = { view.onPause() },
-                            onStop = { view.onStop() },
-                            onDestroy = { view.onDestroy() },
-                            onLowMemory = { view.onLowMemory() },
+                            onCreate = { port.onCreate() },
+                            onStart = { port.onStart() },
+                            onResume = { port.onResume() },
+                            onPause = { port.onPause() },
+                            onStop = { port.onStop() },
+                            onDestroy = { port.onDestroy() },
+                            onLowMemory = { port.onLowMemory() },
                         )
                     controller.syncToLifecycleState(lifecycleOwner.lifecycle.currentState)
 
-                    @Suppress("ClickableViewAccessibility")
-                    view.setOnTouchListener { v, event ->
-                        when (event.actionMasked) {
-                            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE ->
-                                v.parent?.requestDisallowInterceptTouchEvent(true)
-                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
-                                v.parent?.requestDisallowInterceptTouchEvent(false)
-                        }
-                        false
-                    }
-
-                    val willStartLoadingListener =
-                        MapView.OnWillStartLoadingMapListener {
-                            ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "MapView Radar iniciou carregamento do mapa.")
-                        }
-                    val styleLoadedListener =
-                        MapView.OnDidFinishLoadingStyleListener {
-                            ClimaMapLogger.i(
-                                ClimaMapLogTags.MAP_STYLE,
-                                "Callback onDidFinishLoadingStyle disparado (Radar, ${stateMachine.elapsedMs()}ms).",
-                            )
-                        }
-                    val mapLoadedListener =
-                        MapView.OnDidFinishLoadingMapListener {
-                            ClimaMapLogger.i(
-                                ClimaMapLogTags.MAP_RENDER,
-                                "onDidFinishLoadingMap disparado (Radar, ${stateMachine.elapsedMs()}ms).",
-                            )
-                            view.post {
-                                if (sessionDisposedRef.get()) return@post
-                                loadState = stateMachine.onMapLoadedCallback(
-                                    TileTransportDiagnostics.snapshot.value,
-                                    latestIsOnline,
-                                )
-                            }
-                        }
-                    val mapFailListener =
-                        MapView.OnDidFailLoadingMapListener { errorMessage ->
-                            val reason = errorMessage.ifBlank { "Erro ao carregar mapa-base OpenStreetMap." }
-                            ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, "Falha no estilo/mapa Radar: $reason")
-                            view.post {
-                                if (sessionDisposedRef.get()) return@post
-                                loadState = stateMachine.onStyleFailed(reason, isOnline = latestIsOnline)
-                            }
-                        }
-                    val willStartRenderingMapListener =
-                        MapView.OnWillStartRenderingMapListener {
-                            stateMachine.updateSurfaceDiagnostics(inspectSurfaceInfo(view))
-                            ClimaMapLogger.i(
-                                ClimaMapLogTags.MAP_RENDER,
-                                "MapView Radar iniciou pipeline de renderização (${stateMachine.surfaceDiagnostics}).",
-                            )
-                        }
-                    val frameRenderedListener =
-                        MapView.OnDidFinishRenderingFrameListener { _, _, _ ->
-                            if (firstFrameLogged.compareAndSet(false, true)) {
-                                ClimaMapLogger.i(
-                                    ClimaMapLogTags.MAP_RENDER,
-                                    "Primeiro quadro do MapView Radar renderizado em ${stateMachine.elapsedMs()}ms.",
-                                )
-                                view.post {
-                                    if (sessionDisposedRef.get()) return@post
-                                    loadState = stateMachine.onFirstFrameRendered(TileTransportDiagnostics.snapshot.value)
-                                }
-                            }
-                        }
-                    val mapRenderedListener =
-                        MapView.OnDidFinishRenderingMapListener { fully ->
-                            if (fully) {
-                                if (fullyRenderedLogged.compareAndSet(false, true)) {
+                    val detachListeners =
+                        port.attachListeners(
+                            MapSurfaceCallbacks(
+                                onWillStartLoading = {
+                                    ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "MapView Radar iniciou carregamento do mapa.")
+                                },
+                                onDidFinishLoadingStyle = {
+                                    ClimaMapLogger.i(
+                                        ClimaMapLogTags.MAP_STYLE,
+                                        "Callback onDidFinishLoadingStyle disparado (Radar, ${stateMachine.elapsedMs()}ms).",
+                                    )
+                                },
+                                onDidFinishLoadingMap = {
                                     ClimaMapLogger.i(
                                         ClimaMapLogTags.MAP_RENDER,
-                                        "Mapa Radar totalmente renderizado com tiles em ${stateMachine.elapsedMs()}ms.",
+                                        "onDidFinishLoadingMap disparado (Radar, ${stateMachine.elapsedMs()}ms).",
                                     )
-                                }
-                                view.post {
-                                    if (sessionDisposedRef.get()) return@post
-                                    loadState = stateMachine.onMapFinishedRendering(
-                                        fully = true,
-                                        tileSnapshot = TileTransportDiagnostics.snapshot.value,
+                                    port.postToUi {
+                                        if (sessionDisposedRef.get()) return@postToUi
+                                        loadState = stateMachine.onMapLoadedCallback(
+                                            TileTransportDiagnostics.snapshot.value,
+                                            latestIsOnline,
+                                        )
+                                    }
+                                },
+                                onDidFailLoadingMap = { errorMessage ->
+                                    val reason = errorMessage.ifBlank { "Erro ao carregar mapa-base OpenStreetMap." }
+                                    ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, "Falha no estilo/mapa Radar: $reason")
+                                    port.postToUi {
+                                        if (sessionDisposedRef.get()) return@postToUi
+                                        loadState = stateMachine.onStyleFailed(reason, isOnline = latestIsOnline)
+                                    }
+                                },
+                                onWillStartRenderingMap = {
+                                    stateMachine.updateSurfaceDiagnostics(port.inspectSurfaceInfo())
+                                    ClimaMapLogger.i(
+                                        ClimaMapLogTags.MAP_RENDER,
+                                        "MapView Radar iniciou pipeline de renderização (${stateMachine.surfaceDiagnostics}).",
                                     )
-                                }
-                            } else {
-                                view.post {
-                                    if (sessionDisposedRef.get()) return@post
-                                    loadState = stateMachine.onMapFinishedRendering(
-                                        fully = false,
-                                        tileSnapshot = TileTransportDiagnostics.snapshot.value,
-                                    )
-                                }
-                            }
-                        }
-                    val renderErrorListener =
-                        MapView.OnRenderErrorListener {
-                            ClimaMapLogger.e(ClimaMapLogTags.MAP_RENDER, "Erro nativo de renderização no MapView Radar.")
-                            view.post {
-                                if (sessionDisposedRef.get()) return@post
-                                loadState = stateMachine.onRenderError("Erro nativo de renderização OpenGL/TextureView no Radar.")
-                            }
-                        }
-                    val shaderErrorListener =
-                        MapView.OnShaderCompileFailedListener { id, type, _ ->
-                            ClimaMapLogger.e(ClimaMapLogTags.MAP_RENDER, "Falha ao compilar shader MapLibre Radar (id=$id, type=$type).")
-                            view.post {
-                                if (sessionDisposedRef.get()) return@post
-                                loadState = stateMachine.onRenderError("Falha ao compilar shader OpenGL (id=$id).")
-                            }
-                        }
-
-                    view.addOnWillStartLoadingMapListener(willStartLoadingListener)
-                    view.addOnDidFinishLoadingStyleListener(styleLoadedListener)
-                    view.addOnDidFinishLoadingMapListener(mapLoadedListener)
-                    view.addOnDidFailLoadingMapListener(mapFailListener)
-                    view.addOnWillStartRenderingMapListener(willStartRenderingMapListener)
-                    view.addOnDidFinishRenderingFrameListener(frameRenderedListener)
-                    view.addOnDidFinishRenderingMapListener(mapRenderedListener)
-                    view.addOnRenderErrorListener(renderErrorListener)
-                    view.addOnShaderCompileFailedListener(shaderErrorListener)
+                                },
+                                onFirstFrameRendered = {
+                                    if (firstFrameLogged.compareAndSet(false, true)) {
+                                        ClimaMapLogger.i(
+                                            ClimaMapLogTags.MAP_RENDER,
+                                            "Primeiro quadro do MapView Radar renderizado em ${stateMachine.elapsedMs()}ms.",
+                                        )
+                                        port.postToUi {
+                                            if (sessionDisposedRef.get()) return@postToUi
+                                            loadState = stateMachine.onFirstFrameRendered(TileTransportDiagnostics.snapshot.value)
+                                        }
+                                    }
+                                },
+                                onDidFinishRenderingMap = { fully ->
+                                    if (fully && fullyRenderedLogged.compareAndSet(false, true)) {
+                                        ClimaMapLogger.i(
+                                            ClimaMapLogTags.MAP_RENDER,
+                                            "Mapa Radar totalmente renderizado com tiles em ${stateMachine.elapsedMs()}ms.",
+                                        )
+                                    }
+                                    port.postToUi {
+                                        if (sessionDisposedRef.get()) return@postToUi
+                                        loadState = stateMachine.onMapFinishedRendering(
+                                            fully = fully,
+                                            tileSnapshot = TileTransportDiagnostics.snapshot.value,
+                                        )
+                                    }
+                                },
+                                onRenderError = { reason ->
+                                    ClimaMapLogger.e(ClimaMapLogTags.MAP_RENDER, "Erro nativo de renderização no MapView Radar.")
+                                    port.postToUi {
+                                        if (sessionDisposedRef.get()) return@postToUi
+                                        loadState = stateMachine.onRenderError(reason)
+                                    }
+                                },
+                            ),
+                        )
 
                     sessionHolder =
-                        RadarMapViewSession(
-                            mapView = view,
+                        MapViewSessionHandle(
+                            screenName = "Radar",
+                            sessionId = sessionId,
+                            surfacePort = port,
                             controller = controller,
-                            onDetachListeners = {
-                                view.removeOnWillStartLoadingMapListener(willStartLoadingListener)
-                                view.removeOnDidFinishLoadingStyleListener(styleLoadedListener)
-                                view.removeOnDidFinishLoadingMapListener(mapLoadedListener)
-                                view.removeOnDidFailLoadingMapListener(mapFailListener)
-                                view.removeOnWillStartRenderingMapListener(willStartRenderingMapListener)
-                                view.removeOnDidFinishRenderingFrameListener(frameRenderedListener)
-                                view.removeOnDidFinishRenderingMapListener(mapRenderedListener)
-                                view.removeOnRenderErrorListener(renderErrorListener)
-                                view.removeOnShaderCompileFailedListener(shaderErrorListener)
-                            },
+                            onDetachListeners = detachListeners,
+                            onCancelTransitions = { mapLibreMapRef?.cancelTransitions() },
                         )
-                    mapViewRef = view
+                    mapViewRef = port
 
-                    view.getMapAsync { map ->
+                    port.getMapAsync { map ->
                         if (sessionDisposedRef.get()) return@getMapAsync
                         mapLibreMapRef = map
-                        stateMachine.updateSurfaceDiagnostics(inspectSurfaceInfo(view))
+                        stateMachine.updateSurfaceDiagnostics(port.inspectSurfaceInfo())
                         loadState = stateMachine.onMapReady(latestIsOnline)
                         ClimaMapLogger.i(
                             ClimaMapLogTags.MAP_RENDER,
                             "getMapAsync pronto no Radar (${stateMachine.surfaceDiagnostics}).",
                         )
-                        map.uiSettings.apply {
-                            isZoomGesturesEnabled = true
-                            isScrollGesturesEnabled = true
-                            isDoubleTapGesturesEnabled = true
-                            isRotateGesturesEnabled = false
-                            isTiltGesturesEnabled = false
-                            isLogoEnabled = false
-                            isAttributionEnabled = false
-                        }
+                        map.configureUiSettings()
 
                         val initCenter = latestCenter
                         val initZoom = latestZoom
                         appliedCameraSignature = Triple(initCenter.latitude, initCenter.longitude, initZoom)
-                        map.cameraPosition =
-                            CameraPosition.Builder()
-                                .target(LatLng(initCenter.latitude, initCenter.longitude))
-                                .zoom(initZoom)
-                                .build()
+                        map.setInitialCamera(
+                            latitude = initCenter.latitude,
+                            longitude = initCenter.longitude,
+                            zoom = initZoom,
+                        )
 
                         applyBaseOsmStyle(map)
                     }
-                    view
+                    port.androidView
+                },
+                onRelease = {
+                    sessionDisposedRef.set(true)
+                    sessionHolder?.destroyOnceAfterDetach()
+                    sessionHolder = null
+                    mapViewRef = null
+                    mapLibreMapRef = null
+                    loadedStyleRef = null
+                    layerPool.clearTrackingOnly()
+                    ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "MapView do Radar destruído e listeners removidos.")
                 },
             )
         }
@@ -747,16 +704,5 @@ fun RadarMapLibreView(
                         Modifier.align(Alignment.Center)
                 },
         )
-    }
-}
-
-private class RadarMapViewSession(
-    val mapView: MapView,
-    val controller: MapViewLifecycleController,
-    private val onDetachListeners: () -> Unit,
-) {
-    fun dispose() {
-        runCatching { onDetachListeners() }
-        controller.destroy()
     }
 }
