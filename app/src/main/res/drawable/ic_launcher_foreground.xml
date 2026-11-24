@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/clima_3d_launcher_fg_1795535537003"
+        android:drawable="@drawable/ic_launcher_official_foreground"
         android:gravity="center" />
 </layer-list>
