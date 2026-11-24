@@ -9,6 +9,7 @@ import androidx.annotation.RawRes
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -28,6 +29,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.R
 import com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics
+import com.example.diagnostics.GraphicsSurfaceCoordinator
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal data class ExoSurfaceSnapshot(
@@ -44,6 +46,10 @@ internal interface WeatherVideoPlayerBridge {
     val identityHash: Int
     val isReleased: Boolean
     val isIdle: Boolean
+    val currentPositionMs: Long
+        get() = 0L
+    val currentPlaybackSpeed: Float
+        get() = 1.0f
 
     fun setVideoResIdHint(@RawRes resId: Int) {}
     fun setMediaItem(uri: Uri)
@@ -100,6 +106,12 @@ private class RealExoPlayerBridge(
 
     override val isIdle: Boolean
         get() = !releasedFlag.get() && exoPlayer.playbackState == Player.STATE_IDLE
+
+    override val currentPositionMs: Long
+        get() = if (releasedFlag.get()) 0L else runCatching { exoPlayer.currentPosition }.getOrDefault(0L)
+
+    override val currentPlaybackSpeed: Float
+        get() = if (releasedFlag.get()) 1.0f else runCatching { exoPlayer.playbackParameters.speed }.getOrDefault(1.0f)
 
     private val lifecycleDiagnosticListener =
         object : Player.Listener {
@@ -310,6 +322,10 @@ private class RealPlayerViewSurfaceBridge(
  *   composite cleanly over the video with zero SurfaceView Z-order artifacts.
  * - Supports V53 playback speed adjustments (e.g., 0.85f for `chuva_fraca`) without resetting
  *   media items or recreating the player.
+ * - Enforces surface exclusivity with MapLibre (`RADAR` / `CITIES`): pauses playback, detaches
+ *   `PlayerView.player = null`, and clears `ExoPlayer`'s video output surface while any MapLibre
+ *   OpenGL TextureView session is active or disposing, then reattaches the same in-memory
+ *   `ExoPlayer` instance once MapLibre teardown completes.
  * - Lifecycle-aware pause/resume and ordered surface-detachment before idempotent `release()`.
  */
 @Composable
@@ -336,6 +352,8 @@ internal fun WeatherVideoBackgroundImpl(
     isPlaying: Boolean = true,
     onFirstFrameRendered: () -> Unit = {},
     modifier: Modifier = Modifier,
+    allowVideoSurfaceOutput: Boolean = true,
+    enforceMapSurfaceExclusivity: Boolean = !allowVideoSurfaceOutput,
     playerBridgeFactory: ((Context) -> WeatherVideoPlayerBridge)? = null,
     surfaceBridgeFactory: ((Context) -> WeatherVideoSurfaceBridge)? = null,
 ) {
@@ -343,6 +361,7 @@ internal fun WeatherVideoBackgroundImpl(
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestOnFirstFrame by rememberUpdatedState(onFirstFrameRendered)
     val latestIsPlaying by rememberUpdatedState(isPlaying)
+    val coordinationSnapshot by GraphicsSurfaceCoordinator.state.collectAsState()
 
     val playerHandle =
         remember(context) {
@@ -354,7 +373,7 @@ internal fun WeatherVideoBackgroundImpl(
                             ExoPlayer.Builder(context).build().apply {
                                 repeatMode = Player.REPEAT_MODE_ONE
                                 volume = 0f
-                                playWhenReady = isPlaying
+                                playWhenReady = isPlaying && allowVideoSurfaceOutput
                             },
                         sessionId = sessionId,
                         initialVideoResId = videoResId,
@@ -372,6 +391,140 @@ internal fun WeatherVideoBackgroundImpl(
     var appliedVideoResId by remember(playerHandle) { mutableStateOf<Int?>(null) }
     var appliedSpeed by remember(playerHandle) { mutableStateOf<Float?>(null) }
     var lastAppliedPlayState by remember(playerHandle) { mutableStateOf<Boolean?>(null) }
+    var videoSurfaceClearedForMap by remember(playerHandle) { mutableStateOf(false) }
+    var pendingReattachRequestLogged by remember(playerHandle) { mutableStateOf(false) }
+
+    // Effective exclusivity: when mounted via WeatherBackgroundLayer (or when allowVideoSurfaceOutput
+    // is false / map exclusivity is active), video output only attaches when allowed AND no MapView
+    // session is active or disposing.
+    val trackMapExclusivity = remember(playerHandle) { mutableStateOf(enforceMapSurfaceExclusivity) }
+    if (!allowVideoSurfaceOutput || enforceMapSurfaceExclusivity) {
+        trackMapExclusivity.value = true
+    }
+    val canAttachVideoSurfaceNow =
+        allowVideoSurfaceOutput &&
+            (!trackMapExclusivity.value || coordinationSnapshot.canAttachVideoOutput)
+    val latestCanAttachVideoSurfaceNow by rememberUpdatedState(canAttachVideoSurfaceNow)
+
+    fun isLifecycleStarted(): Boolean =
+        lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+
+    fun pausePlayerIdempotently() {
+        if (playerHandle.isReleased) return
+        if (lastAppliedPlayState != false) {
+            lastAppliedPlayState = false
+            playerHandle.setPlayWhenReady(false)
+            playerHandle.pause()
+        }
+    }
+
+    fun resumePlayerIfEligible(requireStartedLifecycle: Boolean = true) {
+        if (playerHandle.isReleased) return
+        val canPlayInCurrentLifecycle = !requireStartedLifecycle || isLifecycleStarted()
+        if (!latestIsPlaying || !latestCanAttachVideoSurfaceNow) {
+            pausePlayerIdempotently()
+            return
+        }
+        if (!canPlayInCurrentLifecycle) {
+            return
+        }
+        val bridge = surfaceBridgeRef
+        if (bridge != null && bridge.isPlayerAttached(playerHandle) && lastAppliedPlayState != true) {
+            lastAppliedPlayState = true
+            playerHandle.setPlayWhenReady(true)
+            if (playerHandle.isIdle) {
+                playerHandle.prepare()
+            } else {
+                playerHandle.play()
+            }
+        }
+    }
+
+    fun detachVideoOutputForMapExclusivity(bridge: WeatherVideoSurfaceBridge, reason: String) {
+        pausePlayerIdempotently()
+        val wasAttachedToBridge = bridge.isPlayerAttached(playerHandle)
+        if (!wasAttachedToBridge && videoSurfaceClearedForMap) {
+            return
+        }
+        GraphicsSurfaceCoordinator.onVideoOutputDetachForMap(
+            sessionId = playerHandle.sessionId,
+            playerIdentity = playerHandle.identityHash,
+            viewIdentity = bridge.viewIdentity,
+            reason = reason,
+        )
+        if (wasAttachedToBridge) {
+            bridge.detachPlayer()
+        }
+        if (!videoSurfaceClearedForMap && !playerHandle.isReleased) {
+            playerHandle.clearVideoSurface()
+            videoSurfaceClearedForMap = true
+            ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceCleared(
+                sessionId = playerHandle.sessionId,
+                playerIdentity = playerHandle.identityHash,
+                viewIdentity = bridge.viewIdentity,
+                reason = reason,
+            )
+        }
+        pendingReattachRequestLogged = false
+        GraphicsSurfaceCoordinator.onVideoOutputDetached(
+            sessionId = playerHandle.sessionId,
+            playerIdentity = playerHandle.identityHash,
+            viewIdentity = bridge.viewIdentity,
+            reason = reason,
+        )
+    }
+
+    fun attachVideoOutputIfAllowed(bridge: WeatherVideoSurfaceBridge, reason: String) {
+        if (playerHandle.isReleased) return
+        if (!allowVideoSurfaceOutput) {
+            detachVideoOutputForMapExclusivity(bridge, reason = "map_tab_active")
+            return
+        }
+        if (trackMapExclusivity.value && !coordinationSnapshot.canAttachVideoOutput) {
+            if (bridge.isPlayerAttached(playerHandle) || !videoSurfaceClearedForMap) {
+                detachVideoOutputForMapExclusivity(bridge, reason = "map_surface_busy")
+            }
+            if (!pendingReattachRequestLogged) {
+                pendingReattachRequestLogged = true
+                GraphicsSurfaceCoordinator.onVideoOutputReattachRequest(
+                    sessionId = playerHandle.sessionId,
+                    playerIdentity = playerHandle.identityHash,
+                    viewIdentity = bridge.viewIdentity,
+                    reason = "${reason}_awaiting_map_teardown",
+                )
+            }
+            return
+        }
+
+        if (!bridge.isPlayerAttached(playerHandle)) {
+            if (!pendingReattachRequestLogged && videoSurfaceClearedForMap) {
+                GraphicsSurfaceCoordinator.onVideoOutputReattachRequest(
+                    sessionId = playerHandle.sessionId,
+                    playerIdentity = playerHandle.identityHash,
+                    viewIdentity = bridge.viewIdentity,
+                    reason = reason,
+                )
+            }
+            pendingReattachRequestLogged = false
+            videoSurfaceClearedForMap = false
+            bridge.attachPlayer(playerHandle)
+            val surfaceFormatted = bridge.inspectSurfaceSnapshot().formatted()
+            ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceAttached(
+                sessionId = playerHandle.sessionId,
+                playerIdentity = playerHandle.identityHash,
+                viewIdentity = bridge.viewIdentity,
+                viewClass = bridge.viewClassName,
+                surfaceInfo = surfaceFormatted,
+            )
+            GraphicsSurfaceCoordinator.onVideoOutputReattached(
+                sessionId = playerHandle.sessionId,
+                playerIdentity = playerHandle.identityHash,
+                viewIdentity = bridge.viewIdentity,
+                surfaceInfo = surfaceFormatted,
+            )
+        }
+        resumePlayerIfEligible(requireStartedLifecycle = true)
+    }
 
     LaunchedEffect(playerHandle, videoResId) {
         if (playerHandle.isReleased || appliedVideoResId == videoResId) return@LaunchedEffect
@@ -379,14 +532,15 @@ internal fun WeatherVideoBackgroundImpl(
         if (appliedVideoResId != null) {
             playerHandle.stop()
         }
+        val playNow = latestIsPlaying && latestCanAttachVideoSurfaceNow
         playerHandle.setVideoResIdHint(videoResId)
         playerHandle.setMediaItem(uri)
         playerHandle.setVolume(0f)
         playerHandle.setRepeatMode(Player.REPEAT_MODE_ONE)
-        playerHandle.setPlayWhenReady(latestIsPlaying)
+        playerHandle.setPlayWhenReady(playNow)
         playerHandle.prepare()
         appliedVideoResId = videoResId
-        lastAppliedPlayState = latestIsPlaying
+        lastAppliedPlayState = playNow
     }
 
     LaunchedEffect(playerHandle, playbackSpeed) {
@@ -398,19 +552,24 @@ internal fun WeatherVideoBackgroundImpl(
         }
     }
 
-    LaunchedEffect(playerHandle, isPlaying) {
-        if (playerHandle.isReleased || lastAppliedPlayState == isPlaying) return@LaunchedEffect
-        lastAppliedPlayState = isPlaying
-        playerHandle.setPlayWhenReady(isPlaying)
-        if (isPlaying) {
-            if (playerHandle.isIdle) {
-                playerHandle.prepare()
-            } else {
-                playerHandle.play()
-            }
+    LaunchedEffect(
+        playerHandle,
+        surfaceBridgeRef,
+        allowVideoSurfaceOutput,
+        coordinationSnapshot.mapState,
+        coordinationSnapshot.canAttachVideoOutput,
+    ) {
+        val bridge = surfaceBridgeRef ?: return@LaunchedEffect
+        if (!allowVideoSurfaceOutput) {
+            detachVideoOutputForMapExclusivity(bridge, reason = "map_tab_active")
         } else {
-            playerHandle.pause()
+            attachVideoOutputIfAllowed(bridge, reason = "return_from_map")
         }
+    }
+
+    LaunchedEffect(playerHandle, isPlaying, canAttachVideoSurfaceNow) {
+        if (playerHandle.isReleased) return@LaunchedEffect
+        resumePlayerIfEligible()
     }
 
     DisposableEffect(lifecycleOwner, playerHandle) {
@@ -420,24 +579,17 @@ internal fun WeatherVideoBackgroundImpl(
                 when (event) {
                     Lifecycle.Event.ON_START,
                     Lifecycle.Event.ON_RESUME -> {
-                        if (latestIsPlaying && lastAppliedPlayState != true) {
-                            lastAppliedPlayState = true
-                            playerHandle.setPlayWhenReady(true)
-                            if (playerHandle.isIdle) {
-                                playerHandle.prepare()
-                            } else {
-                                playerHandle.play()
-                            }
+                        val bridge = surfaceBridgeRef
+                        if (bridge != null && latestCanAttachVideoSurfaceNow && !bridge.isPlayerAttached(playerHandle)) {
+                            attachVideoOutputIfAllowed(bridge, reason = "lifecycle_${event.name.lowercase()}")
+                        } else {
+                            resumePlayerIfEligible()
                         }
                     }
 
                     Lifecycle.Event.ON_PAUSE,
                     Lifecycle.Event.ON_STOP -> {
-                        if (lastAppliedPlayState != false) {
-                            lastAppliedPlayState = false
-                            playerHandle.setPlayWhenReady(false)
-                            playerHandle.pause()
-                        }
+                        pausePlayerIdempotently()
                     }
 
                     else -> Unit
@@ -458,16 +610,33 @@ internal fun WeatherVideoBackgroundImpl(
             detachWindowObserverRef?.invoke()
             detachWindowObserverRef = null
             surfaceBridgeRef?.let { bridge ->
-                bridge.detachPlayer()
-                ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceCleared(
+                val wasAttached = bridge.isPlayerAttached(playerHandle)
+                if (wasAttached) {
+                    bridge.detachPlayer()
+                }
+                if (!videoSurfaceClearedForMap) {
+                    playerHandle.clearVideoSurface()
+                    videoSurfaceClearedForMap = true
+                    ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceCleared(
+                        sessionId = playerHandle.sessionId,
+                        playerIdentity = playerHandle.identityHash,
+                        viewIdentity = bridge.viewIdentity,
+                        reason = "onDispose",
+                    )
+                }
+                GraphicsSurfaceCoordinator.onVideoOutputDetached(
                     sessionId = playerHandle.sessionId,
                     playerIdentity = playerHandle.identityHash,
                     viewIdentity = bridge.viewIdentity,
                     reason = "onDispose",
                 )
+            } ?: run {
+                if (!videoSurfaceClearedForMap) {
+                    playerHandle.clearVideoSurface()
+                    videoSurfaceClearedForMap = true
+                }
             }
             surfaceBridgeRef = null
-            playerHandle.clearVideoSurface()
             if (playerHandle.releaseOnce()) {
                 ClimaGraphicsLifecycleDiagnostics.logExoPlayerReleased(
                     sessionId = playerHandle.sessionId,
@@ -486,7 +655,6 @@ internal fun WeatherVideoBackgroundImpl(
                         LayoutInflater.from(viewContext)
                             .inflate(R.layout.view_weather_video_texture, null, false) as PlayerView,
                     )
-            bridge.attachPlayer(playerHandle)
             surfaceBridgeRef = bridge
             detachWindowObserverRef?.invoke()
             detachWindowObserverRef =
@@ -502,26 +670,38 @@ internal fun WeatherVideoBackgroundImpl(
                         hasSurfaceTexture = snapshot.hasSurfaceTexture,
                     )
                 }
-            ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceAttached(
-                sessionId = playerHandle.sessionId,
-                playerIdentity = playerHandle.identityHash,
-                viewIdentity = bridge.viewIdentity,
-                viewClass = bridge.viewClassName,
-                surfaceInfo = bridge.inspectSurfaceSnapshot().formatted(),
-            )
-            bridge.view
-        },
-        update = {
-            val bridge = surfaceBridgeRef ?: return@AndroidView
-            if (!playerHandle.isReleased && !bridge.isPlayerAttached(playerHandle)) {
+            if (canAttachVideoSurfaceNow) {
                 bridge.attachPlayer(playerHandle)
+                videoSurfaceClearedForMap = false
+                val surfaceFormatted = bridge.inspectSurfaceSnapshot().formatted()
                 ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceAttached(
                     sessionId = playerHandle.sessionId,
                     playerIdentity = playerHandle.identityHash,
                     viewIdentity = bridge.viewIdentity,
                     viewClass = bridge.viewClassName,
-                    surfaceInfo = bridge.inspectSurfaceSnapshot().formatted(),
+                    surfaceInfo = surfaceFormatted,
                 )
+                GraphicsSurfaceCoordinator.onVideoOutputReattached(
+                    sessionId = playerHandle.sessionId,
+                    playerIdentity = playerHandle.identityHash,
+                    viewIdentity = bridge.viewIdentity,
+                    surfaceInfo = surfaceFormatted,
+                )
+            } else {
+                videoSurfaceClearedForMap = true
+                GraphicsSurfaceCoordinator.onVideoOutputDetached(
+                    sessionId = playerHandle.sessionId,
+                    playerIdentity = playerHandle.identityHash,
+                    viewIdentity = bridge.viewIdentity,
+                    reason = "factory_map_active",
+                )
+            }
+            bridge.view
+        },
+        update = {
+            val bridge = surfaceBridgeRef ?: return@AndroidView
+            if (!playerHandle.isReleased && canAttachVideoSurfaceNow && !bridge.isPlayerAttached(playerHandle)) {
+                attachVideoOutputIfAllowed(bridge, reason = "android_view_update")
             }
         },
         onRelease = {
@@ -529,11 +709,20 @@ internal fun WeatherVideoBackgroundImpl(
             detachWindowObserverRef = null
             val bridge = surfaceBridgeRef
             if (bridge != null) {
-                bridge.detachPlayer()
-                if (!playerHandle.isReleased) {
-                    playerHandle.clearVideoSurface()
+                if (bridge.isPlayerAttached(playerHandle)) {
+                    bridge.detachPlayer()
                 }
-                ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceCleared(
+                if (!playerHandle.isReleased && !videoSurfaceClearedForMap) {
+                    playerHandle.clearVideoSurface()
+                    videoSurfaceClearedForMap = true
+                    ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceCleared(
+                        sessionId = playerHandle.sessionId,
+                        playerIdentity = playerHandle.identityHash,
+                        viewIdentity = bridge.viewIdentity,
+                        reason = "onRelease",
+                    )
+                }
+                GraphicsSurfaceCoordinator.onVideoOutputDetached(
                     sessionId = playerHandle.sessionId,
                     playerIdentity = playerHandle.identityHash,
                     viewIdentity = bridge.viewIdentity,
@@ -544,3 +733,4 @@ internal fun WeatherVideoBackgroundImpl(
         },
     )
 }
+

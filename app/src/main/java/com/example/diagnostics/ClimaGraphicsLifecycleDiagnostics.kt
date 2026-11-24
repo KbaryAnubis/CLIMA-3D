@@ -74,6 +74,7 @@ object ClimaGraphicsLifecycleDiagnostics {
     internal fun clearForTest() {
         synchronized(lock) { recentEvents.clear() }
         currentTab = ClimaTab.HOME
+        GraphicsSurfaceCoordinator.resetForTest()
     }
 
     private fun emit(event: String) {
@@ -91,6 +92,110 @@ object ClimaGraphicsLifecycleDiagnostics {
             recentEvents.addLast(line)
         }
         runCatching { Log.i(TAG, line) }
+    }
+
+    fun logVideoOutputDetachForMap(
+        sessionId: String,
+        playerIdentity: Int,
+        viewIdentity: Int,
+        reason: String,
+        mapState: MapSurfaceSessionState,
+        videoState: VideoSurfaceOutputState,
+    ) {
+        emit(
+            "VIDEO_OUTPUT_DETACH_FOR_MAP session=$sessionId playerId=$playerIdentity viewId=$viewIdentity " +
+                "reason=$reason mapState=${mapState.name} videoState=${videoState.name}",
+        )
+    }
+
+    fun logVideoOutputDetached(
+        sessionId: String,
+        playerIdentity: Int,
+        viewIdentity: Int,
+        reason: String,
+        mapState: MapSurfaceSessionState,
+        videoState: VideoSurfaceOutputState,
+    ) {
+        emit(
+            "VIDEO_OUTPUT_DETACHED session=$sessionId playerId=$playerIdentity viewId=$viewIdentity " +
+                "reason=$reason mapState=${mapState.name} videoState=${videoState.name}",
+        )
+    }
+
+    fun logMapSurfaceCreated(
+        screen: String,
+        sessionId: String,
+        viewIdentity: Int,
+        mapState: MapSurfaceSessionState,
+        videoState: VideoSurfaceOutputState,
+        surfaceInfo: String? = null,
+    ) {
+        val surfaceSuffix = surfaceInfo?.let { " surface=[$it]" }.orEmpty()
+        emit(
+            "MAP_SURFACE_CREATED screen=$screen session=$sessionId viewId=$viewIdentity " +
+                "mapState=${mapState.name} videoState=${videoState.name}$surfaceSuffix",
+        )
+    }
+
+    fun logMapSurfaceDisposing(
+        screen: String,
+        sessionId: String,
+        viewIdentity: Int,
+        stage: String,
+        mapState: MapSurfaceSessionState,
+        videoState: VideoSurfaceOutputState,
+        surfaceInfo: String? = null,
+    ) {
+        val surfaceSuffix = surfaceInfo?.let { " surface=[$it]" }.orEmpty()
+        emit(
+            "MAP_SURFACE_DISPOSING screen=$screen session=$sessionId viewId=$viewIdentity stage=$stage " +
+                "mapState=${mapState.name} videoState=${videoState.name}$surfaceSuffix",
+        )
+    }
+
+    fun logMapSurfaceDetached(
+        screen: String,
+        sessionId: String,
+        viewIdentity: Int,
+        mapState: MapSurfaceSessionState,
+        videoState: VideoSurfaceOutputState,
+        surfaceInfo: String? = null,
+    ) {
+        val surfaceSuffix = surfaceInfo?.let { " surface=[$it]" }.orEmpty()
+        emit(
+            "MAP_SURFACE_DETACHED screen=$screen session=$sessionId viewId=$viewIdentity " +
+                "mapState=${mapState.name} videoState=${videoState.name}$surfaceSuffix",
+        )
+    }
+
+    fun logVideoOutputReattachRequest(
+        sessionId: String,
+        playerIdentity: Int,
+        viewIdentity: Int,
+        reason: String,
+        mapState: MapSurfaceSessionState,
+        videoState: VideoSurfaceOutputState,
+        canAttachNow: Boolean,
+    ) {
+        emit(
+            "VIDEO_OUTPUT_REATTACH_REQUEST session=$sessionId playerId=$playerIdentity viewId=$viewIdentity " +
+                "reason=$reason mapState=${mapState.name} videoState=${videoState.name} canAttachNow=$canAttachNow",
+        )
+    }
+
+    fun logVideoOutputReattached(
+        sessionId: String,
+        playerIdentity: Int,
+        viewIdentity: Int,
+        mapState: MapSurfaceSessionState,
+        videoState: VideoSurfaceOutputState,
+        surfaceInfo: String? = null,
+    ) {
+        val surfaceSuffix = surfaceInfo?.let { " surface=[$it]" }.orEmpty()
+        emit(
+            "VIDEO_OUTPUT_REATTACHED session=$sessionId playerId=$playerIdentity viewId=$viewIdentity " +
+                "mapState=${mapState.name} videoState=${videoState.name}$surfaceSuffix",
+        )
     }
 
     fun logMapViewCreated(

@@ -357,14 +357,34 @@ internal class MapViewSessionHandle(
     private val pausedAndStopped = AtomicBoolean(false)
     private val destroyed = AtomicBoolean(false)
 
+    init {
+        com.example.diagnostics.GraphicsSurfaceCoordinator.onMapSurfaceCreated(
+            screen = screenName,
+            sessionId = sessionId,
+            viewIdentity = surfacePort.viewIdentity,
+            surfaceInfo = runCatching { surfacePort.inspectSurfaceInfo() }.getOrNull(),
+        )
+    }
+
     fun pauseAndStopBeforeDetach(stage: String) {
-        if (pausedAndStopped.compareAndSet(false, true) || stage != "release") {
+        val surfaceSnapshot = runCatching { surfacePort.inspectSurfaceInfo() }.getOrNull()
+        val firstDisposeTransition = pausedAndStopped.compareAndSet(false, true)
+        if (firstDisposeTransition || stage != "release") {
             com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics.logMapViewDisposeRequested(
                 screen = screenName,
                 sessionId = sessionId,
                 viewIdentity = surfacePort.viewIdentity,
                 stage = stage,
-                surfaceInfo = runCatching { surfacePort.inspectSurfaceInfo() }.getOrNull(),
+                surfaceInfo = surfaceSnapshot,
+            )
+        }
+        if (firstDisposeTransition) {
+            com.example.diagnostics.GraphicsSurfaceCoordinator.onMapSurfaceDisposing(
+                screen = screenName,
+                sessionId = sessionId,
+                viewIdentity = surfacePort.viewIdentity,
+                stage = stage,
+                surfaceInfo = surfaceSnapshot,
             )
         }
         runCatching { onCancelTransitions() }
@@ -388,6 +408,13 @@ internal class MapViewSessionHandle(
                 viewIdentity = surfacePort.viewIdentity,
                 surfaceInfo = surfaceSnapshot,
             )
+            com.example.diagnostics.GraphicsSurfaceCoordinator.onMapSurfaceDetached(
+                screen = screenName,
+                sessionId = sessionId,
+                viewIdentity = surfacePort.viewIdentity,
+                surfaceInfo = surfaceSnapshot,
+            )
         }
     }
 }
+

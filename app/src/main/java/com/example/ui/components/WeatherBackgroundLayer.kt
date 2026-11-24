@@ -97,12 +97,13 @@ internal fun WeatherBackgroundLayerImpl(
             modifier = Modifier.fillMaxSize(),
         )
 
-        // Layer 2: Media3 looping muted MP4 video (paused while MapLibre TextureView tabs are active)
+        // Layer 2: Media3 looping muted MP4 video (paused and detached from output surface while MapLibre TextureView tabs are active)
         if (shouldMountVideo) {
             WeatherVideoBackgroundImpl(
                 videoResId = condition.backgroundVideo.rawRes,
                 playbackSpeed = condition.videoPlaybackSpeed,
                 isPlaying = shouldPlayVideoNow,
+                allowVideoSurfaceOutput = !isMapTabActive,
                 onFirstFrameRendered = { firstFrameReady = true },
                 modifier = Modifier.fillMaxSize().alpha(videoAlpha),
                 playerBridgeFactory = playerBridgeFactory,

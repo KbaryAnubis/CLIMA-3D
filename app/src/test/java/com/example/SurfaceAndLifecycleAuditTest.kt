@@ -24,6 +24,9 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.data.model.RainViewerRadarFrame
 import com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics
+import com.example.diagnostics.GraphicsSurfaceCoordinator
+import com.example.diagnostics.MapSurfaceSessionState
+import com.example.diagnostics.VideoSurfaceOutputState
 import com.example.maps.CityMapCoordinate
 import com.example.maps.CityMapLibreSectionImpl
 import com.example.maps.CityMapLibreViewImpl
@@ -1100,6 +1103,818 @@ class SurfaceAndLifecycleAuditTest {
         assertEquals(4, createdMapPorts.count { it.destroyCount == 1 })
     }
 
+    // 23. Etapa 3J (1): Player é pausado ao entrar em RADAR
+    @Test
+    fun `test_23_player_paused_when_entering_radar`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.SOL,
+                    activeTab = activeTab,
+                    animatedEnabled = true,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        assertEquals(true, player.lastPlayWhenReady)
+
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.HOME, ClimaTab.RADAR)
+            activeTab = ClimaTab.RADAR
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(false, player.lastPlayWhenReady)
+        assertEquals(1, player.pauseCalls)
+        assertEquals(0, player.releaseCalls)
+    }
+
+    // 24. Etapa 3J (2): Player é pausado ao entrar em CITIES
+    @Test
+    fun `test_24_player_paused_when_entering_cities`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.CHUVA,
+                    activeTab = activeTab,
+                    animatedEnabled = true,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        assertEquals(true, player.lastPlayWhenReady)
+
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.HOME, ClimaTab.CITIES)
+            activeTab = ClimaTab.CITIES
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(false, player.lastPlayWhenReady)
+        assertEquals(1, player.pauseCalls)
+        assertEquals(0, player.releaseCalls)
+    }
+
+    // 25. Etapa 3J (3): Saída de vídeo é desassociada (detachPlayer + clearVideoSurface) ao entrar em abas de mapa
+    @Test
+    fun `test_25_video_output_disassociated_and_cleared_when_entering_map_tabs`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.SOL_NUVENS,
+                    activeTab = activeTab,
+                    animatedEnabled = true,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        val surface = surfaces.single()
+        assertTrue(surface.isPlayerAttached(player))
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, GraphicsSurfaceCoordinator.state.value.videoState)
+
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.HOME, ClimaTab.RADAR)
+            activeTab = ClimaTab.RADAR
+        }
+        composeTestRule.waitForIdle()
+
+        assertFalse("PlayerView must be detached from ExoPlayer on RADAR", surface.isPlayerAttached(player))
+        assertEquals(1, surface.detachCount)
+        assertEquals(1, player.clearSurfaceCount)
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED, GraphicsSurfaceCoordinator.state.value.videoState)
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(logs.any { it.contains("VIDEO_OUTPUT_DETACH_FOR_MAP") })
+        assertTrue(logs.any { it.contains("VIDEO_OUTPUT_DETACHED") })
+    }
+
+    // 26. Etapa 3J (4): Player permanece em memória e não é liberado ao trocar de aba
+    @Test
+    fun `test_26_player_stays_in_memory_and_is_not_released_across_tab_switches`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.TEMPESTADE,
+                    activeTab = activeTab,
+                    animatedEnabled = true,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        val originalPlayer = players.single()
+
+        listOf(
+            ClimaTab.RADAR,
+            ClimaTab.CITIES,
+            ClimaTab.SETTINGS,
+            ClimaTab.ALERTS,
+            ClimaTab.RADAR,
+            ClimaTab.HOME,
+        ).forEach { tab ->
+            composeTestRule.runOnUiThread { activeTab = tab }
+            composeTestRule.waitForIdle()
+        }
+
+        assertEquals("Only a single ExoPlayer instance may exist", 1, players.size)
+        assertTrue(players.single() === originalPlayer)
+        assertEquals(0, originalPlayer.releaseCalls)
+        assertFalse(originalPlayer.isReleased)
+        assertEquals(1, originalPlayer.setMediaItemCalls)
+        assertEquals(1, originalPlayer.prepareCalls)
+        assertEquals(0, originalPlayer.stopCalls)
+    }
+
+    // 27. Etapa 3J (5): Posição de reprodução é preservada após desanexar e reanexar saída de vídeo
+    @Test
+    fun `test_27_playback_position_preserved_across_map_detach_and_reattach`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.SOL,
+                    activeTab = activeTab,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge().apply { simulatedPositionMs = 4_320L }.also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        val surface = surfaces.single()
+        assertEquals(4_320L, player.currentPositionMs)
+
+        // Enter RADAR (detach output) -> position must remain 4320ms
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.RADAR }
+        composeTestRule.waitForIdle()
+        assertFalse(surface.isPlayerAttached(player))
+        assertEquals(4_320L, player.currentPositionMs)
+        assertEquals(0, player.stopCalls)
+
+        // Return to HOME (reattach output) -> position still 4320ms without re-preparing media
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.HOME }
+        composeTestRule.waitForIdle()
+        assertTrue(surface.isPlayerAttached(player))
+        assertEquals(4_320L, player.currentPositionMs)
+        assertEquals(1, player.setMediaItemCalls)
+        assertEquals(1, player.prepareCalls)
+    }
+
+    // 28. Etapa 3J (6): PlaybackSpeed (ex.: 0.85f para CHUVA_FRACA) é preservado após desanexar e reanexar
+    @Test
+    fun `test_28_playback_speed_preserved_across_map_detach_and_reattach`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.CHUVA_FRACA,
+                    activeTab = activeTab,
+                    animatedEnabled = true,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        val surface = surfaces.single()
+        assertEquals(0.85f, player.currentPlaybackSpeed, 0.001f)
+
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.CITIES }
+        composeTestRule.waitForIdle()
+        assertFalse(surface.isPlayerAttached(player))
+        assertEquals(0.85f, player.currentPlaybackSpeed, 0.001f)
+
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.HOME }
+        composeTestRule.waitForIdle()
+        assertTrue(surface.isPlayerAttached(player))
+        assertEquals(0.85f, player.currentPlaybackSpeed, 0.001f)
+        assertEquals(listOf(0.85f), player.speedHistory)
+    }
+
+    // 29. Etapa 3J (7): Saída de vídeo não é anexada enquanto houver sessão MapLibre ativa ou em descarte
+    @Test
+    fun `test_29_video_output_not_attached_while_maplibre_session_active_or_disposing`() {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<Context>()
+        val manualMapPort = FakeMapViewSurfacePort(context)
+        val manualController =
+            MapViewLifecycleController(
+                onCreate = { manualMapPort.onCreate() },
+                onStart = { manualMapPort.onStart() },
+                onResume = { manualMapPort.onResume() },
+                onPause = { manualMapPort.onPause() },
+                onStop = { manualMapPort.onStop() },
+                onDestroy = { manualMapPort.onDestroy() },
+                onLowMemory = { manualMapPort.onLowMemory() },
+            )
+        manualController.ensureCreated()
+
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.RADAR)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.SOL,
+                    activeTab = activeTab,
+                    animatedEnabled = true,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        val surface = surfaces.single()
+
+        // Create an active MapLibre session handle while on RADAR
+        val mapHandle =
+            MapViewSessionHandle(
+                screenName = "Radar",
+                sessionId = "radar-manual-29",
+                surfacePort = manualMapPort,
+                controller = manualController,
+                onDetachListeners = {},
+                onCancelTransitions = {},
+            )
+        assertEquals(MapSurfaceSessionState.MAP_SURFACE_ACTIVE, GraphicsSurfaceCoordinator.state.value.mapState)
+        assertFalse(surface.isPlayerAttached(player))
+
+        // User switches tab to HOME, while MapView is transitioning to MAP_SURFACE_DISPOSING (phase 1)
+        composeTestRule.runOnUiThread {
+            mapHandle.pauseAndStopBeforeDetach("onDispose")
+            activeTab = ClimaTab.HOME
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(MapSurfaceSessionState.MAP_SURFACE_DISPOSING, GraphicsSurfaceCoordinator.state.value.mapState)
+        assertFalse(
+            "Video surface MUST NOT attach while MapView session is still MAP_SURFACE_DISPOSING",
+            surface.isPlayerAttached(player),
+        )
+        assertTrue(
+            ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().any {
+                it.contains("VIDEO_OUTPUT_REATTACH_REQUEST") && it.contains("canAttachNow=false")
+            },
+        )
+
+        // Phase 2 completes: MapView finishes detach & destroyOnceAfterDetach -> NO_ACTIVE_MAP_SURFACE
+        composeTestRule.runOnUiThread {
+            mapHandle.destroyOnceAfterDetach()
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, GraphicsSurfaceCoordinator.state.value.mapState)
+        assertTrue(
+            "Video surface must reattach immediately once MapView session reaches NO_ACTIVE_MAP_SURFACE",
+            surface.isPlayerAttached(player),
+        )
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, GraphicsSurfaceCoordinator.state.value.videoState)
+        assertEquals(true, player.lastPlayWhenReady)
+    }
+
+    // 30. Etapa 3J (8): Troca RADAR -> CITIES (e CITIES -> RADAR) não reanexa o vídeo entre as duas telas de mapa
+    @Test
+    fun `test_30_switching_radar_to_cities_never_reattaches_video_between_map_tabs`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        val mapPorts = mutableListOf<FakeMapViewSurfacePort>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.NUBLADO,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    )
+                    when (activeTab) {
+                        ClimaTab.RADAR ->
+                            RadarMapLibreViewImpl(
+                                center = CityMapCoordinate(-23.55, -46.63),
+                                zoom = 6.0,
+                                activeFrame = sampleRadarFrame(1700000000L),
+                                layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                                maxRadarZoom = 7,
+                                surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { mapPorts += it } },
+                            )
+                        ClimaTab.CITIES ->
+                            CityMapLibreViewImpl(
+                                state = CityMapUiState(),
+                                onMapTap = {},
+                                onCameraGestureSettled = { _, _ -> },
+                                surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { mapPorts += it } },
+                            )
+                        else -> Text("home")
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        val surface = surfaces.single()
+        assertEquals(1, surface.attachCount)
+
+        // HOME -> RADAR: detaches video output once
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.HOME, ClimaTab.RADAR)
+            activeTab = ClimaTab.RADAR
+        }
+        composeTestRule.waitForIdle()
+        assertFalse(surface.isPlayerAttached(player))
+        assertEquals(1, surface.attachCount)
+        assertEquals(1, surface.detachCount)
+
+        // RADAR -> CITIES: video must stay detached (attachCount remains 1)
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.RADAR, ClimaTab.CITIES)
+            activeTab = ClimaTab.CITIES
+        }
+        composeTestRule.waitForIdle()
+        assertFalse(surface.isPlayerAttached(player))
+        assertEquals("Video must not reattach between RADAR and CITIES", 1, surface.attachCount)
+        assertEquals(1, surface.detachCount)
+
+        // CITIES -> RADAR: video must still stay detached (attachCount remains 1)
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.CITIES, ClimaTab.RADAR)
+            activeTab = ClimaTab.RADAR
+        }
+        composeTestRule.waitForIdle()
+        assertFalse(surface.isPlayerAttached(player))
+        assertEquals("Video must not reattach between CITIES and RADAR", 1, surface.attachCount)
+        assertEquals(1, surface.detachCount)
+    }
+
+    // 31. Etapa 3J (9): Retorno para HOME reanexa o mesmo player após o encerramento da sessão do mapa
+    @Test
+    fun `test_31_returning_to_home_reattaches_same_player_after_map_session_teardown`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        val mapPorts = mutableListOf<FakeMapViewSurfacePort>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    )
+                    if (activeTab == ClimaTab.RADAR) {
+                        RadarMapLibreViewImpl(
+                            center = CityMapCoordinate(-23.55, -46.63),
+                            zoom = 6.0,
+                            activeFrame = sampleRadarFrame(1700000000L),
+                            layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                            maxRadarZoom = 7,
+                            surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { mapPorts += it } },
+                        )
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        val initialPlayer = players.single()
+        val surface = surfaces.single()
+
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.HOME, ClimaTab.RADAR)
+            activeTab = ClimaTab.RADAR
+        }
+        composeTestRule.waitForIdle()
+        assertFalse(surface.isPlayerAttached(initialPlayer))
+        assertEquals(MapSurfaceSessionState.MAP_SURFACE_ACTIVE, GraphicsSurfaceCoordinator.state.value.mapState)
+
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.RADAR, ClimaTab.HOME)
+            activeTab = ClimaTab.HOME
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(1, players.size)
+        assertTrue(players.single() === initialPlayer)
+        assertEquals(1, mapPorts.single().destroyCount)
+        assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, GraphicsSurfaceCoordinator.state.value.mapState)
+        assertTrue(surface.isPlayerAttached(initialPlayer))
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, GraphicsSurfaceCoordinator.state.value.videoState)
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        val mapDetachedIdx = logs.indexOfLast { it.contains("MAP_SURFACE_DETACHED") }
+        val videoReattachedIdx = logs.indexOfLast { it.contains("VIDEO_OUTPUT_REATTACHED") }
+        assertTrue(
+            "MAP_SURFACE_DETACHED must precede VIDEO_OUTPUT_REATTACHED (mapDetached=$mapDetachedIdx, reattached=$videoReattachedIdx)",
+            mapDetachedIdx in 0 until videoReattachedIdx,
+        )
+    }
+
+    // 32. Etapa 3J (10): Reanexação respeita ON_START e ON_RESUME da Activity
+    @Test
+    fun `test_32_video_reattachment_respects_activity_on_start_and_on_resume`() {
+        val lifecycleOwner = TestLifecycleOwner(Lifecycle.State.RESUMED)
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.RADAR)
+
+        composeTestRule.setContent {
+            CompositionLocalProvider(LocalLifecycleOwner provides lifecycleOwner) {
+                Clima3DTheme(darkTheme = true) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        val surface = surfaces.single()
+        assertFalse(surface.isPlayerAttached(player))
+
+        // Activity moves to CREATED (ON_PAUSE + ON_STOP) while returning from RADAR to HOME
+        composeTestRule.runOnUiThread {
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+            activeTab = ClimaTab.HOME
+        }
+        composeTestRule.waitForIdle()
+
+        // While Activity is stopped, player must remain paused
+        assertEquals(false, player.lastPlayWhenReady)
+        val playsWhileStopped = player.playCalls
+
+        // Activity enters ON_START + ON_RESUME -> playback resumes once without duplicate play()
+        composeTestRule.runOnUiThread {
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        }
+        composeTestRule.waitForIdle()
+
+        assertTrue(surface.isPlayerAttached(player))
+        assertEquals(true, player.lastPlayWhenReady)
+        assertEquals(playsWhileStopped + 1, player.playCalls)
+    }
+
+    // 33. Etapa 3J (11): Não ocorrem chamadas duplicadas de attach de superfície
+    @Test
+    fun `test_33_no_duplicate_surface_attach_calls_on_recomposition`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+        var tick by mutableIntStateOf(0)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Column {
+                    Text("tick-$tick")
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        val surface = surfaces.single()
+        assertEquals(1, surface.attachCount)
+
+        repeat(6) {
+            composeTestRule.runOnUiThread { tick++ }
+            composeTestRule.waitForIdle()
+        }
+        assertEquals("Recomposition on HOME must not re-invoke attachPlayer", 1, surface.attachCount)
+
+        // Detach on RADAR and return to HOME -> attachCount increments by exactly 1 (total 2)
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.RADAR }
+        composeTestRule.waitForIdle()
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.HOME }
+        composeTestRule.waitForIdle()
+        assertEquals(2, surface.attachCount)
+
+        repeat(6) {
+            composeTestRule.runOnUiThread { tick++ }
+            composeTestRule.waitForIdle()
+        }
+        assertEquals("Recomposition after reattach must not duplicate attachPlayer", 2, surface.attachCount)
+    }
+
+    // 34. Etapa 3J (12): Não ocorrem chamadas repetidas de clearVideoSurface
+    @Test
+    fun `test_34_no_redundant_clear_video_surface_calls`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+        var tick by mutableIntStateOf(0)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Column {
+                    Text("tick-$tick")
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.CHUVA,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        assertEquals(0, player.clearSurfaceCount)
+
+        // Enter RADAR -> clears video surface once
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.RADAR }
+        composeTestRule.waitForIdle()
+        assertEquals(1, player.clearSurfaceCount)
+
+        // Multiple recompositions + switching RADAR -> CITIES -> RADAR must NOT call clearVideoSurface again
+        repeat(4) {
+            composeTestRule.runOnUiThread { tick++ }
+            composeTestRule.waitForIdle()
+        }
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.CITIES }
+        composeTestRule.waitForIdle()
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.RADAR }
+        composeTestRule.waitForIdle()
+
+        assertEquals("clearVideoSurface must be called only once while detached on map tabs", 1, player.clearSurfaceCount)
+    }
+
+    // 35. Etapa 3J (13): MapView é destruída apenas após detach (MAP_SURFACE_CREATED -> MAP_SURFACE_DISPOSING -> MAP_SURFACE_DETACHED)
+    @Test
+    fun `test_35_mapview_destroyed_only_after_detach_with_ordered_coordinator_events`() {
+        val createdPorts = mutableListOf<FakeMapViewSurfacePort>()
+        var mounted by mutableStateOf(true)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                if (mounted) {
+                    RadarMapLibreViewImpl(
+                        center = CityMapCoordinate(-23.55, -46.63),
+                        zoom = 6.0,
+                        activeFrame = sampleRadarFrame(1700000000L),
+                        layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                        maxRadarZoom = 7,
+                        surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { createdPorts += it } },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(MapSurfaceSessionState.MAP_SURFACE_ACTIVE, GraphicsSurfaceCoordinator.state.value.mapState)
+
+        composeTestRule.runOnUiThread { mounted = false }
+        composeTestRule.waitForIdle()
+
+        val port = createdPorts.single()
+        assertEquals(1, port.destroyCount)
+        assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, GraphicsSurfaceCoordinator.state.value.mapState)
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        val createdIdx = logs.indexOfFirst { it.contains("MAP_SURFACE_CREATED") }
+        val disposingIdx = logs.indexOfFirst { it.contains("MAP_SURFACE_DISPOSING") }
+        val detachedIdx = logs.indexOfFirst { it.contains("MAP_SURFACE_DETACHED") }
+        assertTrue(createdIdx >= 0 && disposingIdx > createdIdx && detachedIdx > disposingIdx)
+    }
+
+    // 36. Etapa 3J (14): Callbacks tardios após dispose são descartados sem alterar estado do coordenador
+    @Test
+    fun `test_36_late_callbacks_after_dispose_discarded_without_corrupting_coordinator`() {
+        val createdPorts = mutableListOf<FakeMapViewSurfacePort>()
+        var mounted by mutableStateOf(true)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                if (mounted) {
+                    RadarMapLibreViewImpl(
+                        center = CityMapCoordinate(-23.55, -46.63),
+                        zoom = 6.0,
+                        activeFrame = sampleRadarFrame(1700000000L),
+                        layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                        maxRadarZoom = 7,
+                        surfacePortFactory = { ctx ->
+                            FakeMapViewSurfacePort(ctx, autoReady = false).also { createdPorts += it }
+                        },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        val port = createdPorts.single()
+        val readyCb = port.pendingMapReadyCallback!!
+        val callbacks = port.attachedCallbacks!!
+
+        composeTestRule.runOnUiThread { mounted = false }
+        composeTestRule.waitForIdle()
+        assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, GraphicsSurfaceCoordinator.state.value.mapState)
+
+        composeTestRule.runOnUiThread {
+            readyCb(port.controllerPort)
+            callbacks.onDidFinishLoadingStyle()
+            callbacks.onFirstFrameRendered()
+            callbacks.onDidFinishRenderingMap(true)
+            port.flushPendingUiPosts()
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(0, port.controllerPort.setStyleCalls)
+        assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, GraphicsSurfaceCoordinator.state.value.mapState)
+    }
+
+    // 37. Etapa 3J (15): Abrir e fechar LocationPickerDialog na Home não altera estados de superfície do vídeo ou do mapa
+    @Test
+    fun `test_37_opening_and_closing_location_picker_on_home_preserves_video_and_map_surface_state`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var showDialog by mutableStateOf(false)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL,
+                        activeTab = ClimaTab.HOME,
+                        animatedEnabled = true,
+                        playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    )
+                    if (showDialog) {
+                        Text("LocationPickerModalOverlay")
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        val player = players.single()
+        val surface = surfaces.single()
+
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, GraphicsSurfaceCoordinator.state.value.videoState)
+        assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, GraphicsSurfaceCoordinator.state.value.mapState)
+        assertEquals(1, surface.attachCount)
+        assertEquals(0, surface.detachCount)
+
+        // Open LocationPickerDialog on HOME
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logModalLifecycle("LocationPicker", "OPEN")
+            showDialog = true
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, GraphicsSurfaceCoordinator.state.value.videoState)
+        assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, GraphicsSurfaceCoordinator.state.value.mapState)
+        assertTrue(surface.isPlayerAttached(player))
+        assertEquals(1, surface.attachCount)
+        assertEquals(0, surface.detachCount)
+        assertEquals(0, player.clearSurfaceCount)
+
+        // Close LocationPickerDialog on HOME
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logModalLifecycle("LocationPicker", "CLOSE")
+            showDialog = false
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, GraphicsSurfaceCoordinator.state.value.videoState)
+        assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, GraphicsSurfaceCoordinator.state.value.mapState)
+        assertTrue(surface.isPlayerAttached(player))
+        assertEquals(1, surface.attachCount)
+        assertEquals(0, surface.detachCount)
+        assertEquals(0, player.clearSurfaceCount)
+    }
+
+    // 38. Etapa 3J (16): Navegação repetida entre abas não acumula sessões de mapa nem players e coordena estados sem vazamento
+    @Test
+    fun `test_38_repeated_navigation_across_all_tabs_coordinates_surfaces_without_accumulation`() {
+        val createdMapPorts = mutableListOf<FakeMapViewSurfacePort>()
+        val createdPlayers = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val createdSurfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.CHUVA_FRACA,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { createdPlayers += it } },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { createdSurfaces += it } },
+                    )
+                    when (activeTab) {
+                        ClimaTab.RADAR ->
+                            RadarMapLibreViewImpl(
+                                center = CityMapCoordinate(-23.55, -46.63),
+                                zoom = 6.0,
+                                activeFrame = sampleRadarFrame(1700000000L),
+                                layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                                maxRadarZoom = 7,
+                                surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { createdMapPorts += it } },
+                            )
+                        ClimaTab.CITIES ->
+                            CityMapLibreViewImpl(
+                                state = CityMapUiState(),
+                                onMapTap = {},
+                                onCameraGestureSettled = { _, _ -> },
+                                surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { createdMapPorts += it } },
+                            )
+                        else -> Text("tab-${activeTab.name}")
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val cycle =
+            listOf(
+                ClimaTab.RADAR,
+                ClimaTab.CITIES,
+                ClimaTab.RADAR,
+                ClimaTab.HOME,
+                ClimaTab.SETTINGS,
+                ClimaTab.CITIES,
+                ClimaTab.ALERTS,
+                ClimaTab.RADAR,
+                ClimaTab.HOME,
+            )
+        cycle.forEach { tab ->
+            val prev = activeTab
+            composeTestRule.runOnUiThread {
+                ClimaGraphicsLifecycleDiagnostics.logTabChanged(prev, tab)
+                activeTab = tab
+            }
+            composeTestRule.waitForIdle()
+
+            val coord = GraphicsSurfaceCoordinator.state.value
+            val isMapTab = tab == ClimaTab.RADAR || tab == ClimaTab.CITIES
+            if (isMapTab) {
+                assertEquals(MapSurfaceSessionState.MAP_SURFACE_ACTIVE, coord.mapState)
+                assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED, coord.videoState)
+                assertFalse(createdSurfaces.single().isPlayerAttached(createdPlayers.single()))
+            } else {
+                assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, coord.mapState)
+                assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, coord.videoState)
+                assertTrue(createdSurfaces.single().isPlayerAttached(createdPlayers.single()))
+            }
+        }
+
+        assertEquals(1, createdPlayers.size)
+        assertEquals(0, createdPlayers.single().releaseCalls)
+        assertEquals(1, createdSurfaces.size)
+        assertEquals(5, createdMapPorts.size)
+        assertEquals(5, createdMapPorts.count { it.destroyCount == 1 })
+        assertTrue(GraphicsSurfaceCoordinator.state.value.activeMapSessions.isEmpty())
+        assertTrue(GraphicsSurfaceCoordinator.state.value.disposingMapSessions.isEmpty())
+    }
+
     private fun extractToken(line: String, prefix: String): String? {
         val idx = line.indexOf(prefix)
         if (idx < 0) return null
@@ -1140,6 +1955,8 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
     var clearSurfaceCount = 0
     var lastPlayWhenReady: Boolean? = null
     var releaseOrder = Int.MAX_VALUE
+    var simulatedPositionMs: Long = 0L
+    var currentSpeedValue: Float = 1.0f
     val speedHistory = mutableListOf<Float>()
     val events = mutableListOf<String>()
     private var attachedView: Any? = null
@@ -1150,6 +1967,12 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
 
     override val isIdle: Boolean
         get() = idleState
+
+    override val currentPositionMs: Long
+        get() = simulatedPositionMs
+
+    override val currentPlaybackSpeed: Float
+        get() = currentSpeedValue
 
     override fun setMediaItem(uri: Uri) {
         setMediaItemCalls++
@@ -1165,6 +1988,7 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
     }
 
     override fun setPlaybackSpeed(speed: Float) {
+        currentSpeedValue = speed
         speedHistory += speed
     }
 
@@ -1223,10 +2047,12 @@ private class FakeWeatherVideoSurfaceBridge(context: Context) : WeatherVideoSurf
     override val viewClassName: String = "FakePlayerView"
     private var boundPlayer: WeatherVideoPlayerBridge? = null
     private var attachObserver: ((Boolean, com.example.ui.components.ExoSurfaceSnapshot) -> Unit)? = null
+    var attachCount = 0
     var detachCount = 0
     var firstDetachOrder = Int.MAX_VALUE
 
     override fun attachPlayer(player: WeatherVideoPlayerBridge) {
+        attachCount++
         boundPlayer = player
     }
 
