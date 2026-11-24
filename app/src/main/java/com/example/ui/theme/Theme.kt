@@ -8,9 +8,13 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+
+val LocalClimaDarkTheme = staticCompositionLocalOf { true }
 
 private val DarkColorScheme =
     darkColorScheme(
@@ -32,10 +36,10 @@ private val LightColorScheme =
     lightColorScheme(
         primary = Color(0xFF0E6CB8),
         onPrimary = Color.White,
-        secondary = Color(0xFF2A85D2),
+        secondary = Color(0xFF1677C5),
         onSecondary = Color.White,
         tertiary = Color(0xFFD95B66),
-        background = Color(0xFFEAF3FC),
+        background = Color(0xFFEDF5FC),
         onBackground = ClimaTextOnLight,
         surface = ClimaGlassLightBase,
         onSurface = ClimaTextOnLight,
@@ -72,62 +76,74 @@ object WeatherGlassSpecs {
         when (tab) {
             ClimaTab.HOME ->
                 TabGlassSpec(
-                    wallpaperShadeAlpha = 0.0f, // 100% transparent shade
-                    cardAlpha = 0.20f, // 80% transparent
-                    navBarAlpha = 0.20f, // 80% transparent
-                    hourlyPanelAlpha = 0.15f, // 85% transparent
-                    dailyPanelAlpha = 0.10f, // 90% transparent
-                    noticeAlpha = 0.19f, // 81% transparent
+                    wallpaperShadeAlpha = 0.0f,
+                    cardAlpha = 0.56f,
+                    navBarAlpha = 0.78f,
+                    hourlyPanelAlpha = 0.74f,
+                    dailyPanelAlpha = 0.58f,
+                    noticeAlpha = 0.52f,
                 )
 
             ClimaTab.RADAR ->
                 TabGlassSpec(
                     wallpaperShadeAlpha = 0.0f,
-                    cardAlpha = 0.20f, // 80% transparent
-                    navBarAlpha = 0.20f,
-                    hourlyPanelAlpha = 0.20f,
-                    dailyPanelAlpha = 0.20f,
-                    noticeAlpha = 0.20f,
+                    cardAlpha = 0.72f,
+                    navBarAlpha = 0.80f,
+                    hourlyPanelAlpha = 0.72f,
+                    dailyPanelAlpha = 0.72f,
+                    noticeAlpha = 0.65f,
                 )
 
             ClimaTab.CITIES ->
                 TabGlassSpec(
                     wallpaperShadeAlpha = 0.0f,
-                    cardAlpha = 0.25f, // 75% transparent
-                    navBarAlpha = 0.25f,
-                    hourlyPanelAlpha = 0.25f,
-                    dailyPanelAlpha = 0.25f,
-                    noticeAlpha = 0.25f,
+                    cardAlpha = 0.68f,
+                    navBarAlpha = 0.80f,
+                    hourlyPanelAlpha = 0.68f,
+                    dailyPanelAlpha = 0.68f,
+                    noticeAlpha = 0.62f,
                 )
 
             ClimaTab.SETTINGS ->
                 TabGlassSpec(
                     wallpaperShadeAlpha = 0.0f,
-                    cardAlpha = 0.25f, // 75% transparent
-                    navBarAlpha = 0.25f,
-                    hourlyPanelAlpha = 0.25f,
-                    dailyPanelAlpha = 0.25f,
-                    noticeAlpha = 0.25f,
+                    cardAlpha = 0.68f,
+                    navBarAlpha = 0.80f,
+                    hourlyPanelAlpha = 0.68f,
+                    dailyPanelAlpha = 0.68f,
+                    noticeAlpha = 0.62f,
                 )
 
             ClimaTab.ALERTS ->
                 TabGlassSpec(
                     wallpaperShadeAlpha = 0.0f,
-                    cardAlpha = 0.40f, // 60% transparent
-                    navBarAlpha = 0.30f,
-                    hourlyPanelAlpha = 0.40f,
-                    dailyPanelAlpha = 0.40f,
-                    noticeAlpha = 0.40f,
+                    cardAlpha = 0.74f,
+                    navBarAlpha = 0.82f,
+                    hourlyPanelAlpha = 0.74f,
+                    dailyPanelAlpha = 0.74f,
+                    noticeAlpha = 0.68f,
                 )
         }
 
     fun glassContainerColor(alpha: Float, darkSurface: Boolean = true): Color {
-        val base = if (darkSurface) ClimaGlassDarkBase else ClimaGlassLightBase
-        return base.copy(alpha = alpha.coerceIn(0f, 1f))
+        return if (darkSurface) {
+            ClimaGlassDarkBase.copy(alpha = alpha.coerceIn(0f, 1f))
+        } else {
+            ClimaGlassLightBase.copy(alpha = (alpha + 0.22f).coerceIn(0.76f, 0.94f))
+        }
     }
 
     fun glassBorderColor(darkSurface: Boolean = true): Color =
         if (darkSurface) ClimaGlassBorderDark else ClimaGlassBorderLight
+
+    fun primaryTextColor(darkSurface: Boolean): Color =
+        if (darkSurface) ClimaTextOnDark else ClimaTextOnLight
+
+    fun mutedTextColor(darkSurface: Boolean): Color =
+        if (darkSurface) ClimaTextMutedOnDark else ClimaTextMutedOnLight
+
+    fun accentColor(darkSurface: Boolean): Color =
+        if (darkSurface) ClimaAccentCyan else Color(0xFF0E6CB8)
 }
 
 @Composable
@@ -147,7 +163,9 @@ fun Clima3DTheme(
             else -> LightColorScheme
         }
 
-    MaterialTheme(colorScheme = colorScheme, typography = Typography, content = content)
+    CompositionLocalProvider(LocalClimaDarkTheme provides darkTheme) {
+        MaterialTheme(colorScheme = colorScheme, typography = Typography, content = content)
+    }
 }
 
 @Composable

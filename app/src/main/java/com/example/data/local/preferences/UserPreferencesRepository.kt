@@ -25,6 +25,12 @@ private val Context.clima3DPreferencesDataStore: DataStore<Preferences> by prefe
     name = "clima3d_user_preferences",
 )
 
+enum class AppThemeMode {
+    DARK,
+    LIGHT,
+    AUTO,
+}
+
 /**
  * User-configurable display units and in-app settings persisted via Jetpack DataStore.
  * Note: Clima 3D alerts remain strictly in-app (no push, status bar, or lock-screen notifications).
@@ -40,6 +46,9 @@ data class UserPreferences(
     val inAppAlertsEnabled: Boolean = true,
     val autoRefreshOnOpen: Boolean = true,
     val selectedLocationId: Long? = null,
+    val themeMode: AppThemeMode = AppThemeMode.DARK,
+    val showPressureStatus: Boolean = true,
+    val widgetPreviewSize: String = "4×2",
 )
 
 class UserPreferencesRepository(
@@ -67,6 +76,9 @@ class UserPreferencesRepository(
                 inAppAlertsEnabled = prefs[Keys.IN_APP_ALERTS] ?: true,
                 autoRefreshOnOpen = prefs[Keys.AUTO_REFRESH_ON_OPEN] ?: true,
                 selectedLocationId = prefs[Keys.SELECTED_LOCATION_ID],
+                themeMode = parseEnum(prefs[Keys.THEME_MODE], AppThemeMode.DARK),
+                showPressureStatus = prefs[Keys.SHOW_PRESSURE_STATUS] ?: true,
+                widgetPreviewSize = prefs[Keys.WIDGET_PREVIEW_SIZE] ?: "4×2",
             )
         }
 
@@ -118,6 +130,28 @@ class UserPreferencesRepository(
         }
     }
 
+    suspend fun setThemeMode(mode: AppThemeMode) {
+        dataStore.edit { it[Keys.THEME_MODE] = mode.name }
+    }
+
+    suspend fun setShowPressureStatus(show: Boolean) {
+        dataStore.edit { it[Keys.SHOW_PRESSURE_STATUS] = show }
+    }
+
+    suspend fun setWidgetPreviewSize(size: String) {
+        dataStore.edit { it[Keys.WIDGET_PREVIEW_SIZE] = size }
+    }
+
+    suspend fun resetToDefaults() {
+        dataStore.edit { prefs ->
+            val currentLocation = prefs[Keys.SELECTED_LOCATION_ID]
+            prefs.clear()
+            if (currentLocation != null) {
+                prefs[Keys.SELECTED_LOCATION_ID] = currentLocation
+            }
+        }
+    }
+
     private inline fun <reified T : Enum<T>> parseEnum(raw: String?, fallback: T): T {
         if (raw.isNullOrBlank()) return fallback
         return runCatching { enumValueOf<T>(raw) }.getOrDefault(fallback)
@@ -134,5 +168,8 @@ class UserPreferencesRepository(
         val IN_APP_ALERTS = booleanPreferencesKey("in_app_alerts_enabled")
         val AUTO_REFRESH_ON_OPEN = booleanPreferencesKey("auto_refresh_on_open")
         val SELECTED_LOCATION_ID = longPreferencesKey("selected_location_id")
+        val THEME_MODE = stringPreferencesKey("theme_mode")
+        val SHOW_PRESSURE_STATUS = booleanPreferencesKey("show_pressure_status")
+        val WIDGET_PREVIEW_SIZE = stringPreferencesKey("widget_preview_size")
     }
 }

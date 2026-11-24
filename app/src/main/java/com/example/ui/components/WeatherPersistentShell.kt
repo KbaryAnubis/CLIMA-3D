@@ -4,6 +4,7 @@ import androidx.annotation.DrawableRes
 import androidx.annotation.StringRes
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -32,6 +33,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -43,9 +45,12 @@ import com.example.R
 import com.example.media.ClimaUiIcons
 import com.example.media.WeatherCondition
 import com.example.ui.theme.ClimaAccentCyan
+import com.example.ui.theme.ClimaNavActiveBorder
+import com.example.ui.theme.ClimaNavActiveBottom
+import com.example.ui.theme.ClimaNavActiveTop
 import com.example.ui.theme.ClimaTab
-import com.example.ui.theme.ClimaTextMutedOnDark
 import com.example.ui.theme.ClimaTextOnDark
+import com.example.ui.theme.LocalClimaDarkTheme
 import com.example.ui.theme.WeatherGlassSpecs
 
 private data class ClimaNavItem(
@@ -65,8 +70,9 @@ private val primaryTabs =
 
 /**
  * Persistent visual shell that keeps `WeatherBackgroundLayer` continuously mounted
- * behind all tabs (Início, Radar, Cidades, Ajustes, Alertas), adapting between a
- * glass bottom navigation bar on compact screens and a glass navigation rail on wide screens.
+ * behind all tabs (Início, Radar, Cidades, Ajustes, Alertas), reproducing V53's
+ * `.phone-bar` active cyan/blue gradient pill on compact screens and adapting to a
+ * glass navigation rail on expanded screens.
  */
 @Composable
 fun WeatherPersistentShell(
@@ -75,9 +81,11 @@ fun WeatherPersistentShell(
     animatedBackgroundEnabled: Boolean,
     onSelectTab: (ClimaTab) -> Unit,
     modifier: Modifier = Modifier,
+    toastMessage: String? = null,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     val tabSpec = remember(activeTab) { WeatherGlassSpecs.forTab(activeTab) }
+    val dark = LocalClimaDarkTheme.current
 
     Box(modifier = modifier.fillMaxSize()) {
         // Persistent full-screen animated weather background behind all tabs
@@ -87,6 +95,16 @@ fun WeatherPersistentShell(
             animatedEnabled = animatedBackgroundEnabled,
             modifier = Modifier.fillMaxSize(),
         )
+
+        // Subtle light-theme veil when user explicitly picks Light appearance in Settings
+        if (!dark) {
+            Box(
+                modifier =
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color(0xA8EBF4FC)),
+            )
+        }
 
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val useNavigationRail = maxWidth >= 700.dp
@@ -99,34 +117,50 @@ fun WeatherPersistentShell(
                         onSelectTab = onSelectTab,
                     )
                     Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                            .windowInsetsPadding(WindowInsets.statusBars)
-                            .windowInsetsPadding(WindowInsets.navigationBars)
+                        modifier =
+                            Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .windowInsetsPadding(WindowInsets.statusBars)
+                                .windowInsetsPadding(WindowInsets.navigationBars),
                     ) {
-                        content(PaddingValues(horizontal = 20.dp, vertical = 16.dp))
+                        content(PaddingValues(horizontal = 20.dp, vertical = 14.dp))
+                        V53ToastOverlay(
+                            message = toastMessage,
+                            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 18.dp),
+                        )
                     }
                 }
             } else {
                 Box(modifier = Modifier.fillMaxSize()) {
                     Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .windowInsetsPadding(WindowInsets.statusBars)
+                        modifier =
+                            Modifier
+                                .fillMaxSize()
+                                .windowInsetsPadding(WindowInsets.statusBars),
                     ) {
-                        content(PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 104.dp))
+                        content(PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 104.dp))
                     }
+
+                    V53ToastOverlay(
+                        message = toastMessage,
+                        modifier =
+                            Modifier
+                                .align(Alignment.BottomCenter)
+                                .windowInsetsPadding(WindowInsets.navigationBars)
+                                .padding(bottom = 90.dp),
+                    )
 
                     GlassBottomNavigationBar(
                         activeTab = activeTab,
                         navAlpha = tabSpec.navBarAlpha,
                         onSelectTab = onSelectTab,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .windowInsetsPadding(WindowInsets.navigationBars)
-                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        modifier =
+                            Modifier
+                                .align(Alignment.BottomCenter)
+                                .fillMaxWidth()
+                                .windowInsetsPadding(WindowInsets.navigationBars)
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
                     )
                 }
             }
@@ -141,46 +175,68 @@ private fun GlassBottomNavigationBar(
     onSelectTab: (ClimaTab) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val dark = LocalClimaDarkTheme.current
     Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(24.dp),
-        color = WeatherGlassSpecs.glassContainerColor(alpha = navAlpha),
-        border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor()),
+        modifier = modifier.testTag("v53_bottom_nav_bar"),
+        shape = RoundedCornerShape(22.dp),
+        color = WeatherGlassSpecs.glassContainerColor(alpha = navAlpha, darkSurface = dark),
+        border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor(dark)),
         shadowElevation = 0.dp,
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             primaryTabs.forEach { item ->
-                val selected = activeTab == item.tab
-                val tint = if (selected) ClimaAccentCyan else ClimaTextMutedOnDark
-                val pillBg = if (selected) ClimaAccentCyan.copy(alpha = 0.18f) else Color.Transparent
+                val selected = activeTab == item.tab || (activeTab == ClimaTab.ALERTS && item.tab == ClimaTab.HOME)
+                val shape = RoundedCornerShape(16.dp)
+                val pillModifier =
+                    if (selected) {
+                        Modifier
+                            .background(
+                                Brush.verticalGradient(listOf(ClimaNavActiveTop, ClimaNavActiveBottom)),
+                                shape = shape,
+                            )
+                            .border(1.dp, ClimaNavActiveBorder, shape)
+                    } else {
+                        Modifier
+                    }
 
                 Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(pillBg)
-                        .minimumInteractiveComponentSize()
-                        .clickable { onSelectTab(item.tab) }
-                        .padding(vertical = 6.dp)
-                        .testTag(item.testTag),
+                    modifier =
+                        Modifier
+                            .weight(1f)
+                            .clip(shape)
+                            .then(pillModifier)
+                            .minimumInteractiveComponentSize()
+                            .clickable { onSelectTab(item.tab) }
+                            .padding(vertical = 6.dp)
+                            .testTag(item.testTag),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(3.dp),
                 ) {
                     Icon(
                         painter = painterResource(id = item.iconRes),
                         contentDescription = stringResource(item.labelRes),
-                        tint = tint,
-                        modifier = Modifier.size(22.dp),
+                        tint =
+                            when {
+                                selected -> ClimaAccentCyan
+                                dark -> Color(0xFFAECAE0)
+                                else -> Color(0xFF334E68)
+                            },
+                        modifier = Modifier.size(21.dp),
                     )
                     Text(
                         text = stringResource(item.labelRes),
-                        color = if (selected) ClimaTextOnDark else ClimaTextMutedOnDark,
+                        color =
+                            when {
+                                selected -> ClimaTextOnDark
+                                dark -> Color(0xFFAECAE0)
+                                else -> Color(0xFF334E68)
+                            },
                         fontSize = 11.sp,
-                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
                         maxLines = 1,
                     )
                 }
@@ -195,16 +251,18 @@ private fun GlassNavigationRail(
     navAlpha: Float,
     onSelectTab: (ClimaTab) -> Unit,
 ) {
+    val dark = LocalClimaDarkTheme.current
     Surface(
-        modifier = Modifier
-            .fillMaxHeight()
-            .width(88.dp)
-            .windowInsetsPadding(WindowInsets.statusBars)
-            .windowInsetsPadding(WindowInsets.navigationBars)
-            .padding(start = 12.dp, top = 12.dp, bottom = 12.dp),
-        shape = RoundedCornerShape(24.dp),
-        color = WeatherGlassSpecs.glassContainerColor(alpha = navAlpha),
-        border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor()),
+        modifier =
+            Modifier
+                .fillMaxHeight()
+                .width(88.dp)
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(start = 12.dp, top = 12.dp, bottom = 12.dp),
+        shape = RoundedCornerShape(22.dp),
+        color = WeatherGlassSpecs.glassContainerColor(alpha = navAlpha, darkSurface = dark),
+        border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor(dark)),
     ) {
         Column(
             modifier = Modifier.fillMaxSize().padding(vertical = 16.dp, horizontal = 6.dp),
@@ -212,31 +270,52 @@ private fun GlassNavigationRail(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             primaryTabs.forEach { item ->
-                val selected = activeTab == item.tab
-                val tint = if (selected) ClimaAccentCyan else ClimaTextMutedOnDark
-                val pillBg = if (selected) ClimaAccentCyan.copy(alpha = 0.18f) else Color.Transparent
+                val selected = activeTab == item.tab || (activeTab == ClimaTab.ALERTS && item.tab == ClimaTab.HOME)
+                val shape = RoundedCornerShape(16.dp)
+                val pillModifier =
+                    if (selected) {
+                        Modifier
+                            .background(
+                                Brush.verticalGradient(listOf(ClimaNavActiveTop, ClimaNavActiveBottom)),
+                                shape = shape,
+                            )
+                            .border(1.dp, ClimaNavActiveBorder, shape)
+                    } else {
+                        Modifier
+                    }
 
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(pillBg)
-                        .minimumInteractiveComponentSize()
-                        .clickable { onSelectTab(item.tab) }
-                        .padding(vertical = 8.dp)
-                        .testTag(item.testTag),
+                    modifier =
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(shape)
+                            .then(pillModifier)
+                            .minimumInteractiveComponentSize()
+                            .clickable { onSelectTab(item.tab) }
+                            .padding(vertical = 8.dp)
+                            .testTag(item.testTag),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Icon(
                         painter = painterResource(id = item.iconRes),
                         contentDescription = stringResource(item.labelRes),
-                        tint = tint,
-                        modifier = Modifier.size(22.dp),
+                        tint =
+                            when {
+                                selected -> ClimaAccentCyan
+                                dark -> Color(0xFFAECAE0)
+                                else -> Color(0xFF334E68)
+                            },
+                        modifier = Modifier.size(21.dp),
                     )
                     Text(
                         text = stringResource(item.labelRes),
-                        color = if (selected) ClimaTextOnDark else ClimaTextMutedOnDark,
+                        color =
+                            when {
+                                selected -> ClimaTextOnDark
+                                dark -> Color(0xFFAECAE0)
+                                else -> Color(0xFF334E68)
+                            },
                         style = MaterialTheme.typography.labelSmall,
                         maxLines = 1,
                     )

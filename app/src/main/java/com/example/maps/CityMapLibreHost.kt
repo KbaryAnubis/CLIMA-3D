@@ -98,6 +98,12 @@ fun CityMapLibreSection(
         )
     }
 
+    LaunchedEffect(initialState.savedMarkers) {
+        if (uiState.savedMarkers != initialState.savedMarkers) {
+            uiState = uiState.withSavedMarkers(initialState.savedMarkers)
+        }
+    }
+
     fun updateState(next: CityMapUiState) {
         uiState = next
         onStateChanged?.invoke(next)

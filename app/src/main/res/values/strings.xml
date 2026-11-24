@@ -31,7 +31,7 @@
     <string name="wx_arco_iris">Arco-íris</string>
     <string name="wx_termometro">Temperatura</string>
 
-    <!-- Stage 2A Native Assets Foundation UI -->
+    <!-- Preserved Stage 2A / MapLibre strings -->
     <string name="stage2a_title">Clima 3D • Recursos Nativos</string>
     <string name="stage2a_subtitle">Motor de fundo persistente, Media3 em loop, WebPs animados e mapas nativos MapLibre + OpenStreetMap</string>
     <string name="stage2a_video_toggle">Cenário em vídeo (Media3)</string>
@@ -47,6 +47,75 @@
     <string name="cities_map_location_active">Localização atual ativa</string>
     <string name="cities_map_osm_attribution">© OpenStreetMap contributors</string>
     <string name="radar_layer_title">Camada meteorológica do Radar</string>
-    <string name="radar_layer_note">MeteorologicalRadarTileProvider preservado e independente do motor cartográfico, pronto para quadros de precipitação.</string>
-    <string name="stage2a_tab_placeholder">Fundo climático persistente ativo nesta aba. Conteúdo completo desta tela será construído nas próximas etapas.</string>
+    <string name="radar_layer_note">MeteorologicalRadarTileProvider integrado ao RainViewer sobre MapLibre + OpenStreetMap (quadros históricos reais).</string>
+    <string name="stage2a_tab_placeholder">Fundo climático persistente ativo nesta aba.</string>
+
+    <!-- V53 Home Screen -->
+    <string name="home_select_location_cd">Selecionar localização</string>
+    <string name="home_open_settings_cd">Abrir ajustes</string>
+    <string name="home_refresh_cd">Atualizar previsão meteorológica</string>
+    <string name="home_hourly_title">Previsão por hora</string>
+    <string name="home_daily_title">Previsão para os próximos dias</string>
+    <string name="home_days_expand">Mostrar mais 9 dias</string>
+    <string name="home_days_collapse">Mostrar menos</string>
+    <string name="home_days_expand_hint">16 dias no total</string>
+    <string name="home_days_collapse_hint">Recolher</string>
+    <string name="home_temp_evolution_title">Evolução da temperatura</string>
+    <string name="home_metrics_title">Indicadores meteorológicos</string>
+    <string name="home_highlights_title">Destaques de hoje</string>
+    <string name="home_air_quality_title">Qualidade do ar</string>
+    <string name="home_alerts_title">Alertas meteorológicos</string>
+    <string name="home_open_action">Abrir</string>
+    <string name="home_retry_action">Tentar novamente</string>
+
+    <!-- V53 Radar Screen -->
+    <string name="radar_title">Radar</string>
+    <string name="radar_subtitle">Chuva e precipitação • RainViewer</string>
+    <string name="radar_precip_now">Precipitação agora</string>
+    <string name="radar_rain_intensity">Intensidade da chuva</string>
+    <string name="radar_layers_label">Camadas</string>
+    <string name="radar_layer_precip">Precipitação</string>
+    <string name="radar_layer_base">Mapa base (OSM)</string>
+    <string name="radar_animation_title">Animação do radar</string>
+    <string name="radar_play_cd">Reproduzir animação do radar</string>
+    <string name="radar_pause_cd">Pausar animação do radar</string>
+
+    <!-- V53 Cities Screen -->
+    <string name="cities_eyebrow">Minhas localizações</string>
+    <string name="cities_title">Localizações</string>
+    <string name="cities_subtitle">Gerencie várias cidades e marque pontos no mapa até o nível de rua.</string>
+    <string name="cities_tab_saved">Minhas localizações</string>
+    <string name="cities_tab_map">Selecionar no mapa</string>
+    <string name="cities_tab_search">Pesquisar cidade</string>
+    <string name="cities_search_placeholder">Ex.: Teresópolis, Rio de Janeiro…</string>
+    <string name="cities_point_name_placeholder">Nome do ponto (ex.: Meu terreno)</string>
+    <string name="cities_save_point">Salvar ponto</string>
+    <string name="cities_add_other">Adicionar outra localização</string>
+    <string name="cities_back_to_map">Voltar ao mapa e às localizações</string>
+
+    <!-- V53 Settings Screen -->
+    <string name="settings_eyebrow">Personalização</string>
+    <string name="settings_title">Configurações</string>
+    <string name="settings_subtitle">Preferências de visual, unidades, widgets e funcionamento do aplicativo.</string>
+    <string name="settings_appearance">Aparência</string>
+    <string name="settings_temperature">Temperatura</string>
+    <string name="settings_wind_rain">Vento e precipitação</string>
+    <string name="settings_pressure">Pressão atmosférica</string>
+    <string name="settings_pressure_info_btn">Entenda a pressão atmosférica</string>
+    <string name="settings_widgets">Widgets da tela inicial</string>
+    <string name="settings_dynamic_scenes">Cenários dinâmicos</string>
+    <string name="settings_data_refresh">Atualização dos dados</string>
+    <string name="settings_locations">Localizações</string>
+    <string name="settings_sources">Fontes e privacidade</string>
+    <string name="settings_reset">Restaurar preferências</string>
+
+    <!-- V53 Alerts Screen -->
+    <string name="alerts_eyebrow">Avisos internos</string>
+    <string name="alerts_title">Alertas meteorológicos</string>
+    <string name="alerts_subtitle">Informações dentro do aplicativo, sem notificações no Android.</string>
+    <string name="alerts_tab_active">Ativos</string>
+    <string name="alerts_tab_recent">Recentes</string>
+    <string name="alerts_no_push_notice">Não há notificações push, alertas na barra de status nem integração com a tela de bloqueio.</string>
+    <string name="action_back">Voltar</string>
+    <string name="action_close">Fechar</string>
 </resources>
