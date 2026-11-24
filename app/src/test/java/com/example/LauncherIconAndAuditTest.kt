@@ -68,6 +68,6 @@ class LauncherIconAndAuditTest {
         // Verify radar tile provider continues working independently
         val radarProvider =
             MeteorologicalRadarTileProvider("https://tilecache.rainviewer.com/v2/radar/1700000000/256/{z}/{x}/{y}/2/1_1.png")
-        assertNotNull(radarProvider.getTileUrl(x = 3, y = 4, zoom = 2))
+        assertNotNull(radarProvider.getTileUrl(x = 3, y = 4, zoom = 3))
     }
 }

@@ -47,6 +47,8 @@ object SafeApiExecutor {
                 ),
             )
         } catch (interrupted: InterruptedIOException) {
+            val wrappedCancel = interrupted.cause as? CancellationException
+            if (wrappedCancel != null) throw wrappedCancel
             RemoteCallOutcome.Failure(
                 WeatherError.TimeoutError(
                     provider = provider,
@@ -68,6 +70,8 @@ object SafeApiExecutor {
                 ),
             )
         } catch (io: IOException) {
+            val wrappedCancel = io.cause as? CancellationException
+            if (wrappedCancel != null) throw wrappedCancel
             RemoteCallOutcome.Failure(
                 WeatherError.NetworkUnavailableError(
                     provider = provider,

@@ -236,7 +236,7 @@ fun RadarScreen(
                                                     if (uiState.radarOrigin == DataSourceOrigin.LOCAL_CACHE) {
                                                         "Metadados em cache"
                                                     } else {
-                                                        "RainViewer ao vivo"
+                                                        "RainViewer (histórico)"
                                                     }
                                                 "$originLabel • ${frames.size} quadros históricos • Zoom máx. camada $maxRadarZoom"
                                             }
@@ -578,7 +578,7 @@ fun RadarScreen(
                                     text = if (isLatest) "Mais recente" else activeFrame?.formattedLocalTime ?: "—",
                                     color = Color(0xFF61E8FF),
                                     style = MaterialTheme.typography.labelSmall,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp).testTag("radar_frame_badge"),
                                 )
                             }
                         }

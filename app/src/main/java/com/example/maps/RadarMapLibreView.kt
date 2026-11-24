@@ -80,7 +80,7 @@ fun RadarMapLibreView(
     }
     val layerSpec = remember(activeFrame?.tileUrlTemplate, layerStyle) {
         activeFrame?.toLayerSpec(
-            transparency = 0.28f,
+            transparency = RainViewerPaletteSpec.DEFAULT_OVERLAY_TRANSPARENCY,
             baseStyle = layerStyle,
         )
     }

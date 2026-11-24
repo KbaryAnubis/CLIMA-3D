@@ -54,6 +54,22 @@ data class WeatherRadarLayerSpec(
 }
 
 /**
+ * Correspondence metadata tying the RainViewer tile color scheme requested in URLs
+ * (`colorScheme = 2`, Universal Blue) and radar overlay opacity (`0.72f`, transparency `0.28f`)
+ * to the 8-stop visual intensity scale rendered in Clima 3D V53 (`ClimaRadarRampColors`).
+ */
+object RainViewerPaletteSpec {
+    const val REQUESTED_COLOR_SCHEME_ID: Int = 2
+    const val REQUESTED_COLOR_SCHEME_NAME: String = "Universal Blue"
+    const val DEFAULT_OVERLAY_TRANSPARENCY: Float = 0.28f
+    const val DEFAULT_OVERLAY_OPACITY: Float = 0.72f
+    const val RAMP_STOP_COUNT: Int = 8
+    val legendBandsPt: List<String> = listOf("Fraca", "Moderada", "Forte", "Muito forte")
+    val rampColors: List<androidx.compose.ui.graphics.Color>
+        get() = com.example.ui.theme.ClimaRadarRampColors
+}
+
+/**
  * Independent meteorological tile URL provider for precipitation and satellite radar frames.
  * Works completely independently of the cartographic map engine (zero Google Maps dependency).
  */
@@ -63,7 +79,9 @@ class MeteorologicalRadarTileProvider(
     val tileHeightPx: Int = 256,
 ) {
     fun getTileUrl(x: Int, y: Int, zoom: Int): URL? {
-        if (tileUrlTemplate.isBlank() || zoom < 0 || x < 0 || y < 0) return null
+        if (!isValidTemplate() || zoom !in 0..30) return null
+        val maxCoord = (1L shl zoom) - 1L
+        if (x.toLong() !in 0L..maxCoord || y.toLong() !in 0L..maxCoord) return null
         val resolved =
             tileUrlTemplate
                 .replace("{z}", zoom.toString())
@@ -73,7 +91,11 @@ class MeteorologicalRadarTileProvider(
     }
 
     fun isValidTemplate(): Boolean {
-        return tileUrlTemplate.contains("{z}") &&
+        val hasHttpScheme =
+            tileUrlTemplate.startsWith("https://", ignoreCase = true) ||
+                tileUrlTemplate.startsWith("http://", ignoreCase = true)
+        return hasHttpScheme &&
+            tileUrlTemplate.contains("{z}") &&
             tileUrlTemplate.contains("{x}") &&
             tileUrlTemplate.contains("{y}")
     }

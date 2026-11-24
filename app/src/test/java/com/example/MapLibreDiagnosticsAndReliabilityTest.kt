@@ -29,7 +29,12 @@ import com.example.ui.screens.RadarScreen
 import com.example.ui.state.ClimaUiState
 import com.example.ui.theme.Clima3DTheme
 import com.example.ui.theme.ClimaTab
+import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.util.concurrent.CancellationException
+import javax.net.ssl.SSLException
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -232,6 +237,93 @@ class MapLibreDiagnosticsAndReliabilityTest {
         val afterDns = dnsMachine.onTileTransportUpdated(dnsSnap, isOnline = true)
         assertTrue(afterDns is MapSurfaceLoadState.ConnectionError)
         assertTrue((afterDns as MapSurfaceLoadState.ConnectionError).reason.contains("DNS"))
+    }
+
+    @Test
+    fun `Tile interceptor classifies HTTP cancellations as CANCELED without incrementing error counts or triggering ConnectionError`() {
+        val canceledByMessageClient =
+            OkHttpClient.Builder()
+                .addInterceptor(MapLibreInitializer.createTileTransportInterceptor())
+                .addInterceptor { _ ->
+                    throw IOException("Canceled")
+                }
+                .build()
+
+        val callCanceledClient =
+            OkHttpClient.Builder()
+                .addInterceptor(MapLibreInitializer.createTileTransportInterceptor())
+                .addInterceptor { chain ->
+                    chain.call().cancel()
+                    throw IOException("Socket closed")
+                }
+                .build()
+
+        val rainViewerCanceledClient =
+            OkHttpClient.Builder()
+                .addInterceptor(MapLibreInitializer.createTileTransportInterceptor())
+                .addInterceptor { _ ->
+                    throw IOException("stream was reset: CANCEL")
+                }
+                .build()
+
+        val machine = MapLoadStateMachine("Radar")
+        machine.beginAttempt(isOnline = true, hasMapReady = true, tileSnapshot = TileTransportDiagnostics.snapshot.value)
+        machine.onStyleLoaded()
+
+        val osmReq = Request.Builder().url("https://tile.openstreetmap.org/7/47/72.png").build()
+        val rvReq = Request.Builder().url("https://tilecache.rainviewer.com/v2/radar/1763995200/512/7/47/72/2/1_1.png").build()
+
+        repeat(4) {
+            runCatching { canceledByMessageClient.newCall(osmReq).execute().close() }
+        }
+        repeat(2) {
+            runCatching { callCanceledClient.newCall(osmReq).execute().close() }
+        }
+        repeat(3) {
+            runCatching { rainViewerCanceledClient.newCall(rvReq).execute().close() }
+        }
+
+        val snap = TileTransportDiagnostics.snapshot.value
+        assertEquals(6, snap.osmCanceledCount)
+        assertEquals(0, snap.osmErrorCount)
+        assertEquals(null, snap.lastOsmError)
+        assertEquals(TileTransportFailureKind.NONE, snap.lastOsmFailureKind)
+        assertEquals(3, snap.rainViewerCanceledCount)
+        assertEquals(0, snap.rainViewerErrorCount)
+        assertEquals(null, snap.lastRainViewerError)
+
+        val stateAfterCancels = machine.onTileTransportUpdated(snap, isOnline = true)
+        assertEquals(MapSurfaceLoadState.LoadingMap, stateAfterCancels)
+
+        // Direct classification distinguishes CANCELED, TIMEOUT, DNS, TLS
+        assertEquals(
+            TileTransportFailureKind.CANCELED,
+            TileTransportDiagnostics.classifyThrowable(IOException("Canceled")).first,
+        )
+        assertEquals(
+            TileTransportFailureKind.CANCELED,
+            TileTransportDiagnostics.classifyThrowable(CancellationException("viewport changed")).first,
+        )
+        assertEquals(
+            TileTransportFailureKind.CANCELED,
+            TileTransportDiagnostics.classifyThrowable(IOException("Socket closed"), isCallCanceled = true).first,
+        )
+        assertEquals(
+            TileTransportFailureKind.TIMEOUT,
+            TileTransportDiagnostics.classifyThrowable(SocketTimeoutException("Read timed out")).first,
+        )
+        assertEquals(
+            TileTransportFailureKind.TIMEOUT,
+            TileTransportDiagnostics.classifyThrowable(InterruptedIOException("timeout")).first,
+        )
+        assertEquals(
+            TileTransportFailureKind.DNS_OR_NETWORK,
+            TileTransportDiagnostics.classifyThrowable(UnknownHostException("tile.openstreetmap.org")).first,
+        )
+        assertEquals(
+            TileTransportFailureKind.TLS,
+            TileTransportDiagnostics.classifyThrowable(SSLException("Handshake failed")).first,
+        )
     }
 
     @Test

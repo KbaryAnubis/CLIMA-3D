@@ -36,10 +36,13 @@ import com.example.ui.theme.ClimaTextOnDark
 import com.example.ui.theme.ClimaToastEmerald
 import com.example.ui.theme.WeatherGlassSpecs
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.util.concurrent.CancellationException as JavaCancellationException
 import javax.net.ssl.SSLException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -130,6 +133,7 @@ sealed interface MapSurfaceLoadState {
 
 enum class TileTransportFailureKind {
     NONE,
+    CANCELED,
     DNS_OR_NETWORK,
     TIMEOUT,
     TLS,
@@ -142,6 +146,7 @@ enum class TileTransportFailureKind {
 data class TileTransportSnapshot(
     val osmRequestCount: Int = 0,
     val osmSuccessCount: Int = 0,
+    val osmCanceledCount: Int = 0,
     val osmErrorCount: Int = 0,
     val lastOsmStatusCode: Int? = null,
     val lastOsmError: String? = null,
@@ -150,6 +155,7 @@ data class TileTransportSnapshot(
     val lastOsmUrl: String? = null,
     val rainViewerRequestCount: Int = 0,
     val rainViewerSuccessCount: Int = 0,
+    val rainViewerCanceledCount: Int = 0,
     val rainViewerErrorCount: Int = 0,
     val lastRainViewerStatusCode: Int? = null,
     val lastRainViewerError: String? = null,
@@ -233,13 +239,40 @@ object TileTransportDiagnostics {
         }
     }
 
+    fun recordTransportCanceled(
+        isRainViewer: Boolean,
+        durationMs: Long,
+        sanitizedUrl: String,
+    ) {
+        _snapshot.update { cur ->
+            if (isRainViewer) {
+                cur.copy(rainViewerCanceledCount = cur.rainViewerCanceledCount + 1)
+            } else {
+                cur.copy(
+                    osmCanceledCount = cur.osmCanceledCount + 1,
+                    lastOsmDurationMs = durationMs,
+                    lastOsmUrl = sanitizedUrl,
+                )
+            }
+        }
+    }
+
     fun recordTransportFailure(
         isRainViewer: Boolean,
         error: Throwable,
         durationMs: Long,
         sanitizedUrl: String,
+        isCallCanceled: Boolean = false,
     ) {
-        val (kind, message) = classifyThrowable(error)
+        if (isCancellationThrowable(error, isCallCanceled)) {
+            recordTransportCanceled(
+                isRainViewer = isRainViewer,
+                durationMs = durationMs,
+                sanitizedUrl = sanitizedUrl,
+            )
+            return
+        }
+        val (kind, message) = classifyThrowable(error, isCallCanceled = false)
         _snapshot.update { cur ->
             if (isRainViewer) {
                 cur.copy(
@@ -258,6 +291,51 @@ object TileTransportDiagnostics {
         }
     }
 
+    fun isCancellationThrowable(
+        error: Throwable,
+        isCallCanceled: Boolean = false,
+    ): Boolean {
+        if (isCallCanceled) return true
+        var cursor: Throwable? = error
+        var depth = 0
+        while (cursor != null && depth < 6) {
+            if (cursor is CancellationException || cursor is JavaCancellationException) {
+                return true
+            }
+            val className = cursor.javaClass.simpleName
+            val msg = cursor.message.orEmpty().lowercase()
+            if (className.contains("StreamResetException") &&
+                (msg.contains("cancel") || msg.contains("rst_stream"))
+            ) {
+                return true
+            }
+            if (cursor is InterruptedIOException &&
+                cursor !is SocketTimeoutException &&
+                (msg.contains("cancel") || msg.contains("interrupt"))
+            ) {
+                return true
+            }
+            if (cursor is IOException &&
+                cursor !is SocketTimeoutException &&
+                cursor !is UnknownHostException &&
+                cursor !is SSLException &&
+                (
+                    msg == "canceled" ||
+                        msg == "cancelled" ||
+                        msg.contains("stream was reset: cancel") ||
+                        msg.contains("request canceled") ||
+                        msg.contains("job was cancelled") ||
+                        msg.contains("call canceled")
+                )
+            ) {
+                return true
+            }
+            cursor = cursor.cause
+            depth++
+        }
+        return false
+    }
+
     fun classifyHttpStatusMessage(statusCode: Int, provider: String): String =
         when (statusCode) {
             403 -> "HTTP 403: servidor $provider recusou a requisição de tile (verifique User-Agent)."
@@ -267,14 +345,29 @@ object TileTransportDiagnostics {
             else -> "HTTP $statusCode ao baixar tile do $provider."
         }
 
-    fun classifyThrowable(error: Throwable): Pair<TileTransportFailureKind, String> =
-        when (error) {
+    fun classifyThrowable(
+        error: Throwable,
+        isCallCanceled: Boolean = false,
+    ): Pair<TileTransportFailureKind, String> {
+        if (isCancellationThrowable(error, isCallCanceled)) {
+            return TileTransportFailureKind.CANCELED to
+                "Requisição de tile cancelada por navegação, zoom ou atualização do estilo."
+        }
+        return when (error) {
             is UnknownHostException ->
                 TileTransportFailureKind.DNS_OR_NETWORK to
                     "Falha DNS ao resolver servidor de tiles (${error.message ?: "sem resposta"})."
             is SocketTimeoutException ->
                 TileTransportFailureKind.TIMEOUT to
                     "Timeout de rede ao baixar tiles (${error.message ?: "tempo esgotado"})."
+            is InterruptedIOException ->
+                if (error.message.orEmpty().contains("timeout", ignoreCase = true)) {
+                    TileTransportFailureKind.TIMEOUT to
+                        "Timeout de rede ao baixar tiles (${error.message ?: "tempo esgotado"})."
+                } else {
+                    TileTransportFailureKind.DNS_OR_NETWORK to
+                        "Erro de E/S interrompido: ${error.message ?: error.javaClass.simpleName}."
+                }
             is SSLException ->
                 TileTransportFailureKind.TLS to
                     "Falha TLS/HTTPS na conexão com servidor de tiles (${error.message ?: error.javaClass.simpleName})."
@@ -288,6 +381,7 @@ object TileTransportDiagnostics {
                 TileTransportFailureKind.UNKNOWN to
                     "Erro ao requisitar tile: ${error.message ?: error.javaClass.simpleName}."
         }
+    }
 }
 
 /**
@@ -541,6 +635,7 @@ class MapLoadStateMachine(
             TileTransportFailureKind.HTTP_BLOCKED_OR_RATE_LIMIT,
             TileTransportFailureKind.HTTP_SERVER_OR_NOT_FOUND,
             TileTransportFailureKind.UNKNOWN,
+            TileTransportFailureKind.CANCELED,
             TileTransportFailureKind.NONE -> MapSurfaceLoadState.RenderError(reason)
         }
     }

@@ -328,12 +328,29 @@ class ClimaMainViewModel(
                                 state.savedLocationSummaries
                             }
 
+                        val previousFrames = state.radarTimeline?.frames.orEmpty()
+                        val previousSafeIndex = state.currentRadarFrameIndexSafe
+                        val previousSelectedTimestamp = previousFrames.getOrNull(previousSafeIndex)?.timestampSeconds
+
                         val nextFrameIndex =
                             when {
                                 newRadar == null || newRadar.frames.isEmpty() -> 0
-                                preserveRadarPlayback && state.isRadarPlaying ->
-                                    state.radarSelectedFrameIndex.coerceIn(0, newRadar.frames.lastIndex)
-                                else -> newRadar.frames.lastIndex
+                                report.radar is WeatherResult.Failure ->
+                                    previousSafeIndex.coerceIn(0, newRadar.frames.lastIndex)
+                                previousFrames.isEmpty() -> newRadar.frames.lastIndex
+                                !state.isRadarPlaying && previousSafeIndex >= previousFrames.lastIndex ->
+                                    newRadar.frames.lastIndex
+                                else -> {
+                                    val matchingIndex =
+                                        previousSelectedTimestamp?.let { ts ->
+                                            newRadar.frames.indexOfFirst { it.timestampSeconds == ts }
+                                        } ?: -1
+                                    when {
+                                        matchingIndex >= 0 -> matchingIndex
+                                        preserveRadarPlayback && state.isRadarPlaying -> 0
+                                        else -> newRadar.frames.lastIndex
+                                    }
+                                }
                             }
 
                         state.copy(

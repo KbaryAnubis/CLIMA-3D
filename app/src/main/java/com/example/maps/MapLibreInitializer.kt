@@ -249,17 +249,31 @@ object MapLibreInitializer {
                 response
             } catch (ioe: IOException) {
                 val durationMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(0L)
-                TileTransportDiagnostics.recordTransportFailure(
-                    isRainViewer = isRainViewer,
-                    error = ioe,
-                    durationMs = durationMs,
-                    sanitizedUrl = sanitizedUrl,
-                )
-                ClimaMapLogger.e(
-                    logTag,
-                    "Falha de rede/DNS/TLS ao buscar tile ($sanitizedUrl, ${durationMs}ms): ${ioe.javaClass.simpleName}: ${ioe.message}",
-                    ioe,
-                )
+                val callCanceled = runCatching { chain.call().isCanceled() }.getOrDefault(false)
+                if (TileTransportDiagnostics.isCancellationThrowable(ioe, callCanceled)) {
+                    TileTransportDiagnostics.recordTransportCanceled(
+                        isRainViewer = isRainViewer,
+                        durationMs = durationMs,
+                        sanitizedUrl = sanitizedUrl,
+                    )
+                    ClimaMapLogger.i(
+                        logTag,
+                        "Requisição de tile cancelada por navegação, zoom ou ciclo de vida ($sanitizedUrl, ${durationMs}ms).",
+                    )
+                } else {
+                    TileTransportDiagnostics.recordTransportFailure(
+                        isRainViewer = isRainViewer,
+                        error = ioe,
+                        durationMs = durationMs,
+                        sanitizedUrl = sanitizedUrl,
+                        isCallCanceled = false,
+                    )
+                    ClimaMapLogger.e(
+                        logTag,
+                        "Falha de rede/DNS/TLS ao buscar tile ($sanitizedUrl, ${durationMs}ms): ${ioe.javaClass.simpleName}: ${ioe.message}",
+                        ioe,
+                    )
+                }
                 throw ioe
             }
         }

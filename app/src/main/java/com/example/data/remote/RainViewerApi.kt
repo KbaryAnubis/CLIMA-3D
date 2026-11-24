@@ -74,10 +74,13 @@ object RainViewerMapper {
         timeFormat: TimeFormatPreference = TimeFormatPreference.H24,
         maxFrames: Int = RadarTimelineSnapshot.V53_TARGET_FRAME_COUNT,
     ): RadarTimelineSnapshot? {
-        val host = dto.host?.trim()?.takeIf { it.startsWith("http") } ?: return null
+        val host =
+            dto.host?.trim()?.takeIf {
+                it.startsWith("https://", ignoreCase = true) || it.startsWith("http://", ignoreCase = true)
+            } ?: return null
         val validPast = dto.radar?.past.orEmpty()
             .mapNotNull { frame ->
-                val time = frame.time ?: return@mapNotNull null
+                val time = frame.time?.takeIf { it > 0L } ?: return@mapNotNull null
                 val path = frame.path?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
                 time to path
             }
