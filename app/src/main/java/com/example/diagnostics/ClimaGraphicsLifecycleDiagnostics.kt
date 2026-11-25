@@ -52,6 +52,11 @@ object ClimaGraphicsLifecycleDiagnostics {
     @Volatile
     private var currentTab: ClimaTab = ClimaTab.HOME
 
+    @Volatile
+    private var currentActivityState: String = "RESUMED"
+
+    fun currentActivityStateName(): String = currentActivityState
+
     fun isEnabled(): Boolean = debugOverrideForTest ?: BuildConfig.DEBUG
 
     fun nextSessionId(prefix: String): String = "$prefix-${sessionSeq.incrementAndGet()}"
@@ -74,6 +79,7 @@ object ClimaGraphicsLifecycleDiagnostics {
     internal fun clearForTest() {
         synchronized(lock) { recentEvents.clear() }
         currentTab = ClimaTab.HOME
+        currentActivityState = "RESUMED"
         GraphicsSurfaceCoordinator.resetForTest()
     }
 
@@ -293,18 +299,128 @@ object ClimaGraphicsLifecycleDiagnostics {
         playbackState: String,
         isPlaying: Boolean,
         videoResId: Int? = null,
+        positionMs: Long = 0L,
+        activityState: String = currentActivityState,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
     ) {
         val resSuffix = videoResId?.let { " resId=$it" }.orEmpty()
-        emit("EXO_PLAYBACK_STATE session=$sessionId playerId=$playerIdentity state=$playbackState playing=$isPlaying$resSuffix")
+        emit(
+            "EXO_PLAYBACK_STATE session=$sessionId playerId=$playerIdentity state=$playbackState " +
+                "playing=$isPlaying posMs=$positionMs activityState=$activityState videoState=${videoState.name}$resSuffix",
+        )
+    }
+
+    fun logExoIsPlayingChanged(
+        sessionId: String,
+        playerIdentity: Int,
+        isPlaying: Boolean,
+        playerState: String,
+        videoResId: Int? = null,
+        positionMs: Long = 0L,
+        activityState: String = currentActivityState,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
+    ) {
+        val resSuffix = videoResId?.let { " resId=$it" }.orEmpty()
+        emit(
+            "EXO_IS_PLAYING session=$sessionId playerId=$playerIdentity playing=$isPlaying " +
+                "playerState=$playerState posMs=$positionMs activityState=$activityState videoState=${videoState.name}$resSuffix",
+        )
+    }
+
+    fun logExoMediaItemTransition(
+        sessionId: String,
+        playerIdentity: Int,
+        mediaId: String? = null,
+        reason: String = "AUTO",
+        transitionReason: String = reason,
+        playerState: String = "READY",
+        videoResId: Int? = null,
+        positionMs: Long = 0L,
+        activityState: String = currentActivityState,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
+    ) {
+        val resSuffix = videoResId?.let { " resId=$it" }.orEmpty()
+        emit(
+            "EXO_MEDIA_ITEM session=$sessionId playerId=$playerIdentity media=${mediaId ?: "none"} " +
+                "reason=$transitionReason playerState=$playerState posMs=$positionMs activityState=$activityState videoState=${videoState.name}$resSuffix",
+        )
+    }
+
+    fun logExoDecoderInitialized(
+        sessionId: String,
+        playerIdentity: Int,
+        trackType: String,
+        decoderName: String,
+        initDurationMs: Long,
+        playerState: String,
+        videoResId: Int? = null,
+        positionMs: Long = 0L,
+        activityState: String = currentActivityState,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
+    ) {
+        val resSuffix = videoResId?.let { " resId=$it" }.orEmpty()
+        emit(
+            "EXO_DECODER_INITIALIZED session=$sessionId playerId=$playerIdentity track=$trackType " +
+                "decoder=$decoderName initDurationMs=$initDurationMs playerState=$playerState " +
+                "posMs=$positionMs activityState=$activityState videoState=${videoState.name}$resSuffix",
+        )
+    }
+
+    fun logExoDecoderReleased(
+        sessionId: String,
+        playerIdentity: Int,
+        trackType: String,
+        decoderName: String,
+        playerState: String,
+        videoResId: Int? = null,
+        positionMs: Long = 0L,
+        activityState: String = currentActivityState,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
+    ) {
+        val resSuffix = videoResId?.let { " resId=$it" }.orEmpty()
+        emit(
+            "EXO_DECODER_RELEASED session=$sessionId playerId=$playerIdentity track=$trackType " +
+                "decoder=$decoderName playerState=$playerState posMs=$positionMs " +
+                "activityState=$activityState videoState=${videoState.name}$resSuffix",
+        )
+    }
+
+    fun logExoCodecError(
+        sessionId: String,
+        playerIdentity: Int,
+        trackType: String,
+        errorClass: String,
+        message: String?,
+        isDeadObject: Boolean,
+        playerState: String,
+        videoResId: Int? = null,
+        positionMs: Long = 0L,
+        activityState: String = currentActivityState,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
+    ) {
+        val resSuffix = videoResId?.let { " resId=$it" }.orEmpty()
+        emit(
+            "EXO_CODEC_ERROR session=$sessionId playerId=$playerIdentity track=$trackType " +
+                "errorClass=$errorClass deadObject=$isDeadObject playerState=$playerState " +
+                "posMs=$positionMs activityState=$activityState videoState=${videoState.name}$resSuffix " +
+                "msg=${message ?: "unknown"}",
+        )
     }
 
     fun logExoFirstFrame(
         sessionId: String,
         playerIdentity: Int,
         videoResId: Int? = null,
+        positionMs: Long = 0L,
+        playerState: String = "READY",
+        activityState: String = currentActivityState,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
     ) {
         val resSuffix = videoResId?.let { " resId=$it" }.orEmpty()
-        emit("EXO_FIRST_FRAME session=$sessionId playerId=$playerIdentity$resSuffix")
+        emit(
+            "EXO_FIRST_FRAME session=$sessionId playerId=$playerIdentity playerState=$playerState " +
+                "posMs=$positionMs activityState=$activityState videoState=${videoState.name}$resSuffix",
+        )
     }
 
     fun logExoSurfaceSizeChanged(
@@ -321,8 +437,43 @@ object ClimaGraphicsLifecycleDiagnostics {
         playerIdentity: Int,
         errorCodeName: String,
         message: String?,
+        errorClass: String = "PlaybackException",
+        isDeadObject: Boolean = false,
+        playerState: String = "IDLE",
+        videoResId: Int? = null,
+        positionMs: Long = 0L,
+        activityState: String = currentActivityState,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
     ) {
-        emit("EXO_ERROR session=$sessionId playerId=$playerIdentity code=$errorCodeName msg=${message ?: "unknown"}")
+        val resSuffix = videoResId?.let { " resId=$it" }.orEmpty()
+        emit(
+            "EXO_ERROR session=$sessionId playerId=$playerIdentity code=$errorCodeName " +
+                "errorClass=$errorClass deadObject=$isDeadObject playerState=$playerState " +
+                "posMs=$positionMs activityState=$activityState videoState=${videoState.name}$resSuffix " +
+                "msg=${message ?: "unknown"}",
+        )
+    }
+
+    fun logExoRecoveryAction(
+        sessionId: String,
+        playerIdentity: Int,
+        action: String,
+        reason: String,
+        playerState: String = "IDLE",
+        videoResId: Int? = null,
+        positionMs: Long = 0L,
+        playbackSpeed: Float = 1.0f,
+        speed: Float = playbackSpeed,
+        activityState: String = currentActivityState,
+        mapState: MapSurfaceSessionState = GraphicsSurfaceCoordinator.state.value.mapState,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
+    ) {
+        val resSuffix = videoResId?.let { " resId=$it" }.orEmpty()
+        emit(
+            "EXO_RECOVERY session=$sessionId playerId=$playerIdentity action=$action reason=$reason " +
+                "playerState=$playerState posMs=$positionMs speed=$speed activityState=$activityState " +
+                "mapState=${mapState.name} videoState=${videoState.name}$resSuffix",
+        )
     }
 
     fun logPlayerSurfaceCleared(
@@ -342,11 +493,21 @@ object ClimaGraphicsLifecycleDiagnostics {
     }
 
     fun logActivityLifecycle(event: Lifecycle.Event) {
+        currentActivityState =
+            when (event) {
+                Lifecycle.Event.ON_CREATE -> "CREATED"
+                Lifecycle.Event.ON_START -> "STARTED"
+                Lifecycle.Event.ON_RESUME -> "RESUMED"
+                Lifecycle.Event.ON_PAUSE -> "STARTED"
+                Lifecycle.Event.ON_STOP -> "CREATED"
+                Lifecycle.Event.ON_DESTROY -> "DESTROYED"
+                Lifecycle.Event.ON_ANY -> currentActivityState
+            }
         when (event) {
             Lifecycle.Event.ON_START,
             Lifecycle.Event.ON_RESUME,
             Lifecycle.Event.ON_PAUSE,
-            Lifecycle.Event.ON_STOP, -> emit("ACTIVITY_LIFECYCLE event=${event.name}")
+            Lifecycle.Event.ON_STOP, -> emit("ACTIVITY_LIFECYCLE event=${event.name} activityState=$currentActivityState")
             else -> Unit
         }
     }

@@ -1960,6 +1960,211 @@ class SurfaceAndLifecycleAuditTest {
         assertTrue(GraphicsSurfaceCoordinator.state.value.disposingMapSessions.isEmpty())
     }
 
+    // 39. Etapa 3L (1): Erro fatal / reclaim simulado do MediaCodec na HOME recupera o mesmo ExoPlayer preservando MediaItem, posição e velocidade
+    @Test
+    fun `test_39_mediacodec_error_on_home_recovers_same_exoplayer_preserving_media_position_and_speed`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.CHUVA_FRACA,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge().apply { simulatedPositionMs = 6_400L }.also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        val surface = surfaces.single()
+        assertTrue(surface.isPlayerAttached(player))
+        assertEquals(1, player.setMediaItemCalls)
+        assertEquals(1, player.prepareCalls)
+        assertEquals(0.85f, player.currentPlaybackSpeed, 0.001f)
+        assertEquals(6_400L, player.currentPositionMs)
+
+        // Simulate MediaCodec reclaim / DEAD_OBJECT error while playing on HOME
+        // Note: In unit tests, this is an application-level simulation of Media3 AnalyticsListener + Player.Listener
+        // codec failure callbacks, NOT the native Android ResourceManagerService process.
+        composeTestRule.runOnUiThread {
+            player.simulateFatalMediaCodecReclaim(
+                decoderName = "c2.android.avc.decoder",
+                errorCodeName = "ERROR_CODE_DECODING_FAILED",
+                errorMessage = "MediaCodec VideoRenderer error: Released by resource manager (DEAD_OBJECT)",
+                resetLivePositionOnIdle = true,
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        // Same ExoPlayer instance is preserved (no duplicate creation, no release, no MediaItem reset)
+        assertEquals("Must not duplicate ExoPlayer instance on codec recovery", 1, players.size)
+        assertTrue(players.single() === player)
+        assertEquals(0, player.releaseCalls)
+        assertFalse(player.isReleased)
+        assertEquals("MediaItem must be preserved without calling setMediaItem again", 1, player.setMediaItemCalls)
+        assertEquals("Player must re-prepare once to recover from STATE_IDLE after codec reclaim", 2, player.prepareCalls)
+        assertFalse("Player must no longer be in IDLE after recovery prepare()", player.isIdle)
+        assertEquals("Playback position must be restored to 6400ms", 6_400L, player.currentPositionMs)
+        assertEquals("Playback speed 0.85f (CHUVA_FRACA) must be preserved", 0.85f, player.currentPlaybackSpeed, 0.001f)
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(logs.any { it.contains("EXO_CODEC_ERROR") && it.contains("track=VIDEO") && it.contains("deadObject=true") })
+        assertTrue(logs.any { it.contains("EXO_ERROR") && it.contains("code=ERROR_CODE_DECODING_FAILED") && it.contains("deadObject=true") })
+        assertTrue(logs.any { it.contains("EXO_DECODER_RELEASED") && it.contains("decoder=c2.android.avc.decoder") })
+        assertTrue(
+            logs.any {
+                it.contains("EXO_RECOVERY") &&
+                    it.contains("action=RECOVER_PREPARE") &&
+                    it.contains("posMs=6400") &&
+                    it.contains("speed=0.85")
+            },
+        )
+        assertTrue(logs.count { it.contains("EXO_DECODER_INITIALIZED") && it.contains("track=VIDEO") } >= 2)
+        assertTrue(logs.count { it.contains("EXO_FIRST_FRAME") } >= 2)
+    }
+
+    // 40. Etapa 3L (2): Reclaim simulado do MediaCodec enquanto em aba de mapa (RADAR/CITIES) adia recuperação sem anexar superfície até voltar à HOME
+    @Test
+    fun `test_40_mediacodec_reclaim_while_on_radar_defers_recovery_without_attaching_surface_until_return_to_home`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        val mapPorts = mutableListOf<FakeMapViewSurfacePort>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.CHUVA_FRACA,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = {
+                            FakeWeatherVideoPlayerBridge().apply { simulatedPositionMs = 5_120L }.also { players += it }
+                        },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    )
+                    when (activeTab) {
+                        ClimaTab.RADAR ->
+                            RadarMapLibreViewImpl(
+                                center = CityMapCoordinate(-23.55, -46.63),
+                                zoom = 6.0,
+                                activeFrame = sampleRadarFrame(1700000000L),
+                                layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                                maxRadarZoom = 7,
+                                surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { mapPorts += it } },
+                            )
+                        ClimaTab.CITIES ->
+                            CityMapLibreViewImpl(
+                                state = CityMapUiState(),
+                                onMapTap = {},
+                                onCameraGestureSettled = { _, _ -> },
+                                surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { mapPorts += it } },
+                            )
+                        else -> Text("home")
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        val surface = surfaces.single()
+        assertEquals(1, player.prepareCalls)
+        assertEquals(1, surface.attachCount)
+
+        // 1. Navigate HOME -> RADAR (detaches video surface before map creation)
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.HOME, ClimaTab.RADAR)
+            activeTab = ClimaTab.RADAR
+        }
+        composeTestRule.waitForIdle()
+
+        assertFalse(surface.isPlayerAttached(player))
+        assertEquals(MapSurfaceSessionState.MAP_SURFACE_ACTIVE, GraphicsSurfaceCoordinator.state.value.mapState)
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED, GraphicsSurfaceCoordinator.state.value.videoState)
+
+        // 2. Simulate MediaCodec reclaim while paused & surface-detached on RADAR
+        val logCountBeforeReclaim = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().size
+        composeTestRule.runOnUiThread {
+            player.simulateFatalMediaCodecReclaim(
+                decoderName = "c2.android.avc.decoder",
+                errorCodeName = "ERROR_CODE_DECODING_FAILED",
+                errorMessage = "Released by resource manager while backgrounded on map tab",
+                resetLivePositionOnIdle = true,
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        // While on RADAR, player MUST NOT re-prepare or attach video surface
+        assertFalse("Video surface MUST NOT attach while MapLibre session is active", surface.isPlayerAttached(player))
+        assertEquals("attachCount must remain 1 while on RADAR", 1, surface.attachCount)
+        assertEquals("prepareCalls must remain 1 (deferred while on RADAR)", 1, player.prepareCalls)
+        assertTrue("Player remains in IDLE until returning to HOME", player.isIdle)
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED, GraphicsSurfaceCoordinator.state.value.videoState)
+
+        val logsDuringRadarReclaim = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().drop(logCountBeforeReclaim)
+        assertTrue(
+            "Must log EXO_RECOVERY action=DEFERRED reason=map_surface_active_or_disposing",
+            logsDuringRadarReclaim.any {
+                it.contains("EXO_RECOVERY") &&
+                    it.contains("action=DEFERRED") &&
+                    it.contains("reason=map_surface_active_or_disposing") &&
+                    it.contains("posMs=5120")
+            },
+        )
+        assertTrue(
+            "Must NOT log EXO_SURFACE_ATTACH or VIDEO_OUTPUT_REATTACHED while map is active",
+            logsDuringRadarReclaim.none { it.contains("EXO_SURFACE_ATTACH") || it.contains("VIDEO_OUTPUT_REATTACHED") },
+        )
+
+        // 3. Switch RADAR -> CITIES while recovery is still pending: must still remain deferred and detached
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.RADAR, ClimaTab.CITIES)
+            activeTab = ClimaTab.CITIES
+        }
+        composeTestRule.waitForIdle()
+        assertFalse(surface.isPlayerAttached(player))
+        assertEquals(1, surface.attachCount)
+        assertEquals(1, player.prepareCalls)
+
+        // 4. Return CITIES -> HOME: after MAP_SURFACE_DETACHED, video surface reattaches and deferred recovery executes
+        val logCountBeforeReturn = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().size
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logTabChanged(ClimaTab.CITIES, ClimaTab.HOME)
+            activeTab = ClimaTab.HOME
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(1, players.size)
+        assertTrue(players.single() === player)
+        assertEquals(0, player.releaseCalls)
+        assertTrue(surface.isPlayerAttached(player))
+        assertEquals(2, surface.attachCount)
+        assertEquals("MediaItem must not be reset", 1, player.setMediaItemCalls)
+        assertEquals("Deferred recovery prepare() must run once on return to HOME", 2, player.prepareCalls)
+        assertFalse(player.isIdle)
+        assertEquals("Position 5120ms must be restored upon deferred recovery", 5_120L, player.currentPositionMs)
+        assertEquals("Speed 0.85f must be preserved upon deferred recovery", 0.85f, player.currentPlaybackSpeed, 0.001f)
+
+        val returnLogs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().drop(logCountBeforeReturn)
+        val mapDetachedIdx = returnLogs.indexOfFirst { it.contains("MAP_SURFACE_DETACHED") }
+        val videoReattachedIdx = returnLogs.indexOfFirst { it.contains("VIDEO_OUTPUT_REATTACHED") }
+        val recoverPrepareIdx =
+            returnLogs.indexOfFirst { it.contains("EXO_RECOVERY") && it.contains("action=RECOVER_PREPARE") }
+        assertTrue(
+            "Return to HOME after codec reclaim must follow MAP_SURFACE_DETACHED -> VIDEO_OUTPUT_REATTACHED -> EXO_RECOVERY(RECOVER_PREPARE), got:\n${returnLogs.joinToString("\n")}",
+            mapDetachedIdx >= 0 &&
+                videoReattachedIdx > mapDetachedIdx &&
+                recoverPrepareIdx > videoReattachedIdx,
+        )
+    }
+
     private fun extractToken(line: String, prefix: String): String? {
         val idx = line.indexOf(prefix)
         if (idx < 0) return null
@@ -1998,14 +2203,18 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
     var pauseCalls = 0
     var releaseCalls = 0
     var clearSurfaceCount = 0
+    var seekToCalls = 0
     var lastPlayWhenReady: Boolean? = null
     var releaseOrder = Int.MAX_VALUE
     var simulatedPositionMs: Long = 0L
     var currentSpeedValue: Float = 1.0f
+    var currentVideoResHint: Int = R.raw.wx_bg_sun_day
     val speedHistory = mutableListOf<Float>()
+    val seekHistory = mutableListOf<Long>()
     val events = mutableListOf<String>()
     private var attachedView: Any? = null
     private var firstFrameListener: (() -> Unit)? = null
+    private var codecErrorListener: ((com.example.ui.components.WeatherVideoCodecErrorDiagnostic) -> Unit)? = null
 
     override val isReleased: Boolean
         get() = released
@@ -2018,6 +2227,10 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
 
     override val currentPlaybackSpeed: Float
         get() = currentSpeedValue
+
+    override fun setVideoResIdHint(resId: Int) {
+        currentVideoResHint = resId
+    }
 
     override fun setMediaItem(uri: Uri) {
         setMediaItemCalls++
@@ -2037,11 +2250,45 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
         speedHistory += speed
     }
 
+    override fun seekTo(positionMs: Long) {
+        seekToCalls++
+        simulatedPositionMs = positionMs
+        seekHistory += positionMs
+        events += "seekTo:$positionMs"
+    }
+
     override fun prepare() {
         prepareCalls++
         idleState = false
         events += "prepare"
-        firstFrameListener?.invoke()
+        ClimaGraphicsLifecycleDiagnostics.logExoDecoderInitialized(
+            sessionId = sessionId,
+            playerIdentity = identityHash,
+            trackType = "VIDEO",
+            decoderName = "c2.android.avc.decoder",
+            initDurationMs = 12L,
+            playerState = "READY",
+            videoResId = currentVideoResHint,
+            positionMs = simulatedPositionMs,
+        )
+        ClimaGraphicsLifecycleDiagnostics.logExoPlaybackMilestone(
+            sessionId = sessionId,
+            playerIdentity = identityHash,
+            playbackState = "READY",
+            isPlaying = lastPlayWhenReady == true,
+            videoResId = currentVideoResHint,
+            positionMs = simulatedPositionMs,
+        )
+        if (lastPlayWhenReady == true) {
+            ClimaGraphicsLifecycleDiagnostics.logExoFirstFrame(
+                sessionId = sessionId,
+                playerIdentity = identityHash,
+                videoResId = currentVideoResHint,
+                positionMs = simulatedPositionMs,
+                playerState = "READY",
+            )
+            firstFrameListener?.invoke()
+        }
     }
 
     override fun stop() {
@@ -2067,6 +2314,68 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
 
     override fun setFirstFrameListener(listener: (() -> Unit)?) {
         firstFrameListener = listener
+    }
+
+    override fun setCodecErrorListener(
+        listener: ((com.example.ui.components.WeatherVideoCodecErrorDiagnostic) -> Unit)?,
+    ) {
+        codecErrorListener = listener
+    }
+
+    fun simulateFatalMediaCodecReclaim(
+        decoderName: String = "c2.android.avc.decoder",
+        errorCodeName: String = "ERROR_CODE_DECODING_FAILED",
+        errorMessage: String = "MediaCodec released by resource manager (DEAD_OBJECT)",
+        resetLivePositionOnIdle: Boolean = true,
+    ) {
+        val posBeforeError = simulatedPositionMs
+        val speedBeforeError = currentSpeedValue
+        idleState = true
+        if (resetLivePositionOnIdle) {
+            simulatedPositionMs = 0L
+        }
+        events += "codecReclaim:$errorCodeName"
+        ClimaGraphicsLifecycleDiagnostics.logExoCodecError(
+            sessionId = sessionId,
+            playerIdentity = identityHash,
+            trackType = "VIDEO",
+            errorClass = "MediaCodecVideoDecoderException",
+            isDeadObject = true,
+            playerState = "IDLE",
+            videoResId = currentVideoResHint,
+            positionMs = posBeforeError,
+            message = errorMessage,
+        )
+        ClimaGraphicsLifecycleDiagnostics.logExoDecoderReleased(
+            sessionId = sessionId,
+            playerIdentity = identityHash,
+            trackType = "VIDEO",
+            decoderName = decoderName,
+            playerState = "IDLE",
+            videoResId = currentVideoResHint,
+            positionMs = posBeforeError,
+        )
+        ClimaGraphicsLifecycleDiagnostics.logExoPlayerError(
+            sessionId = sessionId,
+            playerIdentity = identityHash,
+            errorCodeName = errorCodeName,
+            errorClass = "MediaCodecVideoDecoderException",
+            isDeadObject = true,
+            playerState = "IDLE",
+            videoResId = currentVideoResHint,
+            positionMs = posBeforeError,
+            message = errorMessage,
+        )
+        codecErrorListener?.invoke(
+            com.example.ui.components.WeatherVideoCodecErrorDiagnostic(
+                errorCodeName = errorCodeName,
+                errorClass = "MediaCodecVideoDecoderException",
+                isDeadObjectOrReclaimed = true,
+                positionMsAtError = posBeforeError,
+                playbackSpeedAtError = speedBeforeError,
+                message = errorMessage,
+            ),
+        )
     }
 
     override fun attachToPlayerView(playerView: androidx.media3.ui.PlayerView) {

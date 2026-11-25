@@ -1,7 +1,9 @@
 package com.example.ui.components
 
 import android.content.Context
+import android.media.MediaCodec
 import android.net.Uri
+import android.os.DeadObjectException
 import android.view.LayoutInflater
 import android.view.TextureView
 import android.view.View
@@ -11,6 +13,8 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -26,6 +30,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.ui.PlayerView
 import com.example.R
 import com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics
@@ -40,6 +45,15 @@ internal data class ExoSurfaceSnapshot(
     fun formatted(): String =
         "surfaceView=${surfaceViewClass ?: "none"}, textureAvailable=${textureAvailable ?: "unknown"}, hasSurfaceTexture=${hasSurfaceTexture ?: "unknown"}"
 }
+
+internal data class WeatherVideoCodecErrorDiagnostic(
+    val errorCodeName: String,
+    val errorClass: String,
+    val isDeadObjectOrReclaimed: Boolean,
+    val positionMsAtError: Long,
+    val playbackSpeedAtError: Float,
+    val message: String?,
+)
 
 internal interface WeatherVideoPlayerBridge {
     val sessionId: String
@@ -57,12 +71,14 @@ internal interface WeatherVideoPlayerBridge {
     fun setRepeatMode(repeatMode: Int)
     fun setPlayWhenReady(playWhenReady: Boolean)
     fun setPlaybackSpeed(speed: Float)
+    fun seekTo(positionMs: Long) {}
     fun prepare()
     fun stop()
     fun play()
     fun pause()
     fun clearVideoSurface()
     fun setFirstFrameListener(listener: (() -> Unit)?)
+    fun setCodecErrorListener(listener: ((WeatherVideoCodecErrorDiagnostic) -> Unit)?) {}
     fun attachToPlayerView(playerView: PlayerView)
     fun isAttachedToPlayerView(playerView: PlayerView): Boolean
     fun releaseOnce(): Boolean
@@ -85,6 +101,35 @@ internal interface WeatherVideoSurfaceBridge {
     ): () -> Unit = {}
 }
 
+internal fun isMediaCodecDeadObjectOrReclaimed(throwable: Throwable?): Boolean {
+    var cursor: Throwable? = throwable
+    var depth = 0
+    while (cursor != null && depth < 12) {
+        if (cursor is DeadObjectException) return true
+        if (cursor is MediaCodec.CodecException) {
+            val diag = cursor.diagnosticInfo.orEmpty()
+            val msg = cursor.message.orEmpty()
+            if (diag.contains("DEAD_OBJECT", ignoreCase = true) ||
+                msg.contains("DEAD_OBJECT", ignoreCase = true) ||
+                msg.contains("Released by resource manager", ignoreCase = true) ||
+                cursor.errorCode == MediaCodec.CodecException.ERROR_RECLAIMED
+            ) {
+                return true
+            }
+        }
+        val msg = cursor.message.orEmpty()
+        if (msg.contains("DEAD_OBJECT", ignoreCase = true) ||
+            msg.contains("Released by resource manager", ignoreCase = true) ||
+            msg.contains("ERROR_RECLAIMED", ignoreCase = true)
+        ) {
+            return true
+        }
+        cursor = cursor.cause
+        depth++
+    }
+    return false
+}
+
 private class RealExoPlayerBridge(
     private val exoPlayer: ExoPlayer,
     override val sessionId: String,
@@ -92,8 +137,11 @@ private class RealExoPlayerBridge(
 ) : WeatherVideoPlayerBridge {
     private val releasedFlag = AtomicBoolean(false)
     private var firstFrameCallback: (() -> Unit)? = null
+    private var codecErrorCallback: ((WeatherVideoCodecErrorDiagnostic) -> Unit)? = null
     @Volatile
     private var currentVideoResId: Int = initialVideoResId
+    @Volatile
+    private var lastKnownGoodPositionMs: Long = 0L
     private var firstFrameLoggedForCurrentItem = false
     private var lastPlaybackSignature: Pair<Int, Boolean>? = null
     private var lastSurfaceSize: Pair<Int, Int>? = null
@@ -108,16 +156,35 @@ private class RealExoPlayerBridge(
         get() = !releasedFlag.get() && exoPlayer.playbackState == Player.STATE_IDLE
 
     override val currentPositionMs: Long
-        get() = if (releasedFlag.get()) 0L else runCatching { exoPlayer.currentPosition }.getOrDefault(0L)
+        get() =
+            if (releasedFlag.get()) {
+                0L
+            } else {
+                val livePos = runCatching { exoPlayer.currentPosition.coerceAtLeast(0L) }.getOrDefault(0L)
+                if (livePos > 0L) {
+                    lastKnownGoodPositionMs = livePos
+                    livePos
+                } else {
+                    lastKnownGoodPositionMs
+                }
+            }
 
     override val currentPlaybackSpeed: Float
         get() = if (releasedFlag.get()) 1.0f else runCatching { exoPlayer.playbackParameters.speed }.getOrDefault(1.0f)
+
+    private fun currentPlayerStateLabel(): String =
+        if (releasedFlag.get()) {
+            "RELEASED"
+        } else {
+            runCatching { playbackStateName(exoPlayer.playbackState) }.getOrDefault("UNKNOWN")
+        }
 
     private val lifecycleDiagnosticListener =
         object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (releasedFlag.get()) return
                 val isPlayingNow = exoPlayer.isPlaying
+                val posNow = currentPositionMs
                 val signature = playbackState to isPlayingNow
                 if (lastPlaybackSignature != signature) {
                     lastPlaybackSignature = signature
@@ -127,6 +194,43 @@ private class RealExoPlayerBridge(
                         playbackState = playbackStateName(playbackState),
                         isPlaying = isPlayingNow,
                         videoResId = currentVideoResId,
+                        positionMs = posNow,
+                    )
+                }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (releasedFlag.get()) return
+                val stateNow = exoPlayer.playbackState
+                val posNow = currentPositionMs
+                ClimaGraphicsLifecycleDiagnostics.logExoIsPlayingChanged(
+                    sessionId = sessionId,
+                    playerIdentity = identityHash,
+                    isPlaying = isPlaying,
+                    playerState = playbackStateName(stateNow),
+                    videoResId = currentVideoResId,
+                    positionMs = posNow,
+                )
+            }
+
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                if (releasedFlag.get()) return
+                val reasonName =
+                    when (reason) {
+                        Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT -> "REPEAT"
+                        Player.MEDIA_ITEM_TRANSITION_REASON_AUTO -> "AUTO"
+                        Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> "SEEK"
+                        Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> "PLAYLIST_CHANGED"
+                        else -> "REASON($reason)"
+                    }
+                if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) {
+                    ClimaGraphicsLifecycleDiagnostics.logExoMediaItemTransition(
+                        sessionId = sessionId,
+                        playerIdentity = identityHash,
+                        transitionReason = reasonName,
+                        playerState = currentPlayerStateLabel(),
+                        videoResId = currentVideoResId,
+                        positionMs = currentPositionMs,
                     )
                 }
             }
@@ -147,12 +251,15 @@ private class RealExoPlayerBridge(
 
             override fun onRenderedFirstFrame() {
                 if (releasedFlag.get()) return
+                val posNow = currentPositionMs
                 if (!firstFrameLoggedForCurrentItem) {
                     firstFrameLoggedForCurrentItem = true
                     ClimaGraphicsLifecycleDiagnostics.logExoFirstFrame(
                         sessionId = sessionId,
                         playerIdentity = identityHash,
                         videoResId = currentVideoResId,
+                        positionMs = posNow,
+                        playerState = currentPlayerStateLabel(),
                     )
                 }
                 firstFrameCallback?.invoke()
@@ -160,17 +267,149 @@ private class RealExoPlayerBridge(
 
             override fun onPlayerError(error: PlaybackException) {
                 if (releasedFlag.get()) return
+                val posAtError = currentPositionMs
+                val speedAtError = currentPlaybackSpeed
+                val causeClass = (error.cause ?: error)::class.java.simpleName
+                val deadObject = isMediaCodecDeadObjectOrReclaimed(error)
+                firstFrameLoggedForCurrentItem = false
                 ClimaGraphicsLifecycleDiagnostics.logExoPlayerError(
                     sessionId = sessionId,
                     playerIdentity = identityHash,
                     errorCodeName = error.errorCodeName,
+                    errorClass = causeClass,
+                    isDeadObject = deadObject,
+                    playerState = currentPlayerStateLabel(),
+                    videoResId = currentVideoResId,
+                    positionMs = posAtError,
                     message = error.localizedMessage,
+                )
+                codecErrorCallback?.invoke(
+                    WeatherVideoCodecErrorDiagnostic(
+                        errorCodeName = error.errorCodeName,
+                        errorClass = causeClass,
+                        isDeadObjectOrReclaimed = deadObject,
+                        positionMsAtError = posAtError,
+                        playbackSpeedAtError = speedAtError,
+                        message = error.localizedMessage,
+                    ),
+                )
+            }
+        }
+
+    private val decoderAnalyticsListener =
+        object : AnalyticsListener {
+            override fun onVideoDecoderInitialized(
+                eventTime: AnalyticsListener.EventTime,
+                decoderName: String,
+                initializedTimestampMs: Long,
+                initializationDurationMs: Long,
+            ) {
+                if (releasedFlag.get()) return
+                ClimaGraphicsLifecycleDiagnostics.logExoDecoderInitialized(
+                    sessionId = sessionId,
+                    playerIdentity = identityHash,
+                    trackType = "VIDEO",
+                    decoderName = decoderName,
+                    initDurationMs = initializationDurationMs,
+                    playerState = currentPlayerStateLabel(),
+                    videoResId = currentVideoResId,
+                    positionMs = currentPositionMs,
+                )
+            }
+
+            override fun onVideoDecoderReleased(
+                eventTime: AnalyticsListener.EventTime,
+                decoderName: String,
+            ) {
+                if (releasedFlag.get()) return
+                firstFrameLoggedForCurrentItem = false
+                ClimaGraphicsLifecycleDiagnostics.logExoDecoderReleased(
+                    sessionId = sessionId,
+                    playerIdentity = identityHash,
+                    trackType = "VIDEO",
+                    decoderName = decoderName,
+                    playerState = currentPlayerStateLabel(),
+                    videoResId = currentVideoResId,
+                    positionMs = currentPositionMs,
+                )
+            }
+
+            override fun onVideoCodecError(
+                eventTime: AnalyticsListener.EventTime,
+                videoCodecError: Exception,
+            ) {
+                if (releasedFlag.get()) return
+                firstFrameLoggedForCurrentItem = false
+                ClimaGraphicsLifecycleDiagnostics.logExoCodecError(
+                    sessionId = sessionId,
+                    playerIdentity = identityHash,
+                    trackType = "VIDEO",
+                    errorClass = videoCodecError::class.java.simpleName,
+                    isDeadObject = isMediaCodecDeadObjectOrReclaimed(videoCodecError),
+                    playerState = currentPlayerStateLabel(),
+                    videoResId = currentVideoResId,
+                    positionMs = currentPositionMs,
+                    message = videoCodecError.localizedMessage,
+                )
+            }
+
+            override fun onAudioDecoderInitialized(
+                eventTime: AnalyticsListener.EventTime,
+                decoderName: String,
+                initializedTimestampMs: Long,
+                initializationDurationMs: Long,
+            ) {
+                if (releasedFlag.get()) return
+                ClimaGraphicsLifecycleDiagnostics.logExoDecoderInitialized(
+                    sessionId = sessionId,
+                    playerIdentity = identityHash,
+                    trackType = "AUDIO",
+                    decoderName = decoderName,
+                    initDurationMs = initializationDurationMs,
+                    playerState = currentPlayerStateLabel(),
+                    videoResId = currentVideoResId,
+                    positionMs = currentPositionMs,
+                )
+            }
+
+            override fun onAudioDecoderReleased(
+                eventTime: AnalyticsListener.EventTime,
+                decoderName: String,
+            ) {
+                if (releasedFlag.get()) return
+                ClimaGraphicsLifecycleDiagnostics.logExoDecoderReleased(
+                    sessionId = sessionId,
+                    playerIdentity = identityHash,
+                    trackType = "AUDIO",
+                    decoderName = decoderName,
+                    playerState = currentPlayerStateLabel(),
+                    videoResId = currentVideoResId,
+                    positionMs = currentPositionMs,
+                )
+            }
+
+            override fun onAudioCodecError(
+                eventTime: AnalyticsListener.EventTime,
+                audioCodecError: Exception,
+            ) {
+                if (releasedFlag.get()) return
+                ClimaGraphicsLifecycleDiagnostics.logExoCodecError(
+                    sessionId = sessionId,
+                    playerIdentity = identityHash,
+                    trackType = "AUDIO",
+                    errorClass = audioCodecError::class.java.simpleName,
+                    isDeadObject = isMediaCodecDeadObjectOrReclaimed(audioCodecError),
+                    playerState = currentPlayerStateLabel(),
+                    videoResId = currentVideoResId,
+                    positionMs = currentPositionMs,
+                    message = audioCodecError.localizedMessage,
                 )
             }
         }
 
     init {
         exoPlayer.addListener(lifecycleDiagnosticListener)
+        exoPlayer.addAnalyticsListener(decoderAnalyticsListener)
     }
 
     override fun setVideoResIdHint(resId: Int) {
@@ -180,6 +419,7 @@ private class RealExoPlayerBridge(
     override fun setMediaItem(uri: Uri) {
         if (releasedFlag.get()) return
         firstFrameLoggedForCurrentItem = false
+        lastKnownGoodPositionMs = 0L
         exoPlayer.setMediaItem(MediaItem.fromUri(uri))
     }
 
@@ -203,6 +443,13 @@ private class RealExoPlayerBridge(
         exoPlayer.playbackParameters = PlaybackParameters(speed)
     }
 
+    override fun seekTo(positionMs: Long) {
+        if (releasedFlag.get()) return
+        val clampedPos = positionMs.coerceAtLeast(0L)
+        lastKnownGoodPositionMs = clampedPos
+        runCatching { exoPlayer.seekTo(clampedPos) }
+    }
+
     override fun prepare() {
         if (releasedFlag.get()) return
         exoPlayer.prepare()
@@ -220,16 +467,28 @@ private class RealExoPlayerBridge(
 
     override fun pause() {
         if (releasedFlag.get()) return
+        val livePos = runCatching { exoPlayer.currentPosition.coerceAtLeast(0L) }.getOrDefault(0L)
+        if (livePos > 0L) {
+            lastKnownGoodPositionMs = livePos
+        }
         exoPlayer.pause()
     }
 
     override fun clearVideoSurface() {
         if (releasedFlag.get()) return
+        val livePos = runCatching { exoPlayer.currentPosition.coerceAtLeast(0L) }.getOrDefault(0L)
+        if (livePos > 0L) {
+            lastKnownGoodPositionMs = livePos
+        }
         runCatching { exoPlayer.clearVideoSurface() }
     }
 
     override fun setFirstFrameListener(listener: (() -> Unit)?) {
         firstFrameCallback = listener
+    }
+
+    override fun setCodecErrorListener(listener: ((WeatherVideoCodecErrorDiagnostic) -> Unit)?) {
+        codecErrorCallback = listener
     }
 
     override fun attachToPlayerView(playerView: PlayerView) {
@@ -243,6 +502,8 @@ private class RealExoPlayerBridge(
     override fun releaseOnce(): Boolean {
         if (!releasedFlag.compareAndSet(false, true)) return false
         firstFrameCallback = null
+        codecErrorCallback = null
+        runCatching { exoPlayer.removeAnalyticsListener(decoderAnalyticsListener) }
         runCatching { exoPlayer.removeListener(lifecycleDiagnosticListener) }
         exoPlayer.release()
         return true
@@ -393,6 +654,12 @@ internal fun WeatherVideoBackgroundImpl(
     var lastAppliedPlayState by remember(playerHandle) { mutableStateOf<Boolean?>(null) }
     var videoSurfaceClearedForMap by remember(playerHandle) { mutableStateOf(false) }
     var pendingReattachRequestLogged by remember(playerHandle) { mutableStateOf(false) }
+    var needsCodecRecovery by remember(playerHandle) { mutableStateOf(false) }
+    var recoverySavedPositionMs by remember(playerHandle) { mutableLongStateOf(0L) }
+    var recoverySavedSpeed by remember(playerHandle) { mutableStateOf<Float?>(null) }
+    var lastCodecErrorCode by remember(playerHandle) { mutableStateOf("NONE") }
+    var codecRecoveryEpoch by remember(playerHandle) { mutableIntStateOf(0) }
+    var consecutiveUnrenderedRecoveryCount by remember(playerHandle) { mutableIntStateOf(0) }
 
     // Effective exclusivity: when mounted via WeatherBackgroundLayer (or when allowVideoSurfaceOutput
     // is false / map exclusivity is active), video output only attaches when allowed AND no MapView
@@ -429,13 +696,40 @@ internal fun WeatherVideoBackgroundImpl(
             return
         }
         val bridge = surfaceBridgeRef
-        if (bridge != null && bridge.isPlayerAttached(playerHandle) && lastAppliedPlayState != true) {
-            lastAppliedPlayState = true
-            playerHandle.setPlayWhenReady(true)
-            if (playerHandle.isIdle) {
+        if (bridge != null && bridge.isPlayerAttached(playerHandle)) {
+            if (needsCodecRecovery) {
+                val targetSpeed = (recoverySavedSpeed ?: appliedSpeed ?: playbackSpeed).coerceIn(0.25f, 2.0f)
+                val targetPosMs = maxOf(recoverySavedPositionMs, playerHandle.currentPositionMs)
+                if (appliedSpeed != targetSpeed || playerHandle.currentPlaybackSpeed != targetSpeed) {
+                    playerHandle.setPlaybackSpeed(targetSpeed)
+                    appliedSpeed = targetSpeed
+                }
+                if (targetPosMs > 0L && playerHandle.currentPositionMs != targetPosMs) {
+                    playerHandle.seekTo(targetPosMs)
+                }
+                needsCodecRecovery = false
+                lastAppliedPlayState = true
+                ClimaGraphicsLifecycleDiagnostics.logExoRecoveryAction(
+                    sessionId = playerHandle.sessionId,
+                    playerIdentity = playerHandle.identityHash,
+                    action = "RECOVER_PREPARE",
+                    reason = "codec_error_$lastCodecErrorCode",
+                    videoResId = appliedVideoResId ?: videoResId,
+                    positionMs = targetPosMs,
+                    playbackSpeed = targetSpeed,
+                )
+                playerHandle.setPlayWhenReady(true)
                 playerHandle.prepare()
-            } else {
-                playerHandle.play()
+                return
+            }
+            if (lastAppliedPlayState != true) {
+                lastAppliedPlayState = true
+                playerHandle.setPlayWhenReady(true)
+                if (playerHandle.isIdle) {
+                    playerHandle.prepare()
+                } else {
+                    playerHandle.play()
+                }
             }
         }
     }
@@ -533,6 +827,9 @@ internal fun WeatherVideoBackgroundImpl(
             playerHandle.stop()
         }
         val playNow = latestIsPlaying && latestCanAttachVideoSurfaceNow
+        needsCodecRecovery = false
+        recoverySavedPositionMs = 0L
+        consecutiveUnrenderedRecoveryCount = 0
         playerHandle.setVideoResIdHint(videoResId)
         playerHandle.setMediaItem(uri)
         playerHandle.setVolume(0f)
@@ -549,6 +846,7 @@ internal fun WeatherVideoBackgroundImpl(
         if (appliedSpeed != clamped) {
             playerHandle.setPlaybackSpeed(clamped)
             appliedSpeed = clamped
+            recoverySavedSpeed = clamped
         }
     }
 
@@ -567,7 +865,7 @@ internal fun WeatherVideoBackgroundImpl(
         }
     }
 
-    LaunchedEffect(playerHandle, isPlaying, canAttachVideoSurfaceNow) {
+    LaunchedEffect(playerHandle, isPlaying, canAttachVideoSurfaceNow, codecRecoveryEpoch) {
         if (playerHandle.isReleased) return@LaunchedEffect
         resumePlayerIfEligible()
     }
@@ -603,10 +901,46 @@ internal fun WeatherVideoBackgroundImpl(
 
     DisposableEffect(playerHandle) {
         playerHandle.setFirstFrameListener {
+            consecutiveUnrenderedRecoveryCount = 0
             latestOnFirstFrame()
+        }
+        playerHandle.setCodecErrorListener { diagnostic ->
+            if (playerHandle.isReleased) return@setCodecErrorListener
+            val posToSave = maxOf(diagnostic.positionMsAtError, playerHandle.currentPositionMs)
+            val speedToSave =
+                (appliedSpeed ?: diagnostic.playbackSpeedAtError.takeIf { it > 0f } ?: playbackSpeed)
+                    .coerceIn(0.25f, 2.0f)
+            recoverySavedPositionMs = posToSave
+            recoverySavedSpeed = speedToSave
+            lastCodecErrorCode = diagnostic.errorCodeName
+            lastAppliedPlayState = false
+            if (!latestCanAttachVideoSurfaceNow || !latestIsPlaying || !isLifecycleStarted()) {
+                needsCodecRecovery = true
+                consecutiveUnrenderedRecoveryCount = 0
+                val deferReason =
+                    when {
+                        !latestCanAttachVideoSurfaceNow -> "map_surface_active_or_disposing"
+                        !isLifecycleStarted() -> "activity_not_started"
+                        else -> "playback_paused"
+                    }
+                ClimaGraphicsLifecycleDiagnostics.logExoRecoveryAction(
+                    sessionId = playerHandle.sessionId,
+                    playerIdentity = playerHandle.identityHash,
+                    action = "DEFERRED",
+                    reason = deferReason,
+                    videoResId = appliedVideoResId ?: videoResId,
+                    positionMs = posToSave,
+                    playbackSpeed = speedToSave,
+                )
+            } else if (consecutiveUnrenderedRecoveryCount < 2) {
+                consecutiveUnrenderedRecoveryCount++
+                needsCodecRecovery = true
+                codecRecoveryEpoch++
+            }
         }
         onDispose {
             playerHandle.setFirstFrameListener(null)
+            playerHandle.setCodecErrorListener(null)
             detachWindowObserverRef?.invoke()
             detachWindowObserverRef = null
             surfaceBridgeRef?.let { bridge ->
