@@ -657,8 +657,11 @@ internal fun CityMapLibreViewImpl(
     }
     var attemptKey by remember { mutableIntStateOf(stateMachine.attemptId) }
 
-    fun applyCitiesStyle(map: MapLibreControllerPort) {
-        if (sessionDisposedRef.get()) return
+    fun applyCitiesStyle(
+        map: MapLibreControllerPort,
+        isSessionCurrent: () -> Boolean = { !sessionDisposedRef.get() && mapLibreMapRef === map },
+    ) {
+        if (!isSessionCurrent()) return
         val onlineNow = latestIsOnline
         loadedStyleRef = null
         loadState = stateMachine.beginAttempt(
@@ -683,7 +686,7 @@ internal fun CityMapLibreViewImpl(
                     selectedMarkerGeoJson = latestSelectedMarkerJson,
                 ),
             ) { style ->
-                if (sessionDisposedRef.get()) return@setStyle
+                if (!isSessionCurrent()) return@setStyle
                 loadedStyleRef = style
                 loadState = stateMachine.onStyleLoaded()
                 ClimaMapLogger.i(
@@ -692,7 +695,7 @@ internal fun CityMapLibreViewImpl(
                 )
             }
         }.onFailure { err ->
-            if (sessionDisposedRef.get()) return@onFailure
+            if (!isSessionCurrent()) return@onFailure
             val msg = "Erro ao aplicar estilo do Mapa de Cidades: ${err.message ?: err.javaClass.simpleName}"
             ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, msg, err)
             loadState = stateMachine.onStyleFailed(msg, isOnline = latestIsOnline)
@@ -775,6 +778,7 @@ internal fun CityMapLibreViewImpl(
     Box(modifier = modifier.fillMaxSize()) {
         key(viewRecreationNonce) {
             var sessionHolder by remember { mutableStateOf<MapViewSessionHandle?>(null) }
+            val localSessionDisposed = remember { AtomicBoolean(false) }
 
             DisposableEffect(lifecycleOwner, context) {
                 val observer =
@@ -797,13 +801,19 @@ internal fun CityMapLibreViewImpl(
                 lifecycleOwner.lifecycle.addObserver(observer)
                 context.applicationContext?.registerComponentCallbacks(lowMemoryCallbacks)
                 onDispose {
-                    sessionDisposedRef.set(true)
+                    localSessionDisposed.set(true)
                     lifecycleOwner.lifecycle.removeObserver(observer)
                     context.applicationContext?.unregisterComponentCallbacks(lowMemoryCallbacks)
-                    sessionHolder?.pauseAndStopBeforeDetach("onDispose")
-                    mapViewRef = null
-                    mapLibreMapRef = null
-                    loadedStyleRef = null
+                    val holder = sessionHolder
+                    if (holder == null || mapViewRef === holder.surfacePort) {
+                        sessionDisposedRef.set(true)
+                    }
+                    holder?.pauseAndStopBeforeDetach("onDispose")
+                    if (holder != null && mapViewRef === holder.surfacePort) {
+                        mapViewRef = null
+                        mapLibreMapRef = null
+                        loadedStyleRef = null
+                    }
                 }
             }
 
@@ -812,6 +822,12 @@ internal fun CityMapLibreViewImpl(
                 factory = { viewContext ->
                     val sessionId = ClimaGraphicsLifecycleDiagnostics.nextSessionId("cities_map")
                     val port = surfacePortFactory?.invoke(viewContext) ?: RealMapViewSurfacePort(viewContext)
+                    var sessionMapController: MapLibreControllerPort? = null
+                    fun isThisSessionCurrent(): Boolean =
+                        !localSessionDisposed.get() &&
+                            mapViewRef === port &&
+                            (sessionHolder == null || sessionHolder?.isSessionActive == true)
+
                     ClimaMapLogger.i(
                         ClimaMapLogTags.MAP_RENDER,
                         "Criando MapView de Cidades (TextureView, OpenGL ES, tentativa=${viewRecreationNonce + 1}).",
@@ -866,21 +882,24 @@ internal fun CityMapLibreViewImpl(
                         port.attachListeners(
                             MapSurfaceCallbacks(
                                 onWillStartLoading = {
+                                    if (!isThisSessionCurrent()) return@MapSurfaceCallbacks
                                     ClimaMapLogger.i(ClimaMapLogTags.MAP_STYLE, "MapView Cidades iniciou carregamento do mapa.")
                                 },
                                 onDidFinishLoadingStyle = {
+                                    if (!isThisSessionCurrent()) return@MapSurfaceCallbacks
                                     ClimaMapLogger.i(
                                         ClimaMapLogTags.MAP_STYLE,
                                         "Callback onDidFinishLoadingStyle disparado (Cidades, ${stateMachine.elapsedMs()}ms).",
                                     )
                                 },
                                 onDidFinishLoadingMap = {
+                                    if (!isThisSessionCurrent()) return@MapSurfaceCallbacks
                                     ClimaMapLogger.i(
                                         ClimaMapLogTags.MAP_RENDER,
                                         "onDidFinishLoadingMap disparado (Cidades, ${stateMachine.elapsedMs()}ms).",
                                     )
                                     port.postToUi {
-                                        if (sessionDisposedRef.get()) return@postToUi
+                                        if (!isThisSessionCurrent()) return@postToUi
                                         loadState = stateMachine.onMapLoadedCallback(
                                             TileTransportDiagnostics.snapshot.value,
                                             latestIsOnline,
@@ -888,14 +907,16 @@ internal fun CityMapLibreViewImpl(
                                     }
                                 },
                                 onDidFailLoadingMap = { errorMessage ->
+                                    if (!isThisSessionCurrent()) return@MapSurfaceCallbacks
                                     val reason = errorMessage.ifBlank { "Erro ao carregar mapa-base OpenStreetMap." }
                                     ClimaMapLogger.e(ClimaMapLogTags.MAP_STYLE, "Falha no estilo/mapa Cidades: $reason")
                                     port.postToUi {
-                                        if (sessionDisposedRef.get()) return@postToUi
+                                        if (!isThisSessionCurrent()) return@postToUi
                                         loadState = stateMachine.onStyleFailed(reason, isOnline = latestIsOnline)
                                     }
                                 },
                                 onWillStartRenderingMap = {
+                                    if (!isThisSessionCurrent()) return@MapSurfaceCallbacks
                                     stateMachine.updateSurfaceDiagnostics(port.inspectSurfaceInfo())
                                     ClimaMapLogger.i(
                                         ClimaMapLogTags.MAP_RENDER,
@@ -903,18 +924,20 @@ internal fun CityMapLibreViewImpl(
                                     )
                                 },
                                 onFirstFrameRendered = {
+                                    if (!isThisSessionCurrent()) return@MapSurfaceCallbacks
                                     if (firstFrameLogged.compareAndSet(false, true)) {
                                         ClimaMapLogger.i(
                                             ClimaMapLogTags.MAP_RENDER,
                                             "Primeiro quadro do MapView de Cidades renderizado em ${stateMachine.elapsedMs()}ms.",
                                         )
                                         port.postToUi {
-                                            if (sessionDisposedRef.get()) return@postToUi
+                                            if (!isThisSessionCurrent()) return@postToUi
                                             loadState = stateMachine.onFirstFrameRendered(TileTransportDiagnostics.snapshot.value)
                                         }
                                     }
                                 },
                                 onDidFinishRenderingMap = { fully ->
+                                    if (!isThisSessionCurrent()) return@MapSurfaceCallbacks
                                     if (fully && fullyRenderedLogged.compareAndSet(false, true)) {
                                         ClimaMapLogger.i(
                                             ClimaMapLogTags.MAP_RENDER,
@@ -922,7 +945,7 @@ internal fun CityMapLibreViewImpl(
                                         )
                                     }
                                     port.postToUi {
-                                        if (sessionDisposedRef.get()) return@postToUi
+                                        if (!isThisSessionCurrent()) return@postToUi
                                         loadState = stateMachine.onMapFinishedRendering(
                                             fully = fully,
                                             tileSnapshot = TileTransportDiagnostics.snapshot.value,
@@ -930,9 +953,10 @@ internal fun CityMapLibreViewImpl(
                                     }
                                 },
                                 onRenderError = { reason ->
+                                    if (!isThisSessionCurrent()) return@MapSurfaceCallbacks
                                     ClimaMapLogger.e(ClimaMapLogTags.MAP_RENDER, "Erro nativo de renderização no MapView de Cidades.")
                                     port.postToUi {
-                                        if (sessionDisposedRef.get()) return@postToUi
+                                        if (!isThisSessionCurrent()) return@postToUi
                                         loadState = stateMachine.onRenderError(reason)
                                     }
                                 },
@@ -948,14 +972,16 @@ internal fun CityMapLibreViewImpl(
                             onDetachListeners = detachListeners,
                             onDetachWindowObserver = detachWindowObserver,
                             onCancelTransitions = {
-                                mapLibreMapRef?.cancelTransitions()
-                                mapLibreMapRef?.clearMapListeners()
+                                sessionMapController?.cancelTransitions()
+                                sessionMapController?.clearMapListeners()
                             },
                         )
                     mapViewRef = port
+                    sessionDisposedRef.set(false)
 
                     port.getMapAsync { map ->
-                        if (sessionDisposedRef.get()) return@getMapAsync
+                        if (!isThisSessionCurrent()) return@getMapAsync
+                        sessionMapController = map
                         mapLibreMapRef = map
                         stateMachine.updateSurfaceDiagnostics(port.inspectSurfaceInfo())
                         loadState = stateMachine.onMapReady(latestIsOnline)
@@ -973,27 +999,32 @@ internal fun CityMapLibreViewImpl(
                             zoom = initialCamera.zoom,
                         )
 
-                        applyCitiesStyle(map)
+                        applyCitiesStyle(map, ::isThisSessionCurrent)
 
                         map.setOnMapClick { coord ->
-                            if (sessionDisposedRef.get()) return@setOnMapClick
+                            if (!isThisSessionCurrent()) return@setOnMapClick
                             latestOnMapTap(coord)
                         }
 
                         map.setOnCameraIdle { coord, settledZoom ->
-                            if (sessionDisposedRef.get()) return@setOnCameraIdle
+                            if (!isThisSessionCurrent()) return@setOnCameraIdle
                             latestOnCameraSettled(coord, settledZoom)
                         }
                     }
                     port.androidView
                 },
                 onRelease = {
-                    sessionDisposedRef.set(true)
-                    sessionHolder?.destroyOnceAfterDetach()
-                    sessionHolder = null
-                    mapViewRef = null
-                    mapLibreMapRef = null
-                    loadedStyleRef = null
+                    localSessionDisposed.set(true)
+                    val holder = sessionHolder
+                    if (holder == null || mapViewRef === holder.surfacePort) {
+                        sessionDisposedRef.set(true)
+                    }
+                    holder?.destroyOnceAfterDetach()
+                    if (holder != null && mapViewRef === holder.surfacePort) {
+                        mapViewRef = null
+                        mapLibreMapRef = null
+                        loadedStyleRef = null
+                    }
                     ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "MapView de Cidades destruído e listeners removidos.")
                 },
             )

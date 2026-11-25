@@ -357,6 +357,9 @@ internal class MapViewSessionHandle(
     private val pausedAndStopped = AtomicBoolean(false)
     private val destroyed = AtomicBoolean(false)
 
+    val isSessionActive: Boolean
+        get() = !pausedAndStopped.get() && !destroyed.get()
+
     init {
         com.example.diagnostics.GraphicsSurfaceCoordinator.onMapSurfaceCreated(
             screen = screenName,

@@ -3111,6 +3111,553 @@ class SurfaceAndLifecycleAuditTest {
         assertEquals(1f, observedVideoAlpha, 0.001f)
     }
 
+    // 57. Etapa 3O (5 #1, #2): Callback de primeiro frame pertencente a geração antiga ou recebido após desanexação da superfície (mesmo durante VIDEO_PREPARING/WAITING_FIRST_FRAME) é rejeitado com diagnóstico explícito
+    @Test
+    fun `test_57_etapa3o_first_frame_callback_after_surface_detach_during_initial_preparing_and_old_decoder_generation_are_rejected`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.SOL,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        // Do NOT auto-emit first frame on initial prepare: stay in VIDEO_WAITING_FIRST_FRAME
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = false).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        val surface = surfaces.single()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+        val epochBeforeDetach = player.surfaceEpoch
+
+        // 1. Detach surface while still waiting for the very first frame (hasValidRenderedFrame == false)
+        composeTestRule.runOnUiThread {
+            surface.emitSurfaceAvailability(attached = false, textureAvailable = false, hasSurfaceTexture = false)
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+
+        // 2. Callback arrives after surface detachment -> MUST be rejected even with current epoch or old epoch
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRenderedWithToken(
+                com.example.ui.components.WeatherVideoFrameToken(
+                    sessionId = player.sessionId,
+                    playerIdentity = player.identityHash,
+                    videoResId = R.raw.wx_bg_sun_day,
+                    decoderGeneration = player.decoderGeneration,
+                    surfaceEpoch = epochBeforeDetach,
+                    surfaceViewIdentity = surface.viewIdentity,
+                    decoderAlive = true,
+                ),
+            )
+            player.emitFirstFrameRendered()
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("First frame callback while surface is detached must be rejected", 0f, observedVideoAlpha, 0.001f)
+
+        // 3. Reattach surface, advance decoder to generation 2, and fire a stale callback for generation 1
+        composeTestRule.runOnUiThread {
+            surface.emitSurfaceAvailability(attached = true, textureAvailable = true, hasSurfaceTexture = true)
+            player.prepare() // advances decoderGeneration to 2
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(2, player.decoderGeneration)
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRenderedWithToken(
+                com.example.ui.components.WeatherVideoFrameToken(
+                    sessionId = player.sessionId,
+                    playerIdentity = player.identityHash,
+                    videoResId = R.raw.wx_bg_sun_day,
+                    decoderGeneration = 1, // old generation
+                    surfaceEpoch = player.surfaceEpoch,
+                    surfaceViewIdentity = surface.viewIdentity,
+                    decoderAlive = true,
+                ),
+            )
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Stale callback from decoderGeneration=1 must be rejected", 0f, observedVideoAlpha, 0.001f)
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(
+            "Expected BACKGROUND_VIDEO_STALE_FRAME_REJECTED for detached surface",
+            logs.any { it.contains("BACKGROUND_VIDEO_STALE_FRAME_REJECTED") && it.contains("stale_or_detached_surface_epoch") },
+        )
+        assertTrue(
+            "Expected BACKGROUND_VIDEO_STALE_FRAME_REJECTED for old decoder generation",
+            logs.any { it.contains("BACKGROUND_VIDEO_STALE_FRAME_REJECTED") && it.contains("stale_decoder_gen_1_expected_2") },
+        )
+
+        // 4. Valid first frame for generation 2 on attached surface succeeds
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRendered()
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+    }
+
+    // 58. Etapa 3O (2, 3, 5 #3, #5): Erro de codec antes de onPlayerError invalida imediatamente o frame, bloqueia callbacks tardios na janela intermediária e recupera preservando posição e velocidade
+    @Test
+    fun `test_58_etapa3o_codec_error_before_on_player_error_immediately_blocks_frames_and_recovers_preserving_position_and_speed`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.CHUVA_FRACA, // 0.85x speed
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        val surface = surfaces.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+        assertEquals(0.85f, player.currentPlaybackSpeed, 0.001f)
+
+        // Advance playback position to 4320ms
+        player.simulatedPositionMs = 4320L
+        player.autoFirstFrameOnPrepare = false
+
+        // Step 1: Fire AnalyticsListener.onVideoCodecError BEFORE Player.Listener.onPlayerError
+        composeTestRule.runOnUiThread {
+            player.simulateVideoCodecFaultBeforePlayerError()
+        }
+        composeTestRule.waitForIdle()
+
+        // Must immediately clamp videoAlpha to 0f and enter VIDEO_RECOVERING before onPlayerError arrives
+        assertEquals("onVideoCodecError must hide video immediately before onPlayerError", 0f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+
+        // Step 2: Inject a queued onRenderedFirstFrame callback in the gap between onVideoCodecError and onPlayerError
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRenderedWithToken(
+                com.example.ui.components.WeatherVideoFrameToken(
+                    sessionId = player.sessionId,
+                    playerIdentity = player.identityHash,
+                    videoResId = WeatherCondition.CHUVA_FRACA.backgroundVideo.rawRes,
+                    decoderGeneration = 1,
+                    surfaceEpoch = player.surfaceEpoch,
+                    surfaceViewIdentity = surface.viewIdentity,
+                    decoderAlive = true,
+                ),
+            )
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Queued frame in gap between onVideoCodecError and onPlayerError must be blocked", 0f, observedVideoAlpha, 0.001f)
+
+        // Step 3: Now Player.Listener.onPlayerError arrives (ERROR_RECLAIMED), triggering recovery on the SAME player
+        composeTestRule.runOnUiThread {
+            player.simulateFatalMediaCodecReclaim(
+                decoderName = "c2.android.avc.decoder",
+                errorCodeName = "ERROR_CODE_DECODING_FAILED",
+                errorMessage = "MediaCodec released by resource manager",
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals("Same ExoPlayer instance must be preserved", 1, players.size)
+        assertEquals("Recovery must seek back to saved position 4320ms", 4320L, player.seekHistory.last())
+        assertEquals("Recovery must preserve 0.85x speed", 0.85f, player.currentPlaybackSpeed, 0.001f)
+        assertEquals("Video must remain hidden (0f) until new decoder generation renders its first frame", 0f, observedVideoAlpha, 0.001f)
+
+        // Step 4: Emit valid first frame for recovered decoder generation 2
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRendered()
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+    }
+
+    // 59. Etapa 3O (3, 5 #6): Falha definitiva do decoder após o limite de 2 tentativas mantém o wallpaper estático visível sem loop infinito
+    @Test
+    fun `test_59_etapa3o_definitive_codec_failure_after_retry_limit_keeps_static_wallpaper_without_infinite_loop`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.TEMPESTADE,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+        assertEquals(1, player.prepareCalls)
+
+        // Subsequent recovery prepare() calls fail to produce a first frame and fault again
+        player.autoFirstFrameOnPrepare = false
+
+        // Failure #1 -> recovery attempt #1 (prepareCalls becomes 2)
+        composeTestRule.runOnUiThread {
+            player.simulateVideoCodecFaultBeforePlayerError()
+            player.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_1")
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+        assertEquals(2, player.prepareCalls)
+
+        // Failure #2 -> recovery attempt #2 (prepareCalls becomes 3)
+        composeTestRule.runOnUiThread {
+            player.simulateVideoCodecFaultBeforePlayerError()
+            player.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_2")
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+        assertEquals(3, player.prepareCalls)
+
+        // Failure #3 -> recovery budget (2 attempts) exhausted! Must NOT call prepare() again
+        composeTestRule.runOnUiThread {
+            player.simulateVideoCodecFaultBeforePlayerError()
+            player.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_3")
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Recovery must stop after 2 consecutive unrendered attempts (no infinite loop)", 3, player.prepareCalls)
+        assertEquals("Video must stay hidden at 0f on definitive failure", 0f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(
+            "Expected BACKGROUND_VIDEO_RECOVERY_FAILED milestone",
+            logs.any { it.contains("BACKGROUND_VIDEO_RECOVERY_FAILED") && it.contains("exhausted_after_2_attempts") },
+        )
+    }
+
+    // 60. Etapa 3O (4, 5 #4, #8): Troca rápida entre Início, Radar e Cidades respeita a ordem de 7 passos das superfícies e bloqueia reanexação do vídeo antes da liberação total do mapa
+    @Test
+    fun `test_60_etapa3o_rapid_tab_switching_home_radar_cities_enforces_7_step_surface_order_and_blocks_video_reattach_before_map_release`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val radarPorts = mutableListOf<FakeMapViewSurfacePort>()
+        val cityPorts = mutableListOf<FakeMapViewSurfacePort>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = {
+                            FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                        },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                        onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                    )
+                    if (activeTab == ClimaTab.RADAR) {
+                        RadarMapLibreViewImpl(
+                            center = CityMapCoordinate(-23.55, -46.63),
+                            zoom = 6.0,
+                            activeFrame = sampleRadarFrame(1700000000L),
+                            layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                            maxRadarZoom = 7,
+                            surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { radarPorts += it } },
+                        )
+                    } else if (activeTab == ClimaTab.CITIES) {
+                        CityMapLibreViewImpl(
+                            state = CityMapUiState(),
+                            onMapTap = {},
+                            onCameraGestureSettled = { _, _ -> },
+                            surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx).also { cityPorts += it } },
+                        )
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+
+        // Rapid tab switch: HOME -> RADAR -> CITIES -> RADAR -> HOME
+        ClimaGraphicsLifecycleDiagnostics.clearForTest()
+        GraphicsSurfaceCoordinator.onVideoOutputReattached(
+            sessionId = player.sessionId,
+            playerIdentity = player.identityHash,
+            viewIdentity = 101,
+        )
+
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.RADAR }
+        composeTestRule.waitForIdle()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+        assertEquals(1, radarPorts.size)
+        radarPorts.last().emitAttach(true)
+
+        // Verify that before returning to HOME, if a map session is still disposing (Step 4 in progress, Step 6 not yet done),
+        // video reattachment is strictly blocked (Item 5 #8)
+        GraphicsSurfaceCoordinator.onMapSurfaceCreated(
+            screen = "HoldDisposing",
+            sessionId = "hold-map-disposing",
+            viewIdentity = 9999,
+        )
+        GraphicsSurfaceCoordinator.onMapSurfaceDisposing(
+            screen = "HoldDisposing",
+            sessionId = "hold-map-disposing",
+            viewIdentity = 9999,
+            stage = "onDispose",
+        )
+
+        composeTestRule.runOnUiThread {
+            radarPorts.last().emitAttach(false)
+            activeTab = ClimaTab.HOME
+        }
+        composeTestRule.waitForIdle()
+
+        // Because "hold-map-disposing" has not completed Step 6 (onMapSurfaceDetached), video output MUST NOT reattach yet!
+        assertFalse(GraphicsSurfaceCoordinator.state.value.canAttachVideoOutput)
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED, GraphicsSurfaceCoordinator.state.value.videoState)
+        assertEquals("Video must remain hidden (0f) while map surface is still disposing", 0f, observedVideoAlpha, 0.001f)
+
+        // Now complete Step 6 for "hold-map-disposing" -> video immediately reattaches (Step 7) and renders first frame
+        composeTestRule.runOnUiThread {
+            GraphicsSurfaceCoordinator.onMapSurfaceDetached(
+                screen = "HoldDisposing",
+                sessionId = "hold-map-disposing",
+                viewIdentity = 9999,
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        assertTrue(GraphicsSurfaceCoordinator.state.value.canAttachVideoOutput)
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, GraphicsSurfaceCoordinator.state.value.videoState)
+        assertEquals("Same ExoPlayer instance must be preserved across rapid tab switching", 1, players.size)
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+
+        // Verify the 7-step lifecycle ordering in diagnostics logs:
+        // 1. VIDEO_OUTPUT_DETACH_FOR_MAP -> 2. EXO_SURFACE_CLEAR / VIDEO_OUTPUT_DETACHED ->
+        // 3. MAP_CREATE / MAP_SURFACE_CREATED -> 4. MAP_DISPOSE_REQ / MAP_SURFACE_DISPOSING ->
+        // 5. MAP_VIEW_DETACH -> 6. MAP_DESTROYED / MAP_SURFACE_DETACHED -> 7. VIDEO_OUTPUT_REATTACHED
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        val idxStep1 = logs.indexOfFirst { it.contains("VIDEO_OUTPUT_DETACH_FOR_MAP") }
+        val idxStep2 = logs.indexOfFirst { it.contains("EXO_SURFACE_CLEAR") }
+        val idxStep3 = logs.indexOfFirst { it.contains("MAP_SURFACE_CREATED screen=Radar") }
+        val idxStep4 = logs.indexOfFirst { it.contains("MAP_SURFACE_DISPOSING screen=Radar") }
+        val idxStep5 = logs.indexOfFirst { it.contains("MAP_VIEW_DETACH screen=Radar") }
+        val idxStep6 = logs.indexOfFirst { it.contains("MAP_DESTROYED screen=Radar") }
+        val idxStep7 = logs.indexOfLast { it.contains("VIDEO_OUTPUT_REATTACHED") }
+
+        assertTrue("Step 1 (VIDEO_OUTPUT_DETACH_FOR_MAP) must occur", idxStep1 >= 0)
+        assertTrue("Step 2 (EXO_SURFACE_CLEAR) must follow Step 1", idxStep2 > idxStep1)
+        assertTrue("Step 3 (MAP_SURFACE_CREATED) must follow Step 2", idxStep3 > idxStep2)
+        assertTrue("Step 4 (MAP_SURFACE_DISPOSING) must follow Step 3", idxStep4 > idxStep3)
+        assertTrue("Step 5 (MAP_VIEW_DETACH) must occur before Step 6", idxStep5 in (idxStep3 + 1) until idxStep6)
+        assertTrue("Step 6 (MAP_DESTROYED) must follow Step 4", idxStep6 > idxStep4)
+        assertTrue("Step 7 (VIDEO_OUTPUT_REATTACHED) must follow Step 6", idxStep7 > idxStep6)
+    }
+
+    // 61. Etapa 3O (4 #6, 5 #7): Destruição duplicada de MapView é idempotente e destrói a instância nativa exatamente uma única vez
+    @Test
+    fun `test_61_etapa3o_duplicate_map_view_destruction_is_idempotent_and_destroys_instance_only_once`() {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<Context>()
+        val port = FakeMapViewSurfacePort(context)
+        var cancelTransitionsCount = 0
+        val controller =
+            MapViewLifecycleController(
+                onCreate = { port.onCreate() },
+                onStart = { port.onStart() },
+                onResume = { port.onResume() },
+                onPause = { port.onPause() },
+                onStop = { port.onStop() },
+                onDestroy = { port.onDestroy() },
+                onLowMemory = { port.onLowMemory() },
+            )
+        controller.syncToLifecycleState(Lifecycle.State.RESUMED)
+        assertEquals(1, port.createCount)
+        assertEquals(1, port.startCount)
+        assertEquals(1, port.resumeCount)
+
+        val detachListeners = port.attachListeners(
+            MapSurfaceCallbacks(
+                onWillStartLoading = {},
+                onDidFinishLoadingStyle = {},
+                onDidFinishLoadingMap = {},
+                onDidFailLoadingMap = {},
+                onWillStartRenderingMap = {},
+                onFirstFrameRendered = {},
+                onDidFinishRenderingMap = {},
+                onRenderError = {},
+            ),
+        )
+        val detachWindow = port.attachWindowObserver { _, _ -> }
+
+        val sessionHandle =
+            MapViewSessionHandle(
+                screenName = "Radar",
+                sessionId = "radar-dup-destroy-test",
+                surfacePort = port,
+                controller = controller,
+                onDetachListeners = detachListeners,
+                onDetachWindowObserver = detachWindow,
+                onCancelTransitions = { cancelTransitionsCount++ },
+            )
+        assertTrue(sessionHandle.isSessionActive)
+        assertEquals(MapSurfaceSessionState.MAP_SURFACE_ACTIVE, GraphicsSurfaceCoordinator.state.value.mapState)
+
+        // Call pauseAndStopBeforeDetach multiple times and destroyOnceAfterDetach 3 times
+        sessionHandle.pauseAndStopBeforeDetach("onDispose")
+        assertFalse("Session must be marked inactive immediately on pauseAndStopBeforeDetach", sessionHandle.isSessionActive)
+        assertEquals(MapSurfaceSessionState.MAP_SURFACE_DISPOSING, GraphicsSurfaceCoordinator.state.value.mapState)
+
+        sessionHandle.pauseAndStopBeforeDetach("duplicate_dispose")
+        sessionHandle.destroyOnceAfterDetach()
+        sessionHandle.destroyOnceAfterDetach()
+        sessionHandle.destroyOnceAfterDetach()
+        controller.destroy()
+
+        assertEquals("MapView.onPause() must execute exactly once", 1, port.pauseCount)
+        assertEquals("MapView.onStop() must execute exactly once", 1, port.stopCount)
+        assertEquals("MapView.onDestroy() must execute exactly once despite duplicate calls", 1, port.destroyCount)
+        assertEquals("Listeners must be detached exactly once", 1, port.listenerDetachCount)
+        assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, GraphicsSurfaceCoordinator.state.value.mapState)
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertEquals(
+            "MAP_DESTROYED must be logged exactly once",
+            1,
+            logs.count { it.contains("MAP_DESTROYED") && it.contains("session=radar-dup-destroy-test") },
+        )
+        assertEquals(
+            "MAP_SURFACE_DETACHED must be logged exactly once",
+            1,
+            logs.count { it.contains("MAP_SURFACE_DETACHED") && it.contains("session=radar-dup-destroy-test") },
+        )
+    }
+
+    // 62. Etapa 3O (4, 5 #9): Eventos e callbacks atrasados de uma sessão anterior (MapView ou ExoPlayer) não modificam o estado da sessão nova ativa
+    @Test
+    fun `test_62_etapa3o_late_events_from_previous_map_and_video_sessions_cannot_corrupt_new_active_session`() {
+        val createdMapPorts = mutableListOf<FakeMapViewSurfacePort>()
+        val tappedCoordinates = mutableListOf<CityMapCoordinate>()
+        var showMap by mutableStateOf(true)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                if (showMap) {
+                    CityMapLibreViewImpl(
+                        state = CityMapUiState(),
+                        onMapTap = { tappedCoordinates += it },
+                        onCameraGestureSettled = { _, _ -> },
+                        surfacePortFactory = { ctx ->
+                            // First port stays pending in INITIALIZING so retry triggers full viewRecreationNonce++
+                            val autoReady = createdMapPorts.isNotEmpty()
+                            FakeMapViewSurfacePort(ctx, autoReady = autoReady).also { createdMapPorts += it }
+                        },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1, createdMapPorts.size)
+        val oldPort = createdMapPorts[0]
+
+        // Trigger a render error on oldPort so retry button appears, then click retry to recreate a new MapView session
+        composeTestRule.runOnUiThread {
+            oldPort.attachedCallbacks?.onRenderError("Falha simulada na sessão 1")
+            oldPort.flushPendingUiPosts()
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("city_map_retry_button").performClick()
+        composeTestRule.waitForIdle()
+
+        // New MapView session (newPort) is now created and active
+        assertEquals(2, createdMapPorts.size)
+        val newPort = createdMapPorts[1]
+        composeTestRule.runOnUiThread {
+            newPort.attachedCallbacks?.onFirstFrameRendered()
+            newPort.attachedCallbacks?.onDidFinishRenderingMap(true)
+            newPort.flushPendingUiPosts()
+        }
+        composeTestRule.waitForIdle()
+
+        // Now fire LATE callbacks from the disposed oldPort (getMapAsync, onRenderError, onDidFailLoadingMap, mapTap)
+        composeTestRule.runOnUiThread {
+            oldPort.pendingMapReadyCallback?.invoke(oldPort.controllerPort)
+            oldPort.attachedCallbacks?.onRenderError("Erro atrasado da sessão 1 já encerrada")
+            oldPort.attachedCallbacks?.onDidFailLoadingMap("Falha de estilo atrasada da sessão 1")
+            oldPort.flushPendingUiPosts()
+            oldPort.controllerPort.simulateMapTap(CityMapCoordinate(-10.0, -50.0))
+        }
+        composeTestRule.waitForIdle()
+
+        // Verify oldPort's late callbacks did NOT trigger the error overlay on newPort or register a fake tap
+        composeTestRule.onNodeWithTag("city_map_retry_button").assertDoesNotExist()
+        assertTrue("Taps from disposed MapView session must be ignored", tappedCoordinates.isEmpty())
+
+        // Verify taps on the active newPort work normally
+        composeTestRule.runOnUiThread {
+            newPort.controllerPort.simulateMapTap(CityMapCoordinate(-23.55, -46.63))
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1, tappedCoordinates.size)
+
+        // Close map and verify stale ExoPlayer session detach cannot clobber active video session in GraphicsSurfaceCoordinator
+        composeTestRule.runOnUiThread { showMap = false }
+        composeTestRule.waitForIdle()
+
+        GraphicsSurfaceCoordinator.onVideoOutputReattached(
+            sessionId = "exo-active-new",
+            playerIdentity = 2002,
+            viewIdentity = 3003,
+        )
+        assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, GraphicsSurfaceCoordinator.state.value.videoState)
+        assertEquals("exo-active-new", GraphicsSurfaceCoordinator.state.value.activeVideoSessionId)
+
+        // Fire a delayed detach from a previous video session ("exo-old-stale") and from an older viewIdentity (1111)
+        GraphicsSurfaceCoordinator.onVideoOutputDetached(
+            sessionId = "exo-old-stale",
+            playerIdentity = 1001,
+            viewIdentity = 1111,
+            reason = "onDispose",
+        )
+        GraphicsSurfaceCoordinator.onVideoOutputDetached(
+            sessionId = "exo-old-stale-2",
+            playerIdentity = 2002,
+            viewIdentity = 1111,
+            reason = "onRelease",
+        )
+
+        assertEquals(
+            "Stale video session/view detach must NOT clobber active video session",
+            VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE,
+            GraphicsSurfaceCoordinator.state.value.videoState,
+        )
+        assertEquals("exo-active-new", GraphicsSurfaceCoordinator.state.value.activeVideoSessionId)
+        assertTrue(GraphicsSurfaceCoordinator.state.value.videoOutputAttached)
+    }
+
     private fun extractToken(line: String, prefix: String): String? {
         val idx = line.indexOf(prefix)
         if (idx < 0) return null

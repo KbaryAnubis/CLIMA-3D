@@ -829,6 +829,7 @@ internal fun WeatherVideoBackgroundImpl(
     var isDecoderCurrentlyAlive by remember(playerHandle) { mutableStateOf(false) }
     var activeSurfaceAttachmentEpoch by remember(playerHandle) { mutableIntStateOf(0) }
     var activeSurfaceViewIdentity by remember(playerHandle) { mutableIntStateOf(0) }
+    var isTextureSurfaceAvailable by remember(playerHandle) { mutableStateOf(true) }
 
     var renderedFrameDecoderGeneration by remember(playerHandle) { mutableIntStateOf(-1) }
     var renderedFrameVideoResId by remember(playerHandle) { mutableStateOf<Int?>(null) }
@@ -863,7 +864,10 @@ internal fun WeatherVideoBackgroundImpl(
 
     fun isSurfaceCurrentlyAttached(): Boolean {
         val bridge = surfaceBridgeRef
-        return bridge != null && bridge.isPlayerAttached(playerHandle) && !videoSurfaceClearedForMap
+        return bridge != null &&
+            bridge.isPlayerAttached(playerHandle) &&
+            !videoSurfaceClearedForMap &&
+            isTextureSurfaceAvailable
     }
 
     var lastPublishedSnapshot by remember(playerHandle) { mutableStateOf<WeatherVideoVisualSnapshot?>(null) }
@@ -871,7 +875,11 @@ internal fun WeatherVideoBackgroundImpl(
     fun isCurrentRenderedFrameStrictlyValid(targetResId: Int): Boolean {
         val bridge = surfaceBridgeRef
         val currentViewId = bridge?.viewIdentity ?: 0
-        val attached = bridge != null && bridge.isPlayerAttached(playerHandle) && !videoSurfaceClearedForMap
+        val attached =
+            bridge != null &&
+                bridge.isPlayerAttached(playerHandle) &&
+                !videoSurfaceClearedForMap &&
+                isTextureSurfaceAvailable
         return hasValidRenderedFrame &&
             isDecoderCurrentlyAlive &&
             renderedFrameVideoResId == targetResId &&
@@ -1117,6 +1125,7 @@ internal fun WeatherVideoBackgroundImpl(
             val wasDetachedForMap = videoSurfaceClearedForMap
             pendingReattachRequestLogged = false
             videoSurfaceClearedForMap = false
+            isTextureSurfaceAvailable = true
             activeSurfaceAttachmentEpoch += 1
             activeSurfaceViewIdentity = bridge.viewIdentity
             if (wasDetachedForMap) {
@@ -1170,17 +1179,21 @@ internal fun WeatherVideoBackgroundImpl(
             activeDecoderGeneration = maxOf(activeDecoderGeneration, decoderGen)
             if (!initialized) {
                 isDecoderCurrentlyAlive = false
+                val isCodecError = reasonLabel.startsWith("codec_error:")
+                if (isCodecError) {
+                    hasPendingFatalDecoderError = true
+                }
                 // Previous decoder was released or faulted: any frame from an older generation is immediately invalid
-                if (hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY) {
+                if (isCodecError || hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY) {
                     invalidateCurrentFrame(
                         nextState =
                             when {
                                 !latestCanAttachVideoSurfaceNow -> WeatherVideoVisualState.VIDEO_OUTPUT_DETACHED
-                                needsCodecRecovery || recoveryInProgress -> WeatherVideoVisualState.VIDEO_RECOVERING
+                                isCodecError || needsCodecRecovery || recoveryInProgress -> WeatherVideoVisualState.VIDEO_RECOVERING
                                 else -> WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME
                             },
                         milestoneEvent = "BACKGROUND_VIDEO_HIDDEN_NO_FRAME",
-                        reason = if (reasonLabel.startsWith("codec_error:")) reasonLabel else "decoder_released",
+                        reason = if (isCodecError) reasonLabel else "decoder_released",
                     )
                 }
             } else {
@@ -1286,14 +1299,22 @@ internal fun WeatherVideoBackgroundImpl(
             val currentRes = appliedVideoResId ?: latestVideoResId
             val expectedGen = maxOf(activeDecoderGeneration, playerHandle.decoderGeneration)
             val bridge = surfaceBridgeRef
-            val attachedNow = bridge != null && bridge.isPlayerAttached(playerHandle) && !videoSurfaceClearedForMap
-            val initialPreFactoryPrepare = bridge == null && activeSurfaceAttachmentEpoch == 0 && !videoSurfaceClearedForMap
+            val attachedNow =
+                bridge != null &&
+                    bridge.isPlayerAttached(playerHandle) &&
+                    !videoSurfaceClearedForMap &&
+                    isTextureSurfaceAvailable
+            val initialPreFactoryPrepare =
+                bridge == null &&
+                    activeSurfaceAttachmentEpoch == 0 &&
+                    !videoSurfaceClearedForMap &&
+                    isTextureSurfaceAvailable
 
-            // Etapa 3N Item 3: Validate the exact 5-axis combination before accepting onRenderedFirstFrame:
+            // Etapa 3N / 3O: Validate the exact 5-axis combination before accepting onRenderedFirstFrame:
             // 1. ExoPlayer session & player instance identity
             // 2. Current MediaItem (videoResId)
             // 3. Current active decoder generation (must match and decoder must be alive)
-            // 4. Currently attached video surface (epoch & view identity)
+            // 4. Currently attached & available video surface (epoch & view identity)
             val matchesSessionAndPlayer =
                 token.sessionId == playerHandle.sessionId &&
                     token.playerIdentity == playerHandle.identityHash
@@ -1349,6 +1370,26 @@ internal fun WeatherVideoBackgroundImpl(
                     )
                 }
                 latestOnFirstFrame()
+            } else {
+                val rejectReason =
+                    when {
+                        !matchesSessionAndPlayer -> "stale_session_or_player"
+                        !matchesMediaItem -> "stale_media_item_${token.videoResId}_expected_$currentRes"
+                        !matchesDecoderGeneration -> "stale_decoder_gen_${token.decoderGeneration}_expected_$expectedGen"
+                        else -> "stale_or_detached_surface_epoch_${token.surfaceEpoch}_expected_${playerHandle.surfaceEpoch}"
+                    }
+                ClimaGraphicsLifecycleDiagnostics.logBackgroundVisualMilestone(
+                    eventName = "BACKGROUND_VIDEO_STALE_FRAME_REJECTED",
+                    sessionId = playerHandle.sessionId,
+                    playerIdentity = playerHandle.identityHash,
+                    videoResId = currentRes,
+                    playerState = playerHandle.playerStateName,
+                    decoderGeneration = activeDecoderGeneration,
+                    videoAlpha = if (visualState == WeatherVideoVisualState.VIDEO_FRAME_READY && hasValidRenderedFrame) 1f else 0f,
+                    frameReady = hasValidRenderedFrame,
+                    visualState = visualState.name,
+                    reason = rejectReason,
+                )
             }
         }
     }
@@ -1613,6 +1654,7 @@ internal fun WeatherVideoBackgroundImpl(
             detachWindowObserverRef?.invoke()
             detachWindowObserverRef =
                 bridge.attachWindowObserver { attached, snapshot ->
+                    if (surfaceBridgeRef !== bridge || playerHandle.isReleased) return@attachWindowObserver
                     ClimaGraphicsLifecycleDiagnostics.logExoViewAttachState(
                         sessionId = playerHandle.sessionId,
                         playerIdentity = playerHandle.identityHash,
@@ -1625,7 +1667,8 @@ internal fun WeatherVideoBackgroundImpl(
                     )
                     val lostTextureSurface =
                         !attached || snapshot.textureAvailable == false || snapshot.hasSurfaceTexture == false
-                    if (lostTextureSurface && (hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY)) {
+                    isTextureSurfaceAvailable = !lostTextureSurface
+                    if (lostTextureSurface) {
                         activeSurfaceAttachmentEpoch += 1
                         playerHandle.notifySurfaceReattachedForNewFrame()
                         invalidateCurrentFrame(
@@ -1641,6 +1684,7 @@ internal fun WeatherVideoBackgroundImpl(
                     }
                 }
             if (canAttachVideoSurfaceNow) {
+                isTextureSurfaceAvailable = true
                 activeSurfaceAttachmentEpoch += 1
                 activeSurfaceViewIdentity = bridge.viewIdentity
                 bridge.attachPlayer(playerHandle)
@@ -1704,13 +1748,15 @@ internal fun WeatherVideoBackgroundImpl(
                 attachVideoOutputIfAllowed(bridge, reason = "android_view_update")
             }
         },
-        onRelease = {
-            detachWindowObserverRef?.invoke()
-            detachWindowObserverRef = null
+        onRelease = { releasedView ->
             val bridge = surfaceBridgeRef
-            if (bridge != null) {
+            if (bridge != null && bridge.view === releasedView) {
+                detachWindowObserverRef?.invoke()
+                detachWindowObserverRef = null
+                isTextureSurfaceAvailable = false
                 activeSurfaceAttachmentEpoch += 1
                 activeSurfaceViewIdentity = 0
+                playerHandle.notifySurfaceReattachedForNewFrame()
                 if (bridge.isPlayerAttached(playerHandle)) {
                     bridge.detachPlayer()
                 }

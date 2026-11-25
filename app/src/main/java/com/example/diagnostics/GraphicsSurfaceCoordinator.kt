@@ -49,6 +49,7 @@ object GraphicsSurfaceCoordinator {
     private val disposingMapSessionIds = linkedSetOf<String>()
     private var currentVideoState: VideoSurfaceOutputState = VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED
     private var currentVideoSessionId: String? = null
+    private var currentVideoViewIdentity: Int = 0
     private var isVideoAttached: Boolean = false
 
     private val _state = MutableStateFlow(GraphicsSurfaceCoordinationSnapshot())
@@ -177,18 +178,29 @@ object GraphicsSurfaceCoordinator {
         viewIdentity: Int,
         reason: String,
     ): GraphicsSurfaceCoordinationSnapshot {
+        var effectiveReason = reason
         val snapshot =
             synchronized(lock) {
-                currentVideoSessionId = sessionId
-                currentVideoState = VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED
-                isVideoAttached = false
-                publishLocked()
+                val isStaleSession =
+                    isVideoAttached &&
+                        currentVideoSessionId != null &&
+                        currentVideoSessionId != sessionId
+                if (isStaleSession) {
+                    effectiveReason = "${reason}_stale_ignored"
+                    _state.value
+                } else {
+                    currentVideoSessionId = sessionId
+                    currentVideoViewIdentity = 0
+                    currentVideoState = VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED
+                    isVideoAttached = false
+                    publishLocked()
+                }
             }
         ClimaGraphicsLifecycleDiagnostics.logVideoOutputDetached(
             sessionId = sessionId,
             playerIdentity = playerIdentity,
             viewIdentity = viewIdentity,
-            reason = reason,
+            reason = effectiveReason,
             mapState = snapshot.mapState,
             videoState = snapshot.videoState,
         )
@@ -222,6 +234,7 @@ object GraphicsSurfaceCoordinator {
         val snapshot =
             synchronized(lock) {
                 currentVideoSessionId = sessionId
+                currentVideoViewIdentity = viewIdentity
                 currentVideoState = VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE
                 isVideoAttached = true
                 publishLocked()
@@ -243,6 +256,7 @@ object GraphicsSurfaceCoordinator {
             disposingMapSessionIds.clear()
             currentVideoState = VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED
             currentVideoSessionId = null
+            currentVideoViewIdentity = 0
             isVideoAttached = false
             publishLocked()
         }
