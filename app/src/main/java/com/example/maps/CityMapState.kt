@@ -44,6 +44,7 @@ data class CityMapUiState(
     val locationStatusNotice: String? = null,
     val isLocatingUser: Boolean = false,
     val cameraMoveVersion: Int = 0,
+    val locationFixVersion: Int = 0,
 ) {
     fun zoomIn(step: Double = 1.0): CityMapUiState {
         val nextZoom = (zoom + step).coerceIn(OpenStreetMapTileConfig.MIN_ZOOM, OpenStreetMapTileConfig.MAX_ZOOM)
@@ -130,6 +131,7 @@ data class CityMapUiState(
             locationStatusNotice = null,
             isLocatingUser = false,
             cameraMoveVersion = cameraMoveVersion + 1,
+            locationFixVersion = locationFixVersion + 1,
         )
     }
 
@@ -164,6 +166,11 @@ data class CityMapUiState(
         )
 
     fun formattedZoomLabel(): String = "${(zoom * 10.0).roundToInt() / 10.0}x"
+
+    companion object {
+        const val MIN_ZOOM: Double = OpenStreetMapTileConfig.MIN_ZOOM
+        const val MAX_ZOOM: Double = OpenStreetMapTileConfig.MAX_ZOOM
+    }
 }
 
 /**

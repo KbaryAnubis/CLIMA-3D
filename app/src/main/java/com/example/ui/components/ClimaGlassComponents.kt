@@ -318,7 +318,8 @@ fun V53PrimaryButton(
         }
 
     Surface(
-        modifier = modifier.fillMaxWidth(),
+        onClick = onClick,
+        modifier = modifier.fillMaxWidth().minimumInteractiveComponentSize(),
         shape = shape,
         color = Color.Transparent,
         border =
@@ -332,8 +333,6 @@ fun V53PrimaryButton(
                 Modifier
                     .fillMaxWidth()
                     .background(bgBrush)
-                    .minimumInteractiveComponentSize()
-                    .clickable(onClick = onClick)
                     .padding(horizontal = 14.dp, vertical = 12.dp),
             horizontalArrangement = Arrangement.Center,
             verticalAlignment = Alignment.CenterVertically,

@@ -292,8 +292,12 @@ class WeatherModelsAndUtilsTest {
             population = 169_176,
         )
 
-        assertEquals("Springfield — Illinois, Estados Unidos", springfieldIl.fullDisambiguatedLabel())
-        assertEquals("Springfield — Missouri, Estados Unidos", springfieldMo.fullDisambiguatedLabel())
+        assertEquals("Springfield — Sangamon, Illinois, Estados Unidos", springfieldIl.fullDisambiguatedLabel())
+        assertEquals("Springfield — Greene, Missouri, Estados Unidos", springfieldMo.fullDisambiguatedLabel())
         assertTrue(springfieldIl.fullDisambiguatedLabel() != springfieldMo.fullDisambiguatedLabel())
+        assertEquals(
+            "Springfield — Illinois, Estados Unidos",
+            springfieldIl.copy(admin2 = null).fullDisambiguatedLabel(),
+        )
     }
 }

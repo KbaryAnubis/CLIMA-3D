@@ -6,6 +6,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToKey
 import com.example.maps.CityMapCoordinate
 import com.example.maps.CityMapGeoJsonBuilder
 import com.example.maps.CityMapLibreSection
@@ -131,11 +132,12 @@ class MapLibreAndRadarTest {
 
         composeTestRule.onNodeWithTag("nav_tab_cities").performClick()
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("cities_screen_list").performScrollToKey("cities_saved_header")
         composeTestRule.onNodeWithTag("cities_open_map_picker_button").performScrollTo().performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("cities_map_section").performScrollTo().assertIsDisplayed()
         composeTestRule.onNodeWithTag("city_map_my_location").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("map_picker_close_button").performClick()
+        composeTestRule.onNodeWithTag("map_picker_close_button").performScrollTo().performClick()
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithTag("nav_tab_radar").performClick()

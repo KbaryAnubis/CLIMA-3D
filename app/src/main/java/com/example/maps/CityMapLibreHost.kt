@@ -7,17 +7,26 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -41,6 +50,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -64,6 +74,7 @@ import com.example.ui.theme.ClimaToastEmerald
 import com.example.ui.theme.WeatherGlassSpecs
 import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 import kotlinx.coroutines.delay
 import org.maplibre.android.location.LocationComponentActivationOptions
 import org.maplibre.android.location.engine.LocationEngineRequest
@@ -167,9 +178,12 @@ internal fun CityMapLibreSectionImpl(
         }
     }
 
-    LaunchedEffect(initialState.currentUserLocation) {
+    LaunchedEffect(initialState.currentUserLocation, initialState.locationFixVersion) {
         val incoming = initialState.currentUserLocation
-        if (incoming != null && uiState.currentUserLocation != incoming) {
+        if (
+            incoming != null &&
+            (uiState.currentUserLocation != incoming || uiState.locationFixVersion != initialState.locationFixVersion)
+        ) {
             uiState =
                 uiState.withCurrentLocation(
                     coordinate = incoming,
@@ -376,19 +390,39 @@ internal fun CityMapLibreSectionImpl(
                     isOnline = isOnline,
                     onRetryReload = onRetryReload,
                     onMapTap = { coordinate ->
+                        val movedSignificantly =
+                            abs(coordinate.latitude - uiState.selectedMarker.coordinate.latitude) > 0.0005 ||
+                                abs(coordinate.longitude - uiState.selectedMarker.coordinate.longitude) > 0.0005
+                        val nextLabel =
+                            if (movedSignificantly) {
+                                "Ponto ${coordinate.formatted()}"
+                            } else {
+                                uiState.selectedMarker.label
+                            }
                         updateState(
                             uiState.selectMarkerAt(
                                 coordinate = coordinate,
+                                label = nextLabel,
                                 moveCameraToMarker = false,
-                            )
+                            ),
                         )
                     },
                     onCameraGestureSettled = { coordinate, zoom ->
+                        val movedSignificantly =
+                            abs(coordinate.latitude - uiState.selectedMarker.coordinate.latitude) > 0.0005 ||
+                                abs(coordinate.longitude - uiState.selectedMarker.coordinate.longitude) > 0.0005
+                        val nextLabel =
+                            if (movedSignificantly) {
+                                "Ponto ${coordinate.formatted()}"
+                            } else {
+                                uiState.selectedMarker.label
+                            }
                         updateState(
                             uiState
                                 .syncCameraFromGesture(coordinate, zoom)
                                 .selectMarkerAt(
                                     coordinate = coordinate,
+                                    label = nextLabel,
                                     moveCameraToMarker = false,
                                 ),
                         )
@@ -606,6 +640,43 @@ fun MapLocationPickerScreen(
     onOpenAppSettings: () -> Unit,
     onRetryReload: () -> Unit,
     modifier: Modifier = Modifier,
+) {
+    MapLocationPickerScreenImpl(
+        mapState = mapState,
+        pickerState = pickerState,
+        customPointNameInput = customPointNameInput,
+        isOnline = isOnline,
+        isPermanentlyDenied = isPermanentlyDenied,
+        onSearchQueryChange = onSearchQueryChange,
+        onSubmitSearch = onSubmitSearch,
+        onSelectSearchResult = onSelectSearchResult,
+        onMapStateChange = onMapStateChange,
+        onCustomPointNameChange = onCustomPointNameChange,
+        onConfirmSelection = onConfirmSelection,
+        onCancel = onCancel,
+        onOpenAppSettings = onOpenAppSettings,
+        onRetryReload = onRetryReload,
+        modifier = modifier,
+    )
+}
+
+@Composable
+internal fun MapLocationPickerScreenImpl(
+    mapState: CityMapUiState,
+    pickerState: com.example.ui.state.MapLocationPickerUiState,
+    customPointNameInput: String,
+    isOnline: Boolean,
+    isPermanentlyDenied: Boolean,
+    onSearchQueryChange: (String) -> Unit,
+    onSubmitSearch: () -> Unit,
+    onSelectSearchResult: (com.example.data.model.CitySearchResult) -> Unit,
+    onMapStateChange: (CityMapUiState) -> Unit,
+    onCustomPointNameChange: (String) -> Unit,
+    onConfirmSelection: () -> Unit,
+    onCancel: () -> Unit,
+    onOpenAppSettings: () -> Unit,
+    onRetryReload: () -> Unit,
+    modifier: Modifier = Modifier,
     surfacePortFactory: ((Context) -> MapViewSurfacePort)? = null,
 ) {
     androidx.activity.compose.BackHandler(onBack = onCancel)
@@ -623,18 +694,32 @@ fun MapLocationPickerScreen(
             modifier
                 .fillMaxSize()
                 .background(ClimaDeepSky.copy(alpha = 0.94f))
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            awaitPointerEvent().changes.forEach { change ->
+                                if (!change.isConsumed) {
+                                    change.consume()
+                                }
+                            }
+                        }
+                    }
+                }
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .windowInsetsPadding(WindowInsets.ime)
                 .testTag("map_location_picker_screen"),
     ) {
-        androidx.compose.foundation.lazy.LazyColumn(
+        Column(
             modifier =
                 Modifier
                     .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 14.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             // Header bar with title and close/cancel action
-            item {
-                Surface(
+            Surface(
                     shape = RoundedCornerShape(20.dp),
                     color = WeatherGlassSpecs.glassContainerColor(spec.cardAlpha),
                     border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor()),
@@ -678,19 +763,17 @@ fun MapLocationPickerScreen(
                                     .testTag("map_picker_close_button"),
                         ) {
                             Icon(
-                                painter = painterResource(ClimaUiIcons.Close),
+                                painter = painterResource(R.drawable.ic_wx_close),
                                 contentDescription = "Fechar mapa",
                                 tint = ClimaTextOnDark,
                                 modifier = Modifier.size(20.dp),
                             )
                         }
                     }
-                }
             }
 
             // A. Search input for cities, neighborhoods, municipalities, and localities
-            item {
-                Surface(
+            Surface(
                     shape = RoundedCornerShape(20.dp),
                     color = WeatherGlassSpecs.glassContainerColor(spec.cardAlpha),
                     border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor()),
@@ -731,7 +814,7 @@ fun MapLocationPickerScreen(
                                         modifier = Modifier.testTag("map_picker_clear_search_button"),
                                     ) {
                                         Icon(
-                                            painter = painterResource(ClimaUiIcons.Close),
+                                            painter = painterResource(R.drawable.ic_wx_close),
                                             contentDescription = "Limpar busca",
                                             tint = ClimaTextMutedOnDark,
                                             modifier = Modifier.size(16.dp),
@@ -798,12 +881,8 @@ fun MapLocationPickerScreen(
                                                 .fillMaxWidth()
                                                 .minimumInteractiveComponentSize()
                                                 .clip(RoundedCornerShape(14.dp))
-                                                .let { mod ->
-                                                    mod.then(
-                                                        androidx.compose.foundation.clickable {
-                                                            onSelectSearchResult(candidate)
-                                                        },
-                                                    )
+                                                .clickable {
+                                                    onSelectSearchResult(candidate)
                                                 }
                                                 .testTag("map_picker_search_result_$idx"),
                                     ) {
@@ -840,25 +919,21 @@ fun MapLocationPickerScreen(
                             }
                         }
                     }
-                }
             }
 
             // B & C. Interactive MapLibre + OpenStreetMap viewport with center marker, zoom +/-, pinch zoom & GPS button
-            item {
-                CityMapLibreSectionImpl(
-                    initialState = mapState,
-                    isOnline = isOnline,
-                    isPermanentlyDenied = isPermanentlyDenied,
-                    onOpenAppSettings = onOpenAppSettings,
-                    onRetryReload = onRetryReload,
-                    onStateChanged = onMapStateChange,
-                    surfacePortFactory = surfacePortFactory,
-                )
-            }
+            CityMapLibreSectionImpl(
+                initialState = mapState,
+                isOnline = isOnline,
+                isPermanentlyDenied = isPermanentlyDenied,
+                onOpenAppSettings = onOpenAppSettings,
+                onRetryReload = onRetryReload,
+                onStateChanged = onMapStateChange,
+                surfacePortFactory = surfacePortFactory,
+            )
 
             // D. Confirmation card with selected locality name, live coordinates, custom name input, Confirm & Cancel
-            item {
-                Surface(
+            Surface(
                     shape = RoundedCornerShape(20.dp),
                     color = WeatherGlassSpecs.glassContainerColor(spec.cardAlpha),
                     border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor()),
@@ -894,7 +969,7 @@ fun MapLocationPickerScreen(
                             value = customPointNameInput,
                             onValueChange = onCustomPointNameChange,
                             singleLine = true,
-                            label = { Text(stringResource(R.string.cities_point_name_hint)) },
+                            label = { Text(stringResource(R.string.cities_point_name_placeholder)) },
                             colors =
                                 androidx.compose.material3.OutlinedTextFieldDefaults.colors(
                                     focusedTextColor = ClimaTextOnDark,
@@ -949,7 +1024,6 @@ fun MapLocationPickerScreen(
                             }
                         }
                     }
-                }
             }
         }
     }

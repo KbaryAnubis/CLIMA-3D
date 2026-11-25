@@ -603,10 +603,10 @@ class MapLibreDiagnosticsAndReliabilityTest {
         composeTestRule.onNodeWithTag("cities_subtab_map").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("map_location_picker_screen").assertIsDisplayed()
-        composeTestRule.onNodeWithTag("cities_map_section").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("cities_map_section").performScrollTo().assertIsDisplayed()
 
         // Close on-demand map location picker
-        composeTestRule.onNodeWithTag("map_picker_close_button").performClick()
+        composeTestRule.onNodeWithTag("map_picker_close_button").performScrollTo().performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("map_location_picker_screen").assertDoesNotExist()
         composeTestRule.onNodeWithTag("cities_map_section").assertDoesNotExist()

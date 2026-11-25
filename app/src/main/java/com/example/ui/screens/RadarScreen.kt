@@ -48,12 +48,14 @@ import androidx.compose.ui.unit.sp
 import com.example.R
 import com.example.data.model.DataSourceOrigin
 import com.example.data.model.RadarTimelineSnapshot
+import com.example.data.model.TimeFormatPreference
 import com.example.data.model.WeatherUnitConverter
 import com.example.maps.RadarBaseStyle
 import com.example.maps.RadarLayerStatusCard
 import com.example.media.ClimaUiIcons
 import com.example.media.WeatherIconSize
 import com.example.ui.components.AnimatedWeatherIcon
+import com.example.ui.components.ClimaDateLabels
 import com.example.ui.components.V53NoticeBanner
 import com.example.ui.components.V53PrimaryButton
 import com.example.ui.components.V53PullToRefreshBox
@@ -138,6 +140,7 @@ fun RadarScreen(
             RadarPrecipitationEvolutionCard(
                 forecast = uiState.forecast,
                 precipitationUnit = uiState.preferences.precipitationUnit,
+                timeFormat = uiState.preferences.timeFormat,
                 frames = frames,
                 safeIndex = safeIndex,
                 activeFrame = activeFrame,
@@ -227,7 +230,7 @@ private fun RadarHeaderCard(
                 ) {
                     IconButton(
                         onClick = onRefreshRadar,
-                        modifier = Modifier.size(44.dp).testTag("radar_refresh_button"),
+                        modifier = Modifier.size(48.dp).testTag("radar_refresh_button"),
                     ) {
                         if (isRefreshing) {
                             CircularProgressIndicator(
@@ -450,6 +453,7 @@ private fun RadarSummaryCard(
 private fun RadarPrecipitationEvolutionCard(
     forecast: com.example.data.model.WeatherForecastBundle?,
     precipitationUnit: com.example.data.model.PrecipitationUnit,
+    timeFormat: TimeFormatPreference,
     frames: List<com.example.data.model.RainViewerRadarFrame>,
     safeIndex: Int,
     activeFrame: com.example.data.model.RainViewerRadarFrame?,
@@ -592,8 +596,19 @@ private fun RadarPrecipitationEvolutionCard(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
+                            val hourLabel =
+                                remember(idx, hour.timeIso, hour.epochMillis, forecast?.timezoneId, forecast?.utcOffsetSeconds, timeFormat) {
+                                    ClimaDateLabels.formatHourLabel(
+                                        index = idx,
+                                        isoTime = hour.timeIso,
+                                        epochMillis = hour.epochMillis,
+                                        timezoneId = forecast?.timezoneId,
+                                        utcOffsetSeconds = forecast?.utcOffsetSeconds ?: 0,
+                                        timeFormat = timeFormat,
+                                    )
+                                }
                             Text(
-                                text = hour.formattedTime,
+                                text = hourLabel,
                                 color = ClimaTextOnDark,
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.SemiBold,

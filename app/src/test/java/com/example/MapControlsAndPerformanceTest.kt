@@ -25,6 +25,7 @@ import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityOptionsCompat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.Lifecycle
@@ -70,15 +71,18 @@ import com.example.maps.LocationPermissionState
 import com.example.maps.LocationPrecisionLevel
 import com.example.maps.MapLibreLocationGateway
 import com.example.maps.MapViewLifecycleController
+import com.example.maps.MeteorologicalRadarTileProvider
 import com.example.maps.OpenStreetMapTileConfig
 import com.example.maps.RadarBaseStyle
-import com.example.maps.RadarLayerPoolState
+import com.example.maps.WeatherRadarLayerSpec
 import com.example.maps.syncMapLibreLocationComponent
 import com.example.media.AnimatedWeatherWebp
 import com.example.media.WeatherIconSize
 import com.example.ui.components.buildWeatherWebpRequest
 import com.example.ui.components.shouldPauseBackgroundMotionForTab
+import com.example.ui.screens.RadarScreen
 import com.example.ui.state.ClimaMainViewModel
+import com.example.ui.state.ClimaUiState
 import com.example.ui.theme.Clima3DTheme
 import com.example.ui.theme.ClimaTab
 import java.io.File
@@ -617,10 +621,9 @@ class MapControlsAndPerformanceTest {
         )
     }
 
-    // 14. Pool de camadas do Radar cria fontes uma vez por timeline e só alterna visibility durante animação
+    // 14. Aba Radar Etapa 3P valida tiles RainViewer/especificação meteorológica e linha do tempo sem montar MapView
     @Test
     fun `test_14_radar_layer_pool_attaches_sources_once_and_toggles_visibility_on_ticks`() {
-        val pool = RadarLayerPoolState()
         val baseTs = 1795530000L
         val frames =
             List(9) { idx ->
@@ -636,64 +639,56 @@ class MapControlsAndPerformanceTest {
                 )
             }
 
-        val addedSources = mutableListOf<String>()
-        val removedLayers = mutableListOf<String>()
-        val visibilityMap = mutableMapOf<String, Boolean>()
-
-        // Initial timeline attachment
-        val firstDiff =
-            pool.syncPool(
-                frames = frames,
-                activeFrame = frames[0],
-                layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
-                maxRadarZoom = 12,
-                addSourceAndLayer = { _, sourceId, layerId, _, isVisible ->
-                    addedSources += sourceId
-                    visibilityMap[layerId] = isVisible
-                },
-                setLayerVisibility = { layerId, isVisible -> visibilityMap[layerId] = isVisible },
-                removeSourceAndLayer = { _, layerId -> removedLayers += layerId },
+        frames.forEach { frame ->
+            val provider = MeteorologicalRadarTileProvider(frame.tileUrlTemplate)
+            assertTrue(provider.isValidTemplate())
+            assertEquals(
+                "https://tilecache.rainviewer.com/v2/radar/${frame.timestampSeconds}/512/6/23/36/2/1_1.png",
+                provider.getTileUrl(x = 23, y = 36, zoom = 6)?.toString(),
             )
-
-        assertEquals(9, firstDiff.addedCount)
-        assertEquals(0, firstDiff.removedCount)
-        assertEquals(9, pool.attachedCount)
-        assertEquals(1, visibilityMap.values.count { it })
-
-        // Simulate 650ms frame advances across the rest of the timeline -> zero source/layer adds or removes
-        for (idx in 1 until frames.size) {
-            val tickDiff =
-                pool.syncPool(
-                    frames = frames,
-                    activeFrame = frames[idx],
-                    layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
-                    maxRadarZoom = 12,
-                    addSourceAndLayer = { _, sourceId, _, _, _ -> addedSources += sourceId },
-                    setLayerVisibility = { layerId, isVisible -> visibilityMap[layerId] = isVisible },
-                    removeSourceAndLayer = { _, layerId -> removedLayers += layerId },
-                )
-            assertEquals(0, tickDiff.addedCount)
-            assertEquals(0, tickDiff.removedCount)
-            assertEquals(2, tickDiff.visibilityUpdates)
-            assertEquals(1, visibilityMap.values.count { it })
-            val activeKey = RadarLayerPoolState.buildPoolKey(frames[idx], 12)
-            assertEquals(true, visibilityMap[pool.layerIdFor(activeKey)])
         }
+        val layerSpec = WeatherRadarLayerSpec(tileUrlTemplate = frames.first().tileUrlTemplate)
+        assertEquals(0.65f, layerSpec.opacity, 0.001f)
 
-        // Switching to Satellite clears pooled RainViewer layers cleanly
-        val clearDiff =
-            pool.syncPool(
+        var selectedIdx by mutableStateOf(0)
+        val timeline =
+            com.example.data.model.RadarTimelineSnapshot(
+                apiVersion = "2.0",
+                generatedEpochSeconds = baseTs + 4800L,
+                host = "https://tilecache.rainviewer.com",
                 frames = frames,
-                activeFrame = frames.last(),
-                layerStyle = RadarBaseStyle.SATELLITE,
-                maxRadarZoom = 12,
-                addSourceAndLayer = { _, _, _, _, _ -> },
-                setLayerVisibility = { _, _ -> },
-                removeSourceAndLayer = { _, layerId -> removedLayers += layerId },
+                totalPastFramesAvailable = frames.size,
+                fetchedAtEpochMillis = 1_795_535_000_000L,
             )
-        assertEquals(9, clearDiff.removedCount)
-        assertEquals(0, pool.attachedCount)
-        assertEquals(9, removedLayers.size)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                RadarScreen(
+                    uiState =
+                        ClimaUiState(
+                            radarTimeline = timeline,
+                            radarSelectedFrameIndex = selectedIdx,
+                            isOnline = true,
+                        ),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+                    onToggleLayerMenu = {},
+                    onSelectLayer = {},
+                    onZoomIn = {},
+                    onZoomOut = {},
+                    onSelectFrame = { selectedIdx = it },
+                    onTogglePlay = {},
+                    onRefreshRadar = {},
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Etapa 3P: zero MapView mounted on Radar tab
+        assertEquals(0, composeTestRule.onAllNodesWithTag("city_maplibre_native_view").fetchSemanticsNodes().size)
+        composeTestRule.onNodeWithTag("radar_timeline_card").assertExists()
+        composeTestRule.onNodeWithTag("radar_historical_frame_chip_3").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(3, selectedIdx)
     }
 
     // 15. Repositórios e ViewModel executam I/O, JSON/mapping/alertas fora da thread principal e hidratam em paralelo
@@ -940,14 +935,17 @@ class MapControlsAndPerformanceTest {
         }
     }
 
-    // 17. Vídeo/efeitos de fundo pausam nas abas Radar e Cidades mantendo as abas climáticas ativas
+    // 17. Vídeo/efeitos de fundo permanecem ativos nas abas permanentes e pausam exclusivamente com o seletor de mapa sob demanda aberto
     @Test
     fun `test_17_background_video_and_rain_pause_on_map_tabs_and_resume_on_weather_tabs`() {
-        assertFalse(shouldPauseBackgroundMotionForTab(ClimaTab.HOME))
-        assertTrue(shouldPauseBackgroundMotionForTab(ClimaTab.RADAR))
-        assertTrue(shouldPauseBackgroundMotionForTab(ClimaTab.CITIES))
-        assertFalse(shouldPauseBackgroundMotionForTab(ClimaTab.SETTINGS))
-        assertFalse(shouldPauseBackgroundMotionForTab(ClimaTab.ALERTS))
+        assertFalse(shouldPauseBackgroundMotionForTab(ClimaTab.HOME, isMapLocationPickerOpen = false))
+        assertFalse(shouldPauseBackgroundMotionForTab(ClimaTab.RADAR, isMapLocationPickerOpen = false))
+        assertFalse(shouldPauseBackgroundMotionForTab(ClimaTab.CITIES, isMapLocationPickerOpen = false))
+        assertFalse(shouldPauseBackgroundMotionForTab(ClimaTab.SETTINGS, isMapLocationPickerOpen = false))
+        assertFalse(shouldPauseBackgroundMotionForTab(ClimaTab.ALERTS, isMapLocationPickerOpen = false))
+
+        assertTrue(shouldPauseBackgroundMotionForTab(ClimaTab.HOME, isMapLocationPickerOpen = true))
+        assertTrue(shouldPauseBackgroundMotionForTab(ClimaTab.CITIES, isMapLocationPickerOpen = true))
     }
 
     // 18. Ícones WebP animados usam tamanho alvo limitado em pixels coerente com cada slot

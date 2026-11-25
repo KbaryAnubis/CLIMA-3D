@@ -767,8 +767,6 @@ class ClimaMainViewModel(
                     .copy(
                         isLocatingUser = false,
                         locationStatusNotice = null,
-                        renderErrorMessage = null,
-                        showSettingsRedirectAction = false,
                     ).selectMarkerAt(
                         coordinate = initialCoord,
                         label = initialName,
@@ -1565,20 +1563,30 @@ class ClimaMainViewModel(
         val isMapPickerModal = current.activeModal == ClimaActiveModal.MapLocationPicker
 
         if (isMapPickerModal) {
-            val isGpsUpdate = updatedCurrent != null && updatedCurrent != previousCurrent
+            val isGpsUpdate =
+                updatedCurrent != null &&
+                    (updatedCurrent != previousCurrent || newState.locationFixVersion != previousState.locationFixVersion)
             val previousCoord = previousState.selectedMarker.coordinate
             val newCoord = newState.selectedMarker.coordinate
             val coordChanged = previousCoord != newCoord
 
+            var nextCustomName = current.customPointNameInput
             val updatedPicker =
                 when {
-                    isGpsUpdate ->
+                    isGpsUpdate -> {
+                        if (
+                            nextCustomName == current.mapLocationPickerState.selectedPlaceName ||
+                            nextCustomName == current.mapLocationPickerState.selectedSearchResult?.name
+                        ) {
+                            nextCustomName = ""
+                        }
                         current.mapLocationPickerState.copy(
                             selectedSearchResult = null,
                             isGpsSelection = true,
                             selectedPlaceName = "Minha localização",
                             selectedRegionSubtitle = "",
                         )
+                    }
                     coordChanged -> {
                         val candidate = current.mapLocationPickerState.selectedSearchResult
                         val matchesCandidate =
@@ -1597,15 +1605,16 @@ class ClimaMainViewModel(
                                     kotlin.math.abs(it.latitude - newCoord.latitude) <= 0.0005 &&
                                         kotlin.math.abs(it.longitude - newCoord.longitude) <= 0.0005
                                 }
+                            if (
+                                nextCustomName == current.mapLocationPickerState.selectedPlaceName ||
+                                nextCustomName == current.mapLocationPickerState.selectedSearchResult?.name
+                            ) {
+                                nextCustomName = matchingSaved?.name.orEmpty()
+                            }
                             current.mapLocationPickerState.copy(
                                 selectedSearchResult = null,
                                 isGpsSelection = false,
-                                selectedPlaceName =
-                                    matchingSaved?.name
-                                        ?: newState.selectedMarker.label.takeIf {
-                                            it.isNotBlank() && !it.startsWith("Ponto ")
-                                        }
-                                        ?: "Ponto ${newCoord.formatted()}",
+                                selectedPlaceName = matchingSaved?.name ?: "Ponto ${newCoord.formatted()}",
                                 selectedRegionSubtitle = matchingSaved?.displaySubtitle().orEmpty(),
                             )
                         }
@@ -1616,6 +1625,7 @@ class ClimaMainViewModel(
                 it.copy(
                     cityMapState = newState,
                     mapLocationPickerState = updatedPicker,
+                    customPointNameInput = nextCustomName,
                 )
             }
             return
@@ -1623,7 +1633,10 @@ class ClimaMainViewModel(
 
         _uiState.update { it.copy(cityMapState = newState) }
 
-        if (updatedCurrent != null && updatedCurrent != previousCurrent) {
+        if (
+            updatedCurrent != null &&
+            (updatedCurrent != previousCurrent || newState.locationFixVersion != previousState.locationFixVersion)
+        ) {
             saveGpsLocation(updatedCurrent)
         }
     }
