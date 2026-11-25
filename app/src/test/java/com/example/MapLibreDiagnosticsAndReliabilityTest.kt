@@ -537,9 +537,9 @@ class MapLibreDiagnosticsAndReliabilityTest {
         }
         composeTestRule.waitForIdle()
 
-        composeTestRule.onNodeWithTag("radar_map_container").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("radar_map_secondary_notice").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("radar_map_retry_button").performScrollTo().performClick()
+        composeTestRule.onNodeWithTag("radar_precipitation_evolution_card").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("radar_status_provider_error").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("radar_retry_button").performScrollTo().performClick()
         assertEquals(1, refreshCount)
 
         composeTestRule.onNodeWithTag("radar_frame_counter")
@@ -574,14 +574,14 @@ class MapLibreDiagnosticsAndReliabilityTest {
         }
         composeTestRule.waitForIdle()
 
-        composeTestRule.onNodeWithTag("radar_map_container").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("radar_map_status_offline").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("radar_map_retry_button").performScrollTo().performClick()
+        composeTestRule.onNodeWithTag("radar_precipitation_evolution_card").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("radar_status_offline").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("radar_retry_button").performScrollTo().performClick()
         assertEquals(1, retryCount)
     }
 
     @Test
-    fun `Repeated tab switching between Home, Radar, and Cities preserves both map screens without errors`() {
+    fun `Repeated tab switching between Home, Radar, and Cities mounts zero permanent maps and opens on-demand MapLocationPicker cleanly`() {
         composeTestRule.setContent {
             Clima3DTheme(darkTheme = true) {
                 Clima3DNativeAssetsFoundationApp()
@@ -591,28 +591,33 @@ class MapLibreDiagnosticsAndReliabilityTest {
 
         composeTestRule.onNodeWithTag("nav_tab_radar").performClick()
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("radar_map_container").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("radar_precipitation_evolution_card").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("cities_map_section").assertDoesNotExist()
 
         composeTestRule.onNodeWithTag("nav_tab_cities").performClick()
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("cities_open_map_picker_card").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("cities_map_section").assertDoesNotExist()
+
+        // Open on-demand map location picker via "Mapa" subtab or button
         composeTestRule.onNodeWithTag("cities_subtab_map").performClick()
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("map_location_picker_screen").assertIsDisplayed()
         composeTestRule.onNodeWithTag("cities_map_section").assertIsDisplayed()
+
+        // Close on-demand map location picker
+        composeTestRule.onNodeWithTag("map_picker_close_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("map_location_picker_screen").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("cities_map_section").assertDoesNotExist()
 
         composeTestRule.onNodeWithTag("nav_tab_radar").performClick()
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("radar_map_container").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("radar_precipitation_evolution_card").performScrollTo().assertIsDisplayed()
 
         composeTestRule.onNodeWithTag("nav_tab_home").performClick()
         composeTestRule.waitForIdle()
-
-        composeTestRule.onNodeWithTag("nav_tab_radar").performClick()
-        composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("radar_map_container").performScrollTo().assertIsDisplayed()
-
-        composeTestRule.onNodeWithTag("nav_tab_cities").performClick()
-        composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("cities_map_section").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("cities_map_section").assertDoesNotExist()
     }
 
     private fun TileTransportSnapshotEmpty() = TileTransportDiagnostics.snapshot.value

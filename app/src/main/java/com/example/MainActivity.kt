@@ -28,7 +28,7 @@ import com.example.data.local.preferences.AppThemeMode
 import com.example.diagnostics.ClimaGraphicsLifecycleDiagnostics
 import com.example.maps.LocationLookupResult
 import com.example.maps.LocationPermissionCoordinator
-import com.example.maps.MapLibreInitializer
+import com.example.maps.MapLocationPickerScreen
 import com.example.ui.components.ClimaDetailModalHost
 import com.example.ui.components.LocationPickerDialog
 import com.example.ui.components.WeatherPersistentShell
@@ -46,7 +46,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        MapLibreInitializer.ensureInitialized(applicationContext)
         val dataContainer = ClimaDataContainer.getInstance(applicationContext)
         setContent {
             Clima3DApp(dataContainer = dataContainer)
@@ -262,11 +261,21 @@ fun Clima3DApp(
     }
 
     Clima3DTheme(darkTheme = useDarkTheme, dynamicColor = false) {
+        val openSettingsAction = {
+            if (onOpenAppSettingsOverride != null) {
+                onOpenAppSettingsOverride()
+            } else {
+                LocationPermissionCoordinator.openAppSettings(context)
+            }
+            Unit
+        }
+
         WeatherPersistentShell(
             condition = uiState.activeWeatherCondition,
             activeTab = uiState.activeTab,
             animatedBackgroundEnabled = uiState.preferences.animatedBackgroundEnabled,
             onSelectTab = vm::selectTab,
+            isMapLocationPickerOpen = uiState.isMapLocationPickerOpen,
             toastMessage = uiState.toastMessage,
         ) { contentPadding ->
             when (uiState.activeTab) {
@@ -311,9 +320,10 @@ fun Clima3DApp(
                         onAddCityResult = vm::addCityFromSearch,
                         onSelectSavedLocation = vm::selectSavedLocation,
                         onRemoveSavedLocation = vm::removeSavedLocation,
+                        onOpenMapPicker = vm::openMapLocationPickerModal,
                         onRetryMap = vm::onPullRefreshCities,
                         onRefreshCities = vm::onPullRefreshCities,
-                        onOpenAppLocationSettings = { LocationPermissionCoordinator.openAppSettings(context) },
+                        onOpenAppLocationSettings = openSettingsAction,
                     )
 
                 ClimaTab.SETTINGS ->
@@ -335,7 +345,7 @@ fun Clima3DApp(
                         onOpenCities = { vm.selectTab(ClimaTab.CITIES) },
                         onResetPreferences = vm::resetPreferencesToDefaults,
                         onRequestLocationPermission = requestLocationPermissions,
-                        onOpenAppLocationSettings = { LocationPermissionCoordinator.openAppSettings(context) },
+                        onOpenAppLocationSettings = openSettingsAction,
                     )
 
                 ClimaTab.ALERTS ->
@@ -349,14 +359,6 @@ fun Clima3DApp(
         }
 
         if (uiState.activeModal == ClimaActiveModal.LocationPicker) {
-            val openSettingsAction = {
-                if (onOpenAppSettingsOverride != null) {
-                    onOpenAppSettingsOverride()
-                } else {
-                    LocationPermissionCoordinator.openAppSettings(context)
-                }
-                Unit
-            }
             LocationPickerDialog(
                 uiState = uiState,
                 onSearchQueryChanged = vm::updateLocationPickerSearchQuery,
@@ -386,6 +388,24 @@ fun Clima3DApp(
                 },
                 onOpenAppLocationSettings = openSettingsAction,
                 onDismiss = vm::closeLocationPickerModal,
+                onOpenMapPicker = vm::openMapLocationPickerModal,
+            )
+        } else if (uiState.activeModal == ClimaActiveModal.MapLocationPicker) {
+            MapLocationPickerScreen(
+                mapState = uiState.cityMapState,
+                pickerState = uiState.mapLocationPickerState,
+                customPointNameInput = uiState.customPointNameInput,
+                isOnline = uiState.isOnline,
+                isPermanentlyDenied = uiState.locationPermissionSnapshot.permanentlyDenied,
+                onSearchQueryChange = vm::updateMapPickerSearchQuery,
+                onSubmitSearch = vm::submitMapPickerSearch,
+                onSelectSearchResult = vm::selectSearchResultInMapPicker,
+                onMapStateChange = vm::updateCityMapState,
+                onCustomPointNameChange = vm::updateCustomPointNameInput,
+                onConfirmSelection = vm::confirmMapLocationSelection,
+                onCancel = vm::closeMapLocationPickerModal,
+                onOpenAppSettings = openSettingsAction,
+                onRetryReload = vm::onPullRefreshCities,
             )
         }
 

@@ -45,7 +45,6 @@ import com.example.R
 import com.example.data.model.CitySearchResult
 import com.example.data.model.SavedLocation
 import com.example.data.model.WeatherUnitConverter
-import com.example.maps.CityMapLibreSection
 import com.example.maps.CityMapUiState
 import com.example.media.ClimaUiIcons
 import com.example.ui.components.AnimatedWeatherIcon
@@ -68,9 +67,11 @@ import com.example.ui.theme.WeatherGlassSpecs
 
 /**
  * Complete native reproduction of CLIMA 3D V53 `citiesScreen` (Cidades):
- * Header -> 3-tab toolbar (Minhas localizações / Selecionar no mapa / Pesquisar cidade) ->
- * Interactive MapLibre + OSM map + custom point saver + saved locations with cached weather ->
- * Real Open-Meteo Geocoding search with disambiguation of same-name cities.
+ * Etapa 3P: Does NOT keep a permanent MapLibre `MapView` mounted on the Cities tab.
+ * Instead, provides:
+ * - Saved locations list with cached weather summaries, selection, removal, and pull-to-refresh.
+ * - Real Open-Meteo Geocoding search with disambiguation of same-name cities.
+ * - Direct action to open the on-demand interactive MapLibre location picker screen (`MapLocationPickerScreen`).
  */
 @Composable
 fun CitiesScreen(
@@ -85,6 +86,7 @@ fun CitiesScreen(
     onAddCityResult: (CitySearchResult) -> Unit,
     onSelectSavedLocation: (SavedLocation) -> Unit,
     onRemoveSavedLocation: (SavedLocation) -> Unit,
+    onOpenMapPicker: () -> Unit = { onSelectSubTab(CitiesSubTab.MAP) },
     onRetryMap: () -> Unit = {},
     onRefreshCities: () -> Unit = {},
     onOpenAppLocationSettings: () -> Unit = {},
@@ -119,7 +121,13 @@ fun CitiesScreen(
                             CitiesSubTab.SEARCH to "Pesquisar",
                         ),
                     selected = uiState.citiesSubTab,
-                    onSelect = onSelectSubTab,
+                    onSelect = { selectedTab ->
+                        if (selectedTab == CitiesSubTab.MAP) {
+                            onOpenMapPicker()
+                        } else {
+                            onSelectSubTab(selectedTab)
+                        }
+                    },
                     testTagPrefix = "cities_subtab",
                 )
             }
@@ -132,29 +140,17 @@ fun CitiesScreen(
                         onQueryChanged = onSearchQueryChanged,
                         onSubmit = onSubmitSearch,
                         onAddResult = onAddCityResult,
-                        onBackToMap = { onSelectSubTab(CitiesSubTab.MAP) },
+                        onBackToMap = onOpenMapPicker,
                     )
                 }
             } else {
-                // Interactive MapLibre + OpenStreetMap section (preserves test tags for MapLibreAndRadarTest)
-                item(key = "cities_map_libre") {
-                    CityMapLibreSection(
-                        initialState = uiState.cityMapState,
-                        isOnline = uiState.isOnline,
-                        isPermanentlyDenied = uiState.locationPermissionSnapshot.permanentlyDenied,
-                        onOpenAppSettings = onOpenAppLocationSettings,
-                        onRetryReload = onRetryMap,
-                        onStateChanged = onMapStateChanged,
-                    )
-                }
-
-                // V53 .map-selected custom pin saver card
-                item(key = "cities_save_point_card") {
+                // Etapa 3P: On-demand MapLibre location picker launcher card (no permanent MapView mounted here)
+                item(key = "cities_open_map_picker_card") {
                     Surface(
                         shape = RoundedCornerShape(18.dp),
                         color = Color.Transparent,
                         border = BorderStroke(1.dp, if (dark) Color(0xFF5ABFFF) else Color(0x990E6CB8)),
-                        modifier = Modifier.fillMaxWidth().testTag("cities_save_point_card"),
+                        modifier = Modifier.fillMaxWidth().testTag("cities_open_map_picker_card"),
                     ) {
                         Column(
                             modifier =
@@ -175,18 +171,30 @@ fun CitiesScreen(
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                    Text(
-                                        text = "Ponto selecionado no mapa",
-                                        color = WeatherGlassSpecs.primaryTextColor(dark),
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.Bold,
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(
+                                        painter = painterResource(ClimaUiIcons.Map),
+                                        contentDescription = null,
+                                        tint = ClimaAccentCyan,
+                                        modifier = Modifier.size(22.dp),
                                     )
-                                    Text(
-                                        text = uiState.cityMapState.selectedMarker.coordinate.formatted(),
-                                        color = WeatherGlassSpecs.accentColor(dark),
-                                        style = MaterialTheme.typography.labelMedium,
-                                    )
+                                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text(
+                                            text = "Escolher localização no mapa",
+                                            color = WeatherGlassSpecs.primaryTextColor(dark),
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold,
+                                        )
+                                        Text(
+                                            text = "Ativa: ${uiState.activeLocationName} (${uiState.activeLocationCoordinate.formatted()})",
+                                            color = WeatherGlassSpecs.accentColor(dark),
+                                            style = MaterialTheme.typography.labelMedium,
+                                        )
+                                    }
                                 }
                                 Surface(
                                     shape = RoundedCornerShape(99.dp),
@@ -194,7 +202,7 @@ fun CitiesScreen(
                                     border = BorderStroke(1.dp, ClimaAccentCyan.copy(alpha = 0.5f)),
                                 ) {
                                     Text(
-                                        text = "Escolha livre",
+                                        text = "Sob demanda",
                                         color = WeatherGlassSpecs.primaryTextColor(dark),
                                         style = MaterialTheme.typography.labelSmall,
                                         modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
@@ -202,32 +210,17 @@ fun CitiesScreen(
                                 }
                             }
 
-                            OutlinedTextField(
-                                value = uiState.customPointNameInput,
-                                onValueChange = onPointNameChanged,
-                                singleLine = true,
-                                placeholder = {
-                                    Text(
-                                        text = stringResource(R.string.cities_point_name_placeholder),
-                                        style = MaterialTheme.typography.bodySmall,
-                                    )
-                                },
-                                colors = cityInputColors(dark),
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.fillMaxWidth().testTag("cities_point_name_input"),
+                            Text(
+                                text = "Abra o mapa interativo OpenStreetMap para pesquisar cidades, bairros ou selecionar qualquer ponto geográfico com zoom e GPS.",
+                                color = WeatherGlassSpecs.mutedTextColor(dark),
+                                style = MaterialTheme.typography.bodySmall,
                             )
 
                             V53PrimaryButton(
-                                text = stringResource(R.string.cities_save_point),
-                                iconRes = ClimaUiIcons.Plus,
-                                onClick = onSaveSelectedPoint,
-                                modifier = Modifier.testTag("cities_save_point_button"),
-                            )
-
-                            Text(
-                                text = "O zoom mostra ruas e terrenos no OpenStreetMap; as previsões usam a grade meteorológica real do Open-Meteo.",
-                                color = WeatherGlassSpecs.mutedTextColor(dark),
-                                style = MaterialTheme.typography.labelSmall,
+                                text = "Escolher localização no mapa",
+                                iconRes = ClimaUiIcons.Map,
+                                onClick = onOpenMapPicker,
+                                modifier = Modifier.testTag("cities_open_map_picker_button"),
                             )
                         }
                     }
@@ -245,7 +238,7 @@ fun CitiesScreen(
                     item(key = "cities_empty_saved") {
                         V53GlassCard(alpha = tabSpec.cardAlpha) {
                             Text(
-                                text = "Nenhuma localização salva ainda. Pesquise uma cidade ou marque um ponto no mapa acima.",
+                                text = "Nenhuma localização salva ainda. Pesquise uma cidade ou escolha um ponto no mapa.",
                                 color = WeatherGlassSpecs.mutedTextColor(dark),
                                 style = MaterialTheme.typography.bodySmall,
                             )

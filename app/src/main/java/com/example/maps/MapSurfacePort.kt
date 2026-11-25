@@ -4,7 +4,6 @@ import android.content.Context
 import android.view.MotionEvent
 import android.view.TextureView
 import android.view.View
-import com.example.data.model.RainViewerRadarFrame
 import java.util.concurrent.atomic.AtomicBoolean
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
@@ -12,37 +11,18 @@ import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
-import org.maplibre.android.style.layers.Property
-import org.maplibre.android.style.layers.PropertyFactory.rasterOpacity
-import org.maplibre.android.style.layers.PropertyFactory.visibility
-import org.maplibre.android.style.layers.RasterLayer
 import org.maplibre.android.style.sources.GeoJsonSource
-import org.maplibre.android.style.sources.RasterSource
-import org.maplibre.android.style.sources.TileSet
 
 internal sealed interface MapStyleSpecRequest {
     data class Cities(
         val savedMarkersGeoJson: String,
         val selectedMarkerGeoJson: String,
     ) : MapStyleSpecRequest
-
-    data object RadarBase : MapStyleSpecRequest
 }
 
 internal interface MapStylePort {
     val isFullyLoaded: Boolean
     fun updateGeoJsonSource(sourceId: String, geoJson: String)
-    fun addRainViewerSourceAndLayer(
-        sourceId: String,
-        layerId: String,
-        frame: RainViewerRadarFrame,
-        maxRadarZoom: Int,
-        opacity: Float,
-        isVisible: Boolean,
-        aboveLayerId: String,
-    )
-    fun setLayerVisibility(layerId: String, isVisible: Boolean)
-    fun removeSourceAndLayer(sourceId: String, layerId: String)
 }
 
 internal interface MapLibreControllerPort {
@@ -96,46 +76,6 @@ private class RealMapStylePort(
     override fun updateGeoJsonSource(sourceId: String, geoJson: String) {
         style.getSourceAs<GeoJsonSource>(sourceId)?.setGeoJson(geoJson)
     }
-
-    override fun addRainViewerSourceAndLayer(
-        sourceId: String,
-        layerId: String,
-        frame: RainViewerRadarFrame,
-        maxRadarZoom: Int,
-        opacity: Float,
-        isVisible: Boolean,
-        aboveLayerId: String,
-    ) {
-        val provider = frame.toTileProvider()
-        val tileSet =
-            TileSet("2.2", provider.tileUrlTemplate).apply {
-                minZoom = 0f
-                maxZoom = maxRadarZoom.toFloat()
-                attribution = RainViewerRadarFrame.ATTRIBUTION
-            }
-        style.addSource(RasterSource(sourceId, tileSet, provider.tileWidthPx))
-        val rainLayer =
-            RasterLayer(layerId, sourceId).withProperties(
-                rasterOpacity(opacity),
-                visibility(if (isVisible) Property.VISIBLE else Property.NONE),
-            )
-        if (style.getLayer(aboveLayerId) != null) {
-            style.addLayerAbove(rainLayer, aboveLayerId)
-        } else {
-            style.addLayer(rainLayer)
-        }
-    }
-
-    override fun setLayerVisibility(layerId: String, isVisible: Boolean) {
-        style.getLayerAs<RasterLayer>(layerId)?.setProperties(
-            visibility(if (isVisible) Property.VISIBLE else Property.NONE),
-        )
-    }
-
-    override fun removeSourceAndLayer(sourceId: String, layerId: String) {
-        style.removeLayer(layerId)
-        style.removeSource(sourceId)
-    }
 }
 
 private class RealMapLibreControllerPort(
@@ -185,8 +125,6 @@ private class RealMapLibreControllerPort(
                         savedMarkersGeoJson = request.savedMarkersGeoJson,
                         selectedMarkerGeoJson = request.selectedMarkerGeoJson,
                     )
-                MapStyleSpecRequest.RadarBase ->
-                    OpenStreetMapTileConfig.buildRadarBaseStyleBuilder()
             }
         map.setStyle(builder) { style ->
             onLoaded(RealMapStylePort(style))

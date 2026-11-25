@@ -22,18 +22,38 @@ data class CitySearchResult(
     val population: Int?,
 ) {
     /**
-     * Builds a disambiguation subtitle combining region and country (e.g. "São Paulo, Brasil").
+     * Builds a disambiguation subtitle combining municipality/district, state/region and country
+     * (e.g. "Rio de Janeiro, Brasil" for "Copacabana" or "São Paulo, Brasil").
      */
     fun displayRegionLabel(): String {
         val parts = buildList {
-            admin1?.takeIf { it.isNotBlank() && !it.equals(name, ignoreCase = true) }?.let { add(it) }
-            if (isEmpty()) {
-                admin2?.takeIf { it.isNotBlank() && !it.equals(name, ignoreCase = true) }?.let { add(it) }
+            val cleanAdmin2 = admin2?.trim()?.takeIf {
+                it.isNotEmpty() && !it.equals(name, ignoreCase = true)
             }
-            country?.takeIf { it.isNotBlank() }?.let { add(it) }
-                ?: countryCode?.takeIf { it.isNotBlank() }?.let { add(it) }
+            val cleanAdmin1 = admin1?.trim()?.takeIf {
+                it.isNotEmpty() &&
+                    !it.equals(name, ignoreCase = true) &&
+                    !it.equals(cleanAdmin2, ignoreCase = true)
+            }
+            cleanAdmin2?.let { add(it) }
+            cleanAdmin1?.let { add(it) }
+            country?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it) }
+                ?: countryCode?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it) }
         }
         return parts.joinToString(separator = ", ")
+    }
+
+    /**
+     * Stable deduplication key combining normalized locality name, region, country and 2-decimal coordinates.
+     * Prevents duplicate entries from the geocoding provider while preserving distinct cities with the same name.
+     */
+    fun deduplicationKey(): String {
+        val normName = name.trim().lowercase(Locale.ROOT)
+        val normAdmin1 = admin1?.trim()?.lowercase(Locale.ROOT).orEmpty()
+        val normAdmin2 = admin2?.trim()?.lowercase(Locale.ROOT).orEmpty()
+        val normCountry = (countryCode ?: country)?.trim()?.lowercase(Locale.ROOT).orEmpty()
+        val coordBucket = String.format(Locale.US, "%.2f_%.2f", latitude, longitude)
+        return "$normName|$normAdmin2|$normAdmin1|$normCountry|$coordBucket"
     }
 
     /**

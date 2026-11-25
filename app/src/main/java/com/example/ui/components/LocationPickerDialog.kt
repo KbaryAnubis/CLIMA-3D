@@ -75,6 +75,7 @@ fun LocationPickerDialog(
     onRequestLocationPermission: () -> Unit,
     onOpenAppLocationSettings: () -> Unit,
     onDismiss: () -> Unit,
+    onOpenMapPicker: () -> Unit = {},
 ) {
     val dark = LocalClimaDarkTheme.current
     val pickerState = uiState.locationPickerState
@@ -159,7 +160,7 @@ fun LocationPickerDialog(
                             .testTag("location_picker_list"),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    // "Use my location" quick action + permission/GPS feedback
+                    // "Use my location" quick action + "Choose on map" action + permission/GPS feedback
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Surface(
                             shape = RoundedCornerShape(14.dp),
@@ -230,6 +231,15 @@ fun LocationPickerDialog(
                                 }
                             }
                         }
+
+                        // Etapa 3P: Direct button to open the on-demand interactive MapLibre location picker
+                        V53PrimaryButton(
+                            text = "Escolher localização no mapa",
+                            iconRes = ClimaUiIcons.Map,
+                            secondary = false,
+                            onClick = onOpenMapPicker,
+                            modifier = Modifier.fillMaxWidth().testTag("location_picker_open_map_button"),
+                        )
 
                         if (!permissionSnapshot.hasAnyPermission) {
                             Surface(

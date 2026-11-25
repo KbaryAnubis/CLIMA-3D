@@ -44,6 +44,7 @@ sealed interface ClimaActiveModal {
     data class MetricDetail(val metric: WeatherMetricType) : ClimaActiveModal
     data object PressureInfo : ClimaActiveModal
     data object LocationPicker : ClimaActiveModal
+    data object MapLocationPicker : ClimaActiveModal
 }
 
 @Immutable
@@ -56,6 +57,19 @@ data class LocationPickerUiState(
     val isLocatingUser: Boolean = false,
     val gpsErrorMessage: String? = null,
     val pendingGpsActionAfterPermission: Boolean = false,
+)
+
+@Immutable
+data class MapLocationPickerUiState(
+    val searchQuery: String = "",
+    val searchResults: List<CitySearchResult> = emptyList(),
+    val isSearching: Boolean = false,
+    val searchErrorMessage: String? = null,
+    val hasSearchedCurrentQuery: Boolean = false,
+    val selectedSearchResult: CitySearchResult? = null,
+    val isGpsSelection: Boolean = false,
+    val selectedPlaceName: String = "",
+    val selectedRegionSubtitle: String = "",
 )
 
 @Immutable
@@ -100,6 +114,7 @@ data class ClimaUiState(
     // Home UI interaction state
     val daysExpanded: Boolean = false,
     val locationPickerState: LocationPickerUiState = LocationPickerUiState(),
+    val mapLocationPickerState: MapLocationPickerUiState = MapLocationPickerUiState(),
     // Cities UI state
     val citiesSubTab: CitiesSubTab = CitiesSubTab.SAVED,
     val citySearchQuery: String = "",
@@ -115,6 +130,8 @@ data class ClimaUiState(
     val activeModal: ClimaActiveModal = ClimaActiveModal.None,
     val toastMessage: String? = null,
 ) {
+    val isMapLocationPickerOpen: Boolean
+        get() = activeModal is ClimaActiveModal.MapLocationPicker
     val activeWeatherCondition: WeatherCondition
         get() = forecast?.current?.visualCondition ?: WeatherCondition.SOL_NUVENS
 

@@ -51,14 +51,15 @@ import com.example.data.model.RadarTimelineSnapshot
 import com.example.data.model.WeatherUnitConverter
 import com.example.maps.RadarBaseStyle
 import com.example.maps.RadarLayerStatusCard
-import com.example.maps.RadarMapLibreView
 import com.example.media.ClimaUiIcons
 import com.example.media.WeatherIconSize
 import com.example.ui.components.AnimatedWeatherIcon
 import com.example.ui.components.V53NoticeBanner
+import com.example.ui.components.V53PrimaryButton
 import com.example.ui.components.V53PullToRefreshBox
 import com.example.ui.state.ClimaUiState
 import com.example.ui.theme.ClimaAccentCyan
+import com.example.ui.theme.ClimaAlertAttentionAmber
 import com.example.ui.theme.ClimaDeepSky
 import com.example.ui.theme.ClimaRadarHeaderBottom
 import com.example.ui.theme.ClimaRadarHeaderTop
@@ -76,10 +77,10 @@ import com.example.ui.theme.WeatherGlassSpecs
 import kotlin.math.roundToInt
 
 /**
- * Complete native reproduction of CLIMA 3D V53 `wx28-radar` screen:
+ * Native reproduction of CLIMA 3D V53 `wx28-radar` screen without a permanent MapLibre `MapView` (Etapa 3P):
  * Header -> Location pill -> Summary + 8-stop precipitation intensity ramp ->
- * Interactive MapLibre + OSM + RainViewer map with layer selector & zoom buttons ->
- * Real historical RainViewer 9-frame timeline scrubber & play/pause ->
+ * Native precipitation evolution & hourly rain intensity monitor (Open-Meteo + RainViewer historical scans) ->
+ * Real historical RainViewer timeline scrubber & play/pause ->
  * Preserved MeteorologicalRadarTileProvider transparency status card.
  */
 @Composable
@@ -134,21 +135,16 @@ fun RadarScreen(
                 precipitationUnit = uiState.preferences.precipitationUnit,
             )
 
-            RadarMapCard(
-                center = uiState.activeLocationCoordinate,
-                zoom = uiState.radarZoom,
+            RadarPrecipitationEvolutionCard(
+                forecast = uiState.forecast,
+                precipitationUnit = uiState.preferences.precipitationUnit,
                 frames = frames,
+                safeIndex = safeIndex,
                 activeFrame = activeFrame,
-                radarLayer = uiState.radarLayer,
-                radarLayerMenuExpanded = uiState.radarLayerMenuExpanded,
-                maxRadarZoom = maxRadarZoom,
                 isOnline = uiState.isOnline,
                 radarErrorMessage = uiState.radarErrorMessage,
+                onSelectFrame = onSelectFrame,
                 onRefreshRadar = onRefreshRadar,
-                onToggleLayerMenu = onToggleLayerMenu,
-                onSelectLayer = onSelectLayer,
-                onZoomIn = onZoomIn,
-                onZoomOut = onZoomOut,
             )
 
             RadarTimelineCard(
@@ -163,7 +159,7 @@ fun RadarScreen(
             RadarLayerStatusCard()
 
             V53NoticeBanner(
-                text = "A API pública do RainViewer fornece quadros históricos reais de precipitação (sem previsão futura/nowcast) com zoom máximo de camada $maxRadarZoom.",
+                text = "A API pública do RainViewer fornece quadros históricos reais de precipitação (sem previsão futura/nowcast) e o Open-Meteo fornece a evolução horária real de chuva para a localização ativa.",
                 iconRes = ClimaUiIcons.Info,
             )
         }
@@ -451,148 +447,253 @@ private fun RadarSummaryCard(
 }
 
 @Composable
-private fun RadarMapCard(
-    center: com.example.maps.CityMapCoordinate,
-    zoom: Double,
+private fun RadarPrecipitationEvolutionCard(
+    forecast: com.example.data.model.WeatherForecastBundle?,
+    precipitationUnit: com.example.data.model.PrecipitationUnit,
     frames: List<com.example.data.model.RainViewerRadarFrame>,
+    safeIndex: Int,
     activeFrame: com.example.data.model.RainViewerRadarFrame?,
-    radarLayer: RadarBaseStyle,
-    radarLayerMenuExpanded: Boolean,
-    maxRadarZoom: Int,
     isOnline: Boolean,
     radarErrorMessage: String?,
+    onSelectFrame: (Int) -> Unit,
     onRefreshRadar: () -> Unit,
-    onToggleLayerMenu: () -> Unit,
-    onSelectLayer: (RadarBaseStyle) -> Unit,
-    onZoomIn: () -> Unit,
-    onZoomOut: () -> Unit,
 ) {
-    Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = Color(0xFF062941),
-        border = BorderStroke(1.dp, Color(0x6E5F9ED1)),
-        modifier = Modifier.fillMaxWidth().height(380.dp).testTag("radar_map_container"),
-    ) {
-        Box(modifier = Modifier.fillMaxSize()) {
-            RadarMapLibreView(
-                center = center,
-                zoom = zoom,
-                frames = frames,
-                activeFrame = activeFrame,
-                layerStyle = radarLayer,
-                maxRadarZoom = maxRadarZoom,
-                isOnline = isOnline,
-                radarErrorMessage = radarErrorMessage,
-                onRetryReload = onRefreshRadar,
-                modifier = Modifier.fillMaxSize(),
-            )
+    val hourlySlice = remember(forecast?.hourly) { forecast?.hourly.orEmpty().take(12) }
+    val currentPrecipMm = forecast?.current?.precipitationMm ?: 0.0
+    val currentIntensityLabel = remember(currentPrecipMm) { classifyPrecipitationIntensityPt(currentPrecipMm) }
 
-            Column(
-                modifier = Modifier.align(Alignment.TopStart).padding(10.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = Color.Transparent,
+        border = BorderStroke(1.dp, Color(0x8858C4FF)),
+        modifier = Modifier.fillMaxWidth().testTag("radar_precipitation_evolution_card"),
+    ) {
+        Column(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .background(Brush.linearGradient(listOf(ClimaRadarSummaryTop, ClimaRadarTimelineBottom)))
+                    .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
             ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "Evolução da precipitação e varredura",
+                        color = ClimaTextOnDark,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = "Intensidade atual: $currentIntensityLabel • Dados reais Open-Meteo e RainViewer",
+                        color = Color(0xFFC2DFF1),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 Surface(
-                    shape = RoundedCornerShape(13.dp),
-                    color = Color(0xE806233D),
-                    border = BorderStroke(1.dp, Color(0xFF73CAFD)),
-                    modifier = Modifier.testTag("radar_layer_button"),
+                    shape = RoundedCornerShape(99.dp),
+                    color = ClimaAccentCyan.copy(alpha = 0.2f),
+                    border = BorderStroke(1.dp, ClimaAccentCyan.copy(alpha = 0.55f)),
                 ) {
-                    Row(
-                        modifier =
-                            Modifier
-                                .minimumInteractiveComponentSize()
-                                .clickable(onClick = onToggleLayerMenu)
-                                .padding(horizontal = 11.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    Text(
+                        text = currentIntensityLabel,
+                        color = ClimaTextOnDark,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    )
+                }
+            }
+
+            if (!isOnline && frames.isEmpty() && hourlySlice.isEmpty()) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color(0xAA08243E),
+                    border = BorderStroke(1.dp, ClimaAlertAttentionAmber.copy(alpha = 0.6f)),
+                    modifier = Modifier.fillMaxWidth().testTag("radar_status_offline"),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Icon(
-                            painter = painterResource(ClimaUiIcons.Layers),
-                            contentDescription = stringResource(R.string.radar_layers_label),
-                            tint = ClimaAccentCyan,
-                            modifier = Modifier.size(16.dp),
-                        )
                         Text(
-                            text =
-                                if (radarLayer == RadarBaseStyle.PRECIPITATION_MAP) {
-                                    stringResource(R.string.radar_layer_precip)
-                                } else {
-                                    stringResource(R.string.radar_layer_base)
-                                },
+                            text = "Sem conexão com a internet para consultar as varreduras históricas do RainViewer.",
                             color = ClimaTextOnDark,
-                            style = MaterialTheme.typography.labelMedium,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        V53PrimaryButton(
+                            text = "Tentar novamente",
+                            iconRes = ClimaUiIcons.Refresh,
+                            secondary = true,
+                            onClick = onRefreshRadar,
+                            modifier = Modifier.testTag("radar_retry_button"),
                         )
                     }
                 }
-
-                if (radarLayerMenuExpanded) {
-                    Surface(
-                        shape = RoundedCornerShape(13.dp),
-                        color = Color(0xF506233D),
-                        border = BorderStroke(1.dp, Color(0xFF73CAFD)),
-                        shadowElevation = 8.dp,
-                        modifier = Modifier.testTag("radar_layer_menu"),
+            } else if (radarErrorMessage != null && frames.isEmpty()) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color(0xAA08243E),
+                    border = BorderStroke(1.dp, ClimaAlertAttentionAmber.copy(alpha = 0.6f)),
+                    modifier = Modifier.fillMaxWidth().testTag("radar_status_provider_error"),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Column(
-                            modifier = Modifier.padding(10.dp).width(190.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        Text(
+                            text = radarErrorMessage,
+                            color = ClimaTextOnDark,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        V53PrimaryButton(
+                            text = "Tentar novamente",
+                            iconRes = ClimaUiIcons.Refresh,
+                            secondary = true,
+                            onClick = onRefreshRadar,
+                            modifier = Modifier.testTag("radar_retry_button"),
+                        )
+                    }
+                }
+            }
+
+            if (hourlySlice.isNotEmpty()) {
+                Text(
+                    text = "EVOLUÇÃO HORÁRIA DE CHUVA (OPEN-METEO)",
+                    color = ClimaAccentCyan,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth().testTag("radar_hourly_rain_list"),
+                ) {
+                    val maxMm = remember(hourlySlice) {
+                        hourlySlice.maxOfOrNull { it.precipitationMm ?: 0.0 }?.coerceAtLeast(2.0) ?: 2.0
+                    }
+                    hourlySlice.take(6).forEachIndexed { idx, hour ->
+                        val mm = (hour.precipitationMm ?: 0.0).coerceAtLeast(0.0)
+                        val prob = (hour.precipitationProbabilityPercent ?: 0).coerceIn(0, 100)
+                        val barFraction = (mm / maxMm).toFloat().coerceIn(0.04f, 1f)
+                        val intensityPt = classifyPrecipitationIntensityPt(mm)
+                        val formattedAmount =
+                            WeatherUnitConverter.formatPrecipitation(mm, precipitationUnit)
+                                ?: "0,0 ${precipitationUnit.symbol}"
+
+                        Row(
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .testTag("radar_hourly_rain_row_$idx"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             Text(
-                                text = stringResource(R.string.radar_layers_label),
-                                color = Color(0xFFE1F6FF),
+                                text = hour.formattedTime,
+                                color = ClimaTextOnDark,
                                 style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.width(52.dp),
                             )
-                            RadarLayerMenuItem(
-                                label = stringResource(R.string.radar_layer_precip),
-                                selected = radarLayer == RadarBaseStyle.PRECIPITATION_MAP,
-                                testTag = "radar_layer_option_precip",
-                                onClick = { onSelectLayer(RadarBaseStyle.PRECIPITATION_MAP) },
-                            )
-                            RadarLayerMenuItem(
-                                label = stringResource(R.string.radar_layer_base),
-                                selected = radarLayer == RadarBaseStyle.SATELLITE,
-                                testTag = "radar_layer_option_base",
-                                onClick = { onSelectLayer(RadarBaseStyle.SATELLITE) },
+                            Box(
+                                modifier =
+                                    Modifier
+                                        .weight(1f)
+                                        .height(10.dp)
+                                        .clip(RoundedCornerShape(99.dp))
+                                        .background(Color(0x441B4F79)),
+                            ) {
+                                Box(
+                                    modifier =
+                                        Modifier
+                                            .fillMaxWidth(barFraction)
+                                            .height(10.dp)
+                                            .clip(RoundedCornerShape(99.dp))
+                                            .background(Brush.horizontalGradient(ClimaRadarRampColors)),
+                                )
+                            }
+                            Text(
+                                text = "$prob% • $formattedAmount ($intensityPt)",
+                                color = Color(0xFFD7EEFC),
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
                         }
                     }
                 }
             }
 
-            Column(
-                modifier = Modifier.align(Alignment.TopEnd).padding(10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                RadarZoomButton(
-                    glyph = "+",
-                    contentDescription = stringResource(R.string.cities_map_zoom_in),
-                    testTag = "radar_zoom_in",
-                    onClick = onZoomIn,
-                )
-                RadarZoomButton(
-                    glyph = "−",
-                    contentDescription = stringResource(R.string.cities_map_zoom_out),
-                    testTag = "radar_zoom_out",
-                    onClick = onZoomOut,
-                )
-            }
+            if (frames.isNotEmpty()) {
+                HorizontalDivider(color = Color(0x468FE9FF))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "VARREDURAS HISTÓRICAS RAINVIEWER",
+                        color = ClimaAccentCyan,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = activeFrame?.formattedLocalTime?.let { "Selecionado: $it" }.orEmpty(),
+                        color = ClimaTextMutedOnDark,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
 
-            Surface(
-                modifier = Modifier.align(Alignment.BottomStart).padding(10.dp).testTag("radar_attribution_badge"),
-                shape = RoundedCornerShape(8.dp),
-                color = Color(0xC9001B31),
-                border = BorderStroke(1.dp, Color(0x5570CBF6)),
-            ) {
-                Text(
-                    text = "© OpenStreetMap • RainViewer • Zoom ${zoom.roundToInt()}",
-                    color = ClimaTextOnDark,
-                    style = MaterialTheme.typography.labelSmall,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    frames.forEachIndexed { idx, frame ->
+                        val selected = idx == safeIndex
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (selected) Color(0xFF0F6BA5) else Color(0x660A3354),
+                            border =
+                                BorderStroke(
+                                    1.dp,
+                                    if (selected) Color(0xFF80D6FD) else Color(0x55388DCD),
+                                ),
+                            modifier =
+                                Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { onSelectFrame(idx) }
+                                    .testTag("radar_historical_frame_chip_$idx"),
+                        ) {
+                            Text(
+                                text = frame.formattedLocalTime,
+                                color = if (selected) ClimaTextOnDark else Color(0xFFC7E2F4),
+                                fontSize = 10.sp,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                modifier = Modifier.padding(vertical = 7.dp, horizontal = 2.dp),
+                            )
+                        }
+                    }
+                }
             }
         }
     }
 }
+
+private fun classifyPrecipitationIntensityPt(precipitationMmPerHour: Double): String =
+    when {
+        precipitationMmPerHour <= 0.05 -> "Sem chuva"
+        precipitationMmPerHour < 2.5 -> "Fraca"
+        precipitationMmPerHour < 7.6 -> "Moderada"
+        precipitationMmPerHour < 25.0 -> "Forte"
+        else -> "Muito forte"
+    }
 
 @Composable
 private fun RadarTimelineCard(
@@ -707,57 +808,6 @@ private fun RadarTimelineCard(
                     }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun RadarLayerMenuItem(
-    label: String,
-    selected: Boolean,
-    testTag: String,
-    onClick: () -> Unit,
-) {
-    Surface(
-        shape = RoundedCornerShape(9.dp),
-        color = if (selected) Color(0xFF0F6BA5) else Color(0xFF0A3354),
-        border = BorderStroke(1.dp, if (selected) Color(0xFF80D6FD) else Color(0xFF388DCD)),
-        modifier = Modifier.fillMaxWidth().testTag(testTag),
-    ) {
-        Text(
-            text = label,
-            color = if (selected) ClimaTextOnDark else Color(0xFFD8E9F5),
-            style = MaterialTheme.typography.labelMedium,
-            modifier =
-                Modifier
-                    .fillMaxWidth()
-                    .minimumInteractiveComponentSize()
-                    .clickable(onClick = onClick)
-                    .padding(horizontal = 10.dp, vertical = 10.dp),
-        )
-    }
-}
-
-@Composable
-private fun RadarZoomButton(
-    glyph: String,
-    contentDescription: String,
-    testTag: String,
-    onClick: () -> Unit,
-) {
-    Surface(
-        shape = CircleShape,
-        color = ClimaDeepSky.copy(alpha = 0.84f),
-        border = BorderStroke(1.dp, Color(0x8870CBF6)),
-        modifier = Modifier.size(48.dp).testTag(testTag),
-    ) {
-        IconButton(onClick = onClick) {
-            Text(
-                text = glyph,
-                color = ClimaTextOnDark,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-            )
         }
     }
 }

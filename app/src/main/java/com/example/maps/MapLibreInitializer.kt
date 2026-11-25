@@ -178,6 +178,13 @@ object MapLibreInitializer {
 
     fun isInitialized(): Boolean = initialized
 
+    fun resetForTest() {
+        synchronized(this) {
+            initialized = false
+            lastInitError = null
+        }
+    }
+
     /**
      * Creates [MapLibreMapOptions] configured with `textureMode(true)` (TextureView instead of SurfaceView)
      * and dark ocean foreground load color so MapLibre composites reliably inside Jetpack Compose

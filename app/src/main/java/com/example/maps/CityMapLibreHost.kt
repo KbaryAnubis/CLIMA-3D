@@ -184,6 +184,28 @@ internal fun CityMapLibreSectionImpl(
         }
     }
 
+    LaunchedEffect(
+        initialState.selectedMarker,
+        initialState.cameraCenter,
+        initialState.zoom,
+        initialState.cameraMoveVersion,
+    ) {
+        if (
+            uiState.selectedMarker != initialState.selectedMarker ||
+                uiState.cameraCenter != initialState.cameraCenter ||
+                uiState.zoom != initialState.zoom ||
+                uiState.cameraMoveVersion != initialState.cameraMoveVersion
+        ) {
+            uiState =
+                uiState.copy(
+                    selectedMarker = initialState.selectedMarker,
+                    cameraCenter = initialState.cameraCenter,
+                    zoom = initialState.zoom,
+                    cameraMoveVersion = initialState.cameraMoveVersion,
+                )
+        }
+    }
+
     // Re-evaluate permissions and GPS status when returning from System Settings without recreating MapView
     DisposableEffect(lifecycleOwner, context) {
         val observer =
@@ -362,10 +384,25 @@ internal fun CityMapLibreSectionImpl(
                         )
                     },
                     onCameraGestureSettled = { coordinate, zoom ->
-                        updateState(uiState.syncCameraFromGesture(coordinate, zoom))
+                        updateState(
+                            uiState
+                                .syncCameraFromGesture(coordinate, zoom)
+                                .selectMarkerAt(
+                                    coordinate = coordinate,
+                                    moveCameraToMarker = false,
+                                ),
+                        )
                     },
                     modifier = Modifier.fillMaxSize(),
                     surfacePortFactory = surfacePortFactory,
+                )
+
+                // Fixed center marker overlay so the user sees the exact point under the camera center
+                MapCenterPinIndicator(
+                    modifier =
+                        Modifier
+                            .align(Alignment.Center)
+                            .testTag("map_picker_center_marker"),
                 )
 
                 // Map zoom and GPS controls overlay
@@ -540,6 +577,400 @@ internal fun CityMapLibreSectionImpl(
                     modifier = Modifier.testTag("city_map_location_status"),
                 )
             }
+        }
+    }
+}
+
+/**
+ * Full-screen on-demand MapLibre location picker screen (Etapa 3P).
+ *
+ * This is the ONLY screen in the application that mounts a MapLibre `MapView`.
+ * When the user confirms, cancels, or closes this screen, the composable leaves the composition
+ * and its `MapViewSessionHandle` pauses, stops, detaches listeners, and destroys the `MapView` once,
+ * releasing all OpenGL/TextureView surfaces before the animated video background resumes.
+ */
+@Composable
+fun MapLocationPickerScreen(
+    mapState: CityMapUiState,
+    pickerState: com.example.ui.state.MapLocationPickerUiState,
+    customPointNameInput: String,
+    isOnline: Boolean,
+    isPermanentlyDenied: Boolean,
+    onSearchQueryChange: (String) -> Unit,
+    onSubmitSearch: () -> Unit,
+    onSelectSearchResult: (com.example.data.model.CitySearchResult) -> Unit,
+    onMapStateChange: (CityMapUiState) -> Unit,
+    onCustomPointNameChange: (String) -> Unit,
+    onConfirmSelection: () -> Unit,
+    onCancel: () -> Unit,
+    onOpenAppSettings: () -> Unit,
+    onRetryReload: () -> Unit,
+    modifier: Modifier = Modifier,
+    surfacePortFactory: ((Context) -> MapViewSurfacePort)? = null,
+) {
+    androidx.activity.compose.BackHandler(onBack = onCancel)
+
+    val spec = remember { WeatherGlassSpecs.forTab(ClimaTab.CITIES) }
+    val selectedCoord = mapState.selectedMarker.coordinate
+    val displayPlaceName =
+        pickerState.selectedPlaceName
+            .takeIf { it.isNotBlank() }
+            ?: mapState.selectedMarker.label.takeIf { it.isNotBlank() }
+            ?: "Ponto ${selectedCoord.formatted()}"
+
+    Box(
+        modifier =
+            modifier
+                .fillMaxSize()
+                .background(ClimaDeepSky.copy(alpha = 0.94f))
+                .testTag("map_location_picker_screen"),
+    ) {
+        androidx.compose.foundation.lazy.LazyColumn(
+            modifier =
+                Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            // Header bar with title and close/cancel action
+            item {
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = WeatherGlassSpecs.glassContainerColor(spec.cardAlpha),
+                    border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor()),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Icon(
+                                painter = painterResource(ClimaUiIcons.Map),
+                                contentDescription = null,
+                                tint = ClimaAccentCyan,
+                                modifier = Modifier.size(22.dp),
+                            )
+                            Column {
+                                Text(
+                                    text = "Escolher localização no mapa",
+                                    color = ClimaTextOnDark,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                                Text(
+                                    text = "Pesquise ou mova o mapa para qualquer ponto",
+                                    color = ClimaTextMutedOnDark,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                        IconButton(
+                            onClick = onCancel,
+                            modifier =
+                                Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("map_picker_close_button"),
+                        ) {
+                            Icon(
+                                painter = painterResource(ClimaUiIcons.Close),
+                                contentDescription = "Fechar mapa",
+                                tint = ClimaTextOnDark,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+                }
+            }
+
+            // A. Search input for cities, neighborhoods, municipalities, and localities
+            item {
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = WeatherGlassSpecs.glassContainerColor(spec.cardAlpha),
+                    border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor()),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        androidx.compose.material3.OutlinedTextField(
+                            value = pickerState.searchQuery,
+                            onValueChange = onSearchQueryChange,
+                            singleLine = true,
+                            label = {
+                                Text("Pesquisar cidade, bairro ou localidade (Open-Meteo)")
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    painter = painterResource(ClimaUiIcons.Search),
+                                    contentDescription = null,
+                                    tint = ClimaAccentCyan,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            },
+                            trailingIcon = {
+                                if (pickerState.isSearching) {
+                                    CircularProgressIndicator(
+                                        color = ClimaAccentCyan,
+                                        strokeWidth = 2.dp,
+                                        modifier =
+                                            Modifier
+                                                .size(18.dp)
+                                                .testTag("map_picker_search_loading"),
+                                    )
+                                } else if (pickerState.searchQuery.isNotEmpty()) {
+                                    IconButton(
+                                        onClick = { onSearchQueryChange("") },
+                                        modifier = Modifier.testTag("map_picker_clear_search_button"),
+                                    ) {
+                                        Icon(
+                                            painter = painterResource(ClimaUiIcons.Close),
+                                            contentDescription = "Limpar busca",
+                                            tint = ClimaTextMutedOnDark,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                    }
+                                }
+                            },
+                            keyboardOptions =
+                                androidx.compose.foundation.text.KeyboardOptions(
+                                    imeAction = androidx.compose.ui.text.input.ImeAction.Search,
+                                ),
+                            keyboardActions =
+                                androidx.compose.foundation.text.KeyboardActions(
+                                    onSearch = { onSubmitSearch() },
+                                ),
+                            colors =
+                                androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                                    focusedTextColor = ClimaTextOnDark,
+                                    unfocusedTextColor = ClimaTextOnDark,
+                                    focusedBorderColor = ClimaAccentCyan,
+                                    unfocusedBorderColor = Color(0x55A7D8FF),
+                                    focusedLabelColor = ClimaAccentCyan,
+                                    unfocusedLabelColor = ClimaTextMutedOnDark,
+                                ),
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .testTag("map_picker_search_input"),
+                        )
+
+                        if (pickerState.searchErrorMessage != null) {
+                            Text(
+                                text = pickerState.searchErrorMessage,
+                                color = ClimaAlertAttentionAmber,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.testTag("map_picker_search_error"),
+                            )
+                        } else if (
+                            pickerState.hasSearchedCurrentQuery &&
+                                !pickerState.isSearching &&
+                                pickerState.searchResults.isEmpty() &&
+                                pickerState.searchQuery.trim().length >= 2
+                        ) {
+                            Text(
+                                text = "Nenhuma localidade encontrada para \"${pickerState.searchQuery.trim()}\".",
+                                color = ClimaTextMutedOnDark,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.testTag("map_picker_search_empty"),
+                            )
+                        }
+
+                        if (pickerState.searchResults.isNotEmpty()) {
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.fillMaxWidth().testTag("map_picker_search_results_list"),
+                            ) {
+                                pickerState.searchResults.forEachIndexed { idx, candidate ->
+                                    Surface(
+                                        shape = RoundedCornerShape(14.dp),
+                                        color = Color(0x33163C5E),
+                                        border = BorderStroke(1.dp, Color(0x4453BDFF)),
+                                        modifier =
+                                            Modifier
+                                                .fillMaxWidth()
+                                                .minimumInteractiveComponentSize()
+                                                .clip(RoundedCornerShape(14.dp))
+                                                .let { mod ->
+                                                    mod.then(
+                                                        androidx.compose.foundation.clickable {
+                                                            onSelectSearchResult(candidate)
+                                                        },
+                                                    )
+                                                }
+                                                .testTag("map_picker_search_result_$idx"),
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = candidate.name,
+                                                    color = ClimaTextOnDark,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                )
+                                                val subtitle = candidate.displayRegionLabel()
+                                                if (subtitle.isNotBlank()) {
+                                                    Text(
+                                                        text = subtitle,
+                                                        color = ClimaTextMutedOnDark,
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                    )
+                                                }
+                                            }
+                                            Text(
+                                                text = "Centralizar",
+                                                color = ClimaAccentCyan,
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // B & C. Interactive MapLibre + OpenStreetMap viewport with center marker, zoom +/-, pinch zoom & GPS button
+            item {
+                CityMapLibreSectionImpl(
+                    initialState = mapState,
+                    isOnline = isOnline,
+                    isPermanentlyDenied = isPermanentlyDenied,
+                    onOpenAppSettings = onOpenAppSettings,
+                    onRetryReload = onRetryReload,
+                    onStateChanged = onMapStateChange,
+                    surfacePortFactory = surfacePortFactory,
+                )
+            }
+
+            // D. Confirmation card with selected locality name, live coordinates, custom name input, Confirm & Cancel
+            item {
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = WeatherGlassSpecs.glassContainerColor(spec.cardAlpha),
+                    border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor()),
+                    modifier = Modifier.fillMaxWidth().testTag("map_picker_confirmation_card"),
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text(
+                            text = displayPlaceName,
+                            color = ClimaTextOnDark,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.testTag("map_picker_selected_name"),
+                        )
+                        if (pickerState.selectedRegionSubtitle.isNotBlank()) {
+                            Text(
+                                text = pickerState.selectedRegionSubtitle,
+                                color = ClimaTextMutedOnDark,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Text(
+                            text = selectedCoord.formatted(),
+                            color = ClimaAccentCyan,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.testTag("map_picker_selected_coordinates"),
+                        )
+
+                        androidx.compose.material3.OutlinedTextField(
+                            value = customPointNameInput,
+                            onValueChange = onCustomPointNameChange,
+                            singleLine = true,
+                            label = { Text(stringResource(R.string.cities_point_name_hint)) },
+                            colors =
+                                androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                                    focusedTextColor = ClimaTextOnDark,
+                                    unfocusedTextColor = ClimaTextOnDark,
+                                    focusedBorderColor = ClimaAccentCyan,
+                                    unfocusedBorderColor = Color(0x55A7D8FF),
+                                    focusedLabelColor = ClimaAccentCyan,
+                                    unfocusedLabelColor = ClimaTextMutedOnDark,
+                                ),
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .testTag("cities_point_name_input"),
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            androidx.compose.material3.OutlinedButton(
+                                onClick = onCancel,
+                                border = BorderStroke(1.dp, Color(0x66A7D8FF)),
+                                modifier =
+                                    Modifier
+                                        .weight(1f)
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("map_picker_cancel_button"),
+                            ) {
+                                Text(
+                                    text = "Cancelar",
+                                    color = ClimaTextOnDark,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
+                            androidx.compose.material3.Button(
+                                onClick = onConfirmSelection,
+                                colors =
+                                    androidx.compose.material3.ButtonDefaults.buttonColors(
+                                        containerColor = ClimaAccentCyan,
+                                        contentColor = ClimaDeepSky,
+                                    ),
+                                modifier =
+                                    Modifier
+                                        .weight(1.4f)
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("map_picker_confirm_button"),
+                            ) {
+                                Text(
+                                    text = "Confirmar localização",
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MapCenterPinIndicator(modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier.size(34.dp),
+        shape = CircleShape,
+        color = Color(0x55FF7186),
+        border = BorderStroke(2.dp, Color.White),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Box(
+                modifier =
+                    Modifier
+                        .size(12.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFFFF7186)),
+            )
         }
     }
 }

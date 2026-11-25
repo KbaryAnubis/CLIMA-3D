@@ -64,14 +64,17 @@ class ClimaMainViewModel(
     private var citiesRefreshJob: Job? = null
     private var searchJob: Job? = null
     private var pickerSearchJob: Job? = null
+    private var mapPickerSearchJob: Job? = null
     private var pickerActivationJob: Job? = null
     private var radarPlaybackJob: Job? = null
     private var toastJob: Job? = null
     private var initialLocationSeeded = false
     private var lastLoadedLocationId: Long? = null
     private var pickerSearchSequence: Long = 0L
+    private var mapPickerSearchSequence: Long = 0L
     private var pickerGpsRequestSeq: Long = 0L
     private var lastCompletedPickerQuery: String? = null
+    private var lastCompletedMapPickerQuery: String? = null
 
     init {
         observePreferences()
@@ -744,12 +747,328 @@ class ClimaMainViewModel(
         }
     }
 
+    fun openMapLocationPickerModal() {
+        pickerSearchJob?.cancel()
+        pickerSearchJob = null
+        mapPickerSearchJob?.cancel()
+        mapPickerSearchJob = null
+        pickerSearchSequence++
+        mapPickerSearchSequence++
+        pickerGpsRequestSeq++
+        lastCompletedPickerQuery = null
+        lastCompletedMapPickerQuery = null
+        ClimaGraphicsLifecycleDiagnostics.logModalLifecycle("MapLocationPicker", "OPEN")
+        _uiState.update { state ->
+            val initialCoord = state.activeLocationCoordinate
+            val initialName = state.activeLocationName
+            val initialSubtitle = state.activeLocationSubtitle
+            val resetMapState =
+                state.cityMapState
+                    .copy(
+                        isLocatingUser = false,
+                        locationStatusNotice = null,
+                        renderErrorMessage = null,
+                        showSettingsRedirectAction = false,
+                    ).selectMarkerAt(
+                        coordinate = initialCoord,
+                        label = initialName,
+                        moveCameraToMarker = true,
+                    )
+            state.copy(
+                activeModal = ClimaActiveModal.MapLocationPicker,
+                locationPickerState = LocationPickerUiState(),
+                mapLocationPickerState =
+                    MapLocationPickerUiState(
+                        selectedPlaceName = initialName,
+                        selectedRegionSubtitle = initialSubtitle,
+                    ),
+                customPointNameInput = "",
+                cityMapState = resetMapState,
+            )
+        }
+    }
+
+    fun closeMapLocationPickerModal() {
+        mapPickerSearchJob?.cancel()
+        mapPickerSearchJob = null
+        mapPickerSearchSequence++
+        pickerGpsRequestSeq++
+        lastCompletedMapPickerQuery = null
+        ClimaGraphicsLifecycleDiagnostics.logModalLifecycle("MapLocationPicker", "CLOSE")
+        _uiState.update { state ->
+            val activeCoord = state.activeLocationCoordinate
+            val activeName = state.activeLocationName
+            state.copy(
+                activeModal =
+                    if (state.activeModal == ClimaActiveModal.MapLocationPicker) {
+                        ClimaActiveModal.None
+                    } else {
+                        state.activeModal
+                    },
+                mapLocationPickerState = MapLocationPickerUiState(),
+                customPointNameInput = "",
+                cityMapState =
+                    state.cityMapState
+                        .copy(
+                            isLocatingUser = false,
+                            locationStatusNotice = null,
+                        ).selectMarkerAt(
+                            coordinate = activeCoord,
+                            label = activeName,
+                            moveCameraToMarker = true,
+                        ),
+            )
+        }
+    }
+
     fun closeModal() {
-        if (_uiState.value.activeModal == ClimaActiveModal.LocationPicker) {
-            closeLocationPickerModal()
+        when (_uiState.value.activeModal) {
+            ClimaActiveModal.LocationPicker -> {
+                closeLocationPickerModal()
+                return
+            }
+            ClimaActiveModal.MapLocationPicker -> {
+                closeMapLocationPickerModal()
+                return
+            }
+            else -> {
+                _uiState.update { it.copy(activeModal = ClimaActiveModal.None) }
+            }
+        }
+    }
+
+    // --- On-Demand Map Location Picker Actions ---
+
+    fun updateMapPickerSearchQuery(query: String) {
+        val trimmed = query.trim()
+        val currentMapPicker = _uiState.value.mapLocationPickerState
+        if (
+            trimmed.length >= 2 &&
+            trimmed == lastCompletedMapPickerQuery &&
+            !currentMapPicker.isSearching &&
+            currentMapPicker.hasSearchedCurrentQuery &&
+            currentMapPicker.searchErrorMessage == null
+        ) {
+            _uiState.update { state ->
+                state.copy(mapLocationPickerState = state.mapLocationPickerState.copy(searchQuery = query))
+            }
             return
         }
-        _uiState.update { it.copy(activeModal = ClimaActiveModal.None) }
+
+        mapPickerSearchJob?.cancel()
+        mapPickerSearchJob = null
+        val seq = ++mapPickerSearchSequence
+        if (trimmed != lastCompletedMapPickerQuery) {
+            lastCompletedMapPickerQuery = null
+        }
+
+        if (trimmed.length < 2) {
+            _uiState.update { state ->
+                state.copy(
+                    mapLocationPickerState =
+                        state.mapLocationPickerState.copy(
+                            searchQuery = query,
+                            searchResults = emptyList(),
+                            isSearching = false,
+                            searchErrorMessage = null,
+                            hasSearchedCurrentQuery = false,
+                        ),
+                )
+            }
+            return
+        }
+
+        _uiState.update { state ->
+            state.copy(
+                mapLocationPickerState =
+                    state.mapLocationPickerState.copy(
+                        searchQuery = query,
+                        searchErrorMessage = null,
+                        hasSearchedCurrentQuery = false,
+                    ),
+            )
+        }
+
+        mapPickerSearchJob =
+            viewModelScope.launch {
+                delay(PICKER_SEARCH_DEBOUNCE_MS)
+                executeMapPickerCitySearch(trimmed, seq)
+            }
+    }
+
+    fun submitMapPickerSearch() {
+        val currentMapPicker = _uiState.value.mapLocationPickerState
+        val trimmed = currentMapPicker.searchQuery.trim()
+        if (trimmed.length < 2) return
+        if (
+            trimmed == lastCompletedMapPickerQuery &&
+            !currentMapPicker.isSearching &&
+            currentMapPicker.hasSearchedCurrentQuery &&
+            currentMapPicker.searchErrorMessage == null
+        ) {
+            return
+        }
+        mapPickerSearchJob?.cancel()
+        val seq = ++mapPickerSearchSequence
+        mapPickerSearchJob = viewModelScope.launch { executeMapPickerCitySearch(trimmed, seq) }
+    }
+
+    private suspend fun executeMapPickerCitySearch(
+        query: String,
+        requestSeq: Long,
+    ) {
+        if (!currentCoroutineContext().isActive || requestSeq != mapPickerSearchSequence) return
+        _uiState.update { state ->
+            state.copy(
+                mapLocationPickerState =
+                    state.mapLocationPickerState.copy(
+                        isSearching = true,
+                        searchErrorMessage = null,
+                    ),
+            )
+        }
+        when (val result = container.cityLocationRepository.searchCities(query = query)) {
+            is WeatherResult.Success -> {
+                if (!currentCoroutineContext().isActive ||
+                    requestSeq != mapPickerSearchSequence ||
+                    _uiState.value.activeModal != ClimaActiveModal.MapLocationPicker
+                ) {
+                    return
+                }
+                lastCompletedMapPickerQuery = query
+                _uiState.update { state ->
+                    state.copy(
+                        mapLocationPickerState =
+                            state.mapLocationPickerState.copy(
+                                isSearching = false,
+                                searchResults = result.data,
+                                searchErrorMessage = null,
+                                hasSearchedCurrentQuery = true,
+                            ),
+                    )
+                }
+            }
+            is WeatherResult.Failure -> {
+                if (!currentCoroutineContext().isActive ||
+                    requestSeq != mapPickerSearchSequence ||
+                    _uiState.value.activeModal != ClimaActiveModal.MapLocationPicker
+                ) {
+                    return
+                }
+                lastCompletedMapPickerQuery = null
+                _uiState.update { state ->
+                    state.copy(
+                        mapLocationPickerState =
+                            state.mapLocationPickerState.copy(
+                                isSearching = false,
+                                searchResults = emptyList(),
+                                searchErrorMessage = result.error.userMessagePt,
+                                hasSearchedCurrentQuery = true,
+                            ),
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Centers the on-demand map on a selected geocoding suggestion without immediately closing the map.
+     * The user can fine-tune the position or confirm immediately via "Confirmar localização".
+     */
+    fun selectSearchResultInMapPicker(result: CitySearchResult) {
+        mapPickerSearchJob?.cancel()
+        mapPickerSearchJob = null
+        mapPickerSearchSequence++
+        lastCompletedMapPickerQuery = null
+        val targetCoord = result.toCityMapCoordinate()
+        val regionSubtitle = result.displayRegionLabel()
+        _uiState.update { state ->
+            val updatedMapState =
+                state.cityMapState
+                    .selectMarkerAt(
+                        coordinate = targetCoord,
+                        label = result.name,
+                        moveCameraToMarker = true,
+                    ).copy(
+                        zoom = 12.5.coerceIn(CityMapUiState.MIN_ZOOM, CityMapUiState.MAX_ZOOM),
+                        locationStatusNotice = null,
+                    )
+            state.copy(
+                cityMapState = updatedMapState,
+                customPointNameInput = result.name,
+                mapLocationPickerState =
+                    state.mapLocationPickerState.copy(
+                        searchQuery = result.name,
+                        searchResults = emptyList(),
+                        isSearching = false,
+                        searchErrorMessage = null,
+                        hasSearchedCurrentQuery = false,
+                        selectedSearchResult = result,
+                        isGpsSelection = false,
+                        selectedPlaceName = result.name,
+                        selectedRegionSubtitle = regionSubtitle,
+                    ),
+            )
+        }
+    }
+
+    /**
+     * Confirms the currently selected point on the on-demand map picker, persists it in Room and DataStore,
+     * updates the weather forecast for the newly chosen location, and closes the map screen (destroying MapView).
+     */
+    fun confirmMapLocationSelection() {
+        val state = _uiState.value
+        val picker = state.mapLocationPickerState
+        val selectedCoord = state.cityMapState.selectedMarker.coordinate
+        val customName = state.customPointNameInput.trim()
+
+        pickerActivationJob?.cancel()
+        pickerActivationJob =
+            viewModelScope.launch {
+                val searchCandidate = picker.selectedSearchResult
+                val matchesSearchCandidate =
+                    searchCandidate != null &&
+                        kotlin.math.abs(searchCandidate.latitude - selectedCoord.latitude) <= 0.0005 &&
+                        kotlin.math.abs(searchCandidate.longitude - selectedCoord.longitude) <= 0.0005 &&
+                        (customName.isEmpty() || customName.equals(searchCandidate.name, ignoreCase = true))
+
+                val saved =
+                    when {
+                        matchesSearchCandidate && searchCandidate != null -> {
+                            container.cityLocationRepository.saveCityFromSearch(
+                                result = searchCandidate,
+                                setAsPrimary = true,
+                            )
+                        }
+                        picker.isGpsSelection &&
+                            (customName.isEmpty() || customName.equals("Minha localização", ignoreCase = true)) -> {
+                            container.cityLocationRepository.upsertCurrentLocation(
+                                coordinate = selectedCoord,
+                                name = "Minha localização",
+                                setAsPrimary = true,
+                            )
+                        }
+                        else -> {
+                            val label =
+                                customName.ifEmpty {
+                                    picker.selectedPlaceName
+                                        .takeIf { it.isNotBlank() && !it.startsWith("Ponto ") }
+                                        ?: "Ponto ${selectedCoord.formatted()}"
+                                }
+                            container.cityLocationRepository.saveCustomMapPoint(
+                                label = label,
+                                coordinate = selectedCoord,
+                                setAsPrimary = true,
+                            )
+                        }
+                    }
+
+                activateSavedLocationOnHome(
+                    location = saved,
+                    toastMessage = "Localização confirmada: ${saved.name}",
+                    gpsCoordinateForMapState = if (picker.isGpsSelection) selectedCoord else null,
+                )
+            }
     }
 
     // --- Home Quick Location Picker Actions ---
@@ -995,9 +1314,13 @@ class ClimaMainViewModel(
     ) {
         pickerSearchJob?.cancel()
         pickerSearchJob = null
+        mapPickerSearchJob?.cancel()
+        mapPickerSearchJob = null
         pickerSearchSequence++
+        mapPickerSearchSequence++
         pickerGpsRequestSeq++
         lastCompletedPickerQuery = null
+        lastCompletedMapPickerQuery = null
 
         lastLoadedLocationId = location.id
         container.preferencesRepository.setSelectedLocationId(location.id)
@@ -1066,6 +1389,8 @@ class ClimaMainViewModel(
                 activeLocation = location,
                 activeModal = ClimaActiveModal.None,
                 locationPickerState = LocationPickerUiState(),
+                mapLocationPickerState = MapLocationPickerUiState(),
+                customPointNameInput = "",
                 cityMapState = updatedMapState,
                 forecast = cachedForecast?.data,
                 forecastOrigin = cachedForecast?.origin,
@@ -1225,14 +1550,79 @@ class ClimaMainViewModel(
     }
 
     fun selectCitiesSubTab(subTab: CitiesSubTab) {
+        if (subTab == CitiesSubTab.MAP) {
+            openMapLocationPickerModal()
+            return
+        }
         _uiState.update { it.copy(citiesSubTab = subTab) }
     }
 
     fun updateCityMapState(newState: CityMapUiState) {
-        val previousCurrent = _uiState.value.cityMapState.currentUserLocation
+        val current = _uiState.value
+        val previousState = current.cityMapState
+        val previousCurrent = previousState.currentUserLocation
+        val updatedCurrent = newState.currentUserLocation
+        val isMapPickerModal = current.activeModal == ClimaActiveModal.MapLocationPicker
+
+        if (isMapPickerModal) {
+            val isGpsUpdate = updatedCurrent != null && updatedCurrent != previousCurrent
+            val previousCoord = previousState.selectedMarker.coordinate
+            val newCoord = newState.selectedMarker.coordinate
+            val coordChanged = previousCoord != newCoord
+
+            val updatedPicker =
+                when {
+                    isGpsUpdate ->
+                        current.mapLocationPickerState.copy(
+                            selectedSearchResult = null,
+                            isGpsSelection = true,
+                            selectedPlaceName = "Minha localização",
+                            selectedRegionSubtitle = "",
+                        )
+                    coordChanged -> {
+                        val candidate = current.mapLocationPickerState.selectedSearchResult
+                        val matchesCandidate =
+                            candidate != null &&
+                                kotlin.math.abs(candidate.latitude - newCoord.latitude) <= 0.0005 &&
+                                kotlin.math.abs(candidate.longitude - newCoord.longitude) <= 0.0005
+                        if (matchesCandidate && candidate != null) {
+                            current.mapLocationPickerState.copy(
+                                isGpsSelection = false,
+                                selectedPlaceName = candidate.name,
+                                selectedRegionSubtitle = candidate.displayRegionLabel(),
+                            )
+                        } else {
+                            val matchingSaved =
+                                current.savedLocations.firstOrNull {
+                                    kotlin.math.abs(it.latitude - newCoord.latitude) <= 0.0005 &&
+                                        kotlin.math.abs(it.longitude - newCoord.longitude) <= 0.0005
+                                }
+                            current.mapLocationPickerState.copy(
+                                selectedSearchResult = null,
+                                isGpsSelection = false,
+                                selectedPlaceName =
+                                    matchingSaved?.name
+                                        ?: newState.selectedMarker.label.takeIf {
+                                            it.isNotBlank() && !it.startsWith("Ponto ")
+                                        }
+                                        ?: "Ponto ${newCoord.formatted()}",
+                                selectedRegionSubtitle = matchingSaved?.displaySubtitle().orEmpty(),
+                            )
+                        }
+                    }
+                    else -> current.mapLocationPickerState
+                }
+            _uiState.update {
+                it.copy(
+                    cityMapState = newState,
+                    mapLocationPickerState = updatedPicker,
+                )
+            }
+            return
+        }
+
         _uiState.update { it.copy(cityMapState = newState) }
 
-        val updatedCurrent = newState.currentUserLocation
         if (updatedCurrent != null && updatedCurrent != previousCurrent) {
             saveGpsLocation(updatedCurrent)
         }
@@ -1256,6 +1646,10 @@ class ClimaMainViewModel(
     }
 
     fun saveSelectedMapPoint() {
+        if (_uiState.value.activeModal == ClimaActiveModal.MapLocationPicker) {
+            confirmMapLocationSelection()
+            return
+        }
         val state = _uiState.value
         val coord = state.cityMapState.selectedMarker.coordinate
         val name = state.customPointNameInput.trim().ifEmpty { "Ponto ${coord.formatted()}" }
@@ -1442,6 +1836,7 @@ class ClimaMainViewModel(
     override fun onCleared() {
         stopRadarPlayback()
         pickerSearchJob?.cancel()
+        mapPickerSearchJob?.cancel()
         pickerActivationJob?.cancel()
         super.onCleared()
     }

@@ -81,6 +81,7 @@ fun WeatherPersistentShell(
     animatedBackgroundEnabled: Boolean,
     onSelectTab: (ClimaTab) -> Unit,
     modifier: Modifier = Modifier,
+    isMapLocationPickerOpen: Boolean = false,
     toastMessage: String? = null,
     content: @Composable (PaddingValues) -> Unit,
 ) {
@@ -93,6 +94,7 @@ fun WeatherPersistentShell(
             condition = condition,
             activeTab = activeTab,
             animatedEnabled = animatedBackgroundEnabled,
+            isMapLocationPickerOpen = isMapLocationPickerOpen,
             modifier = Modifier.fillMaxSize(),
         )
 

@@ -222,14 +222,12 @@ class ClimaV53UiIntegrationTest {
 
         composeTestRule.onNodeWithTag("radar_header_card").assertIsDisplayed()
         composeTestRule.onNodeWithTag("radar_summary_card").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("radar_layer_button").performScrollTo().performClick()
+        composeTestRule.onNodeWithTag("radar_precipitation_evolution_card").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("radar_historical_frame_chip_0").performScrollTo().performClick()
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("radar_layer_menu").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("radar_layer_option_base").performScrollTo().performClick()
-        composeTestRule.waitForIdle()
-        assertEquals(RadarBaseStyle.SATELLITE, stateHolder.value.radarLayer)
+        assertEquals(0, stateHolder.value.radarSelectedFrameIndex)
 
-        composeTestRule.onNodeWithTag("radar_frame_counter").performScrollTo().assertTextContains("Quadro 9 de 9", substring = true)
+        composeTestRule.onNodeWithTag("radar_frame_counter").performScrollTo().assertTextContains("Quadro 1 de 9", substring = true)
         composeTestRule.onNodeWithTag("radar_play_button").performScrollTo().performClick()
         assertTrue(stateHolder.value.isRadarPlaying)
 
@@ -237,14 +235,14 @@ class ClimaV53UiIntegrationTest {
     }
 
     @Test
-    fun `CitiesScreen supports MapLibre custom point saving and disambiguated Geocoding search`() {
+    fun `CitiesScreen supports on-demand MapLibre location picker launcher and disambiguated Geocoding search`() {
         val searchResults =
             listOf(
                 CitySearchResult(1L, "Santa Maria", "Rio Grande do Sul", null, "Brasil", "BR", -29.68, -53.80, 113.0, "America/Sao_Paulo", 280000),
                 CitySearchResult(2L, "Santa Maria", "Califórnia", null, "Estados Unidos", "US", 34.95, -120.43, 66.0, "America/Los_Angeles", 109000),
             )
         var addedResult: CitySearchResult? = null
-        var pointSaved = false
+        var mapPickerOpened = false
 
         val stateHolder =
             androidx.compose.runtime.mutableStateOf(
@@ -265,7 +263,7 @@ class ClimaV53UiIntegrationTest {
                     onSelectSubTab = { stateHolder.value = state.copy(citiesSubTab = it) },
                     onMapStateChanged = { stateHolder.value = state.copy(cityMapState = it) },
                     onPointNameChanged = { stateHolder.value = state.copy(customPointNameInput = it) },
-                    onSaveSelectedPoint = { pointSaved = true },
+                    onSaveSelectedPoint = {},
                     onSearchQueryChanged = { query ->
                         stateHolder.value = state.copy(citySearchQuery = query, citySearchResults = searchResults)
                     },
@@ -273,16 +271,15 @@ class ClimaV53UiIntegrationTest {
                     onAddCityResult = { addedResult = it },
                     onSelectSavedLocation = {},
                     onRemoveSavedLocation = {},
+                    onOpenMapPicker = { mapPickerOpened = true },
                 )
             }
         }
         composeTestRule.waitForIdle()
 
-        composeTestRule.onNodeWithTag("cities_map_section").assertIsDisplayed()
-        composeTestRule.onNodeWithTag("cities_screen_list").performScrollToKey("cities_save_point_card")
-        composeTestRule.onNodeWithTag("cities_point_name_input").performTextInput("Sítio Serra")
-        composeTestRule.onNodeWithTag("cities_save_point_button").performClick()
-        assertTrue(pointSaved)
+        composeTestRule.onNodeWithTag("cities_open_map_picker_card").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("cities_open_map_picker_button").performClick()
+        assertTrue(mapPickerOpened)
 
         // Switch to Search tab & verify disambiguation of same-name cities
         composeTestRule.onNodeWithTag("cities_screen_list").performScrollToKey("cities_toolbar")

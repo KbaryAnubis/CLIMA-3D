@@ -121,7 +121,7 @@ class MapLibreAndRadarTest {
     }
 
     @Test
-    fun `Navigating to Cities and Radar tabs displays MapLibre map and independent radar layer`() {
+    fun `Navigating to Cities and Radar tabs displays on-demand MapLibre picker and independent radar layer`() {
         composeTestRule.setContent {
             Clima3DTheme(darkTheme = true) {
                 Clima3DNativeAssetsFoundationApp()
@@ -131,8 +131,12 @@ class MapLibreAndRadarTest {
 
         composeTestRule.onNodeWithTag("nav_tab_cities").performClick()
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("cities_open_map_picker_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("cities_map_section").performScrollTo().assertIsDisplayed()
         composeTestRule.onNodeWithTag("city_map_my_location").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("map_picker_close_button").performClick()
+        composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithTag("nav_tab_radar").performClick()
         composeTestRule.waitForIdle()

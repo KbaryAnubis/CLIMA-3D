@@ -64,12 +64,14 @@ fun WeatherBackgroundLayer(
     condition: WeatherCondition,
     activeTab: ClimaTab,
     animatedEnabled: Boolean,
+    isMapLocationPickerOpen: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     WeatherBackgroundLayerImpl(
         condition = condition,
         activeTab = activeTab,
         animatedEnabled = animatedEnabled,
+        isMapLocationPickerOpen = isMapLocationPickerOpen,
         modifier = modifier,
     )
 }
@@ -79,6 +81,7 @@ internal fun WeatherBackgroundLayerImpl(
     condition: WeatherCondition,
     activeTab: ClimaTab,
     animatedEnabled: Boolean,
+    isMapLocationPickerOpen: Boolean = false,
     modifier: Modifier = Modifier,
     playerBridgeFactory: ((Context) -> WeatherVideoPlayerBridge)? = null,
     surfaceBridgeFactory: ((Context) -> WeatherVideoSurfaceBridge)? = null,
@@ -89,8 +92,8 @@ internal fun WeatherBackgroundLayerImpl(
     val coordinationSnapshot by GraphicsSurfaceCoordinator.state.collectAsState()
     val systemReducedMotion = remember(context) { isSystemReducedMotionEnabled(context) }
     val shouldMountVideo = animatedEnabled && !systemReducedMotion
-    val isMapTabActive = shouldPauseBackgroundMotionForTab(activeTab)
-    val allowVideoSurfaceOutput = !isMapTabActive
+    val isMapSurfaceRequested = shouldPauseBackgroundMotionForTab(activeTab, isMapLocationPickerOpen)
+    val allowVideoSurfaceOutput = !isMapSurfaceRequested
     val shouldPlayVideoNow = shouldMountVideo && allowVideoSurfaceOutput
 
     var isActivityStarted by remember(lifecycleOwner) {
@@ -371,6 +374,14 @@ private fun isSystemReducedMotionEnabled(context: Context): Boolean {
     }.getOrDefault(false)
 }
 
-internal fun shouldPauseBackgroundMotionForTab(tab: ClimaTab): Boolean =
-    tab == ClimaTab.RADAR || tab == ClimaTab.CITIES
+/**
+ * Etapa 3P: none of the four permanent tabs (HOME, RADAR, CITIES, SETTINGS) mount a MapView.
+ * The animated video background is paused and its Surface output detached exclusively when the
+ * on-demand MapLocationPicker screen is open.
+ */
+internal fun shouldPauseBackgroundMotionForTab(
+    @Suppress("UNUSED_PARAMETER") tab: ClimaTab,
+    isMapLocationPickerOpen: Boolean = false,
+): Boolean = isMapLocationPickerOpen
+
 

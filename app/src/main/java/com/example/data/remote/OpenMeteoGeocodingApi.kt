@@ -50,7 +50,7 @@ data class OpenMeteoGeocodingResultDto(
 object OpenMeteoGeocodingMapper {
     fun toDomain(dto: OpenMeteoGeocodingResponseDto): List<CitySearchResult> {
         val rawResults = dto.results ?: return emptyList()
-        return rawResults.mapNotNull { item ->
+        val mapped = rawResults.mapNotNull { item ->
             val name = item.name?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
             val lat = item.latitude ?: return@mapNotNull null
             val lon = item.longitude ?: return@mapNotNull null
@@ -69,5 +69,26 @@ object OpenMeteoGeocodingMapper {
                 population = item.population,
             )
         }
+        return deduplicate(mapped)
+    }
+
+    /**
+     * Removes duplicate geocoding results (by providerId or normalized locality + region + coordinate bucket)
+     * while preserving distinct cities with identical names in different states/countries.
+     */
+    fun deduplicate(results: List<CitySearchResult>): List<CitySearchResult> {
+        if (results.size <= 1) return results
+        val seenProviderIds = HashSet<Long>(results.size)
+        val seenKeys = HashSet<String>(results.size)
+        val out = ArrayList<CitySearchResult>(results.size)
+        for (item in results) {
+            val key = item.deduplicationKey()
+            val isNewId = seenProviderIds.add(item.providerId)
+            val isNewKey = seenKeys.add(key)
+            if (isNewId && isNewKey) {
+                out.add(item)
+            }
+        }
+        return out
     }
 }
