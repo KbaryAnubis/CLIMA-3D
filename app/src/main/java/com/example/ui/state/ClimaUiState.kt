@@ -66,6 +66,7 @@ data class MapLocationPickerUiState(
     val isSearching: Boolean = false,
     val searchErrorMessage: String? = null,
     val hasSearchedCurrentQuery: Boolean = false,
+    val isSearchExpanded: Boolean = true,
     val selectedSearchResult: CitySearchResult? = null,
     val isGpsSelection: Boolean = false,
     val selectedPlaceName: String = "",

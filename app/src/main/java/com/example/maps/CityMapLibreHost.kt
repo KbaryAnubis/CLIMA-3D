@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.res.Configuration
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -49,13 +50,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
@@ -640,6 +646,7 @@ fun MapLocationPickerScreen(
     onOpenAppSettings: () -> Unit,
     onRetryReload: () -> Unit,
     modifier: Modifier = Modifier,
+    onReopenSearch: () -> Unit = {},
 ) {
     MapLocationPickerScreenImpl(
         mapState = mapState,
@@ -657,6 +664,7 @@ fun MapLocationPickerScreen(
         onOpenAppSettings = onOpenAppSettings,
         onRetryReload = onRetryReload,
         modifier = modifier,
+        onReopenSearch = onReopenSearch,
     )
 }
 
@@ -678,10 +686,31 @@ internal fun MapLocationPickerScreenImpl(
     onRetryReload: () -> Unit,
     modifier: Modifier = Modifier,
     surfacePortFactory: ((Context) -> MapViewSurfacePort)? = null,
+    onReopenSearch: () -> Unit = {},
 ) {
     androidx.activity.compose.BackHandler(onBack = onCancel)
 
     val spec = remember { WeatherGlassSpecs.forTab(ClimaTab.CITIES) }
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val searchFocusRequester = remember { FocusRequester() }
+    var isSearchBoxExpanded by remember { mutableStateOf(pickerState.isSearchExpanded) }
+    var reopenFocusNonce by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(pickerState.isSearchExpanded) {
+        isSearchBoxExpanded = pickerState.isSearchExpanded
+    }
+
+    LaunchedEffect(isSearchBoxExpanded, reopenFocusNonce) {
+        if (!isSearchBoxExpanded) {
+            focusManager.clearFocus(force = true)
+            keyboardController?.hide()
+        } else if (reopenFocusNonce > 0) {
+            runCatching { searchFocusRequester.requestFocus() }
+            keyboardController?.show()
+        }
+    }
+
     val selectedCoord = mapState.selectedMarker.coordinate
     val displayPlaceName =
         pickerState.selectedPlaceName
@@ -772,12 +801,13 @@ internal fun MapLocationPickerScreenImpl(
                     }
             }
 
-            // A. Search input for cities, neighborhoods, municipalities, and localities
-            Surface(
+            // A. Search input for cities, neighborhoods, municipalities, and localities (auto-collapses after suggestion pick)
+            if (isSearchBoxExpanded) {
+                Surface(
                     shape = RoundedCornerShape(20.dp),
                     color = WeatherGlassSpecs.glassContainerColor(spec.cardAlpha),
                     border = BorderStroke(1.dp, WeatherGlassSpecs.glassBorderColor()),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().testTag("map_picker_search_box"),
                 ) {
                     Column(
                         modifier = Modifier.fillMaxWidth().padding(12.dp),
@@ -842,6 +872,7 @@ internal fun MapLocationPickerScreenImpl(
                             modifier =
                                 Modifier
                                     .fillMaxWidth()
+                                    .focusRequester(searchFocusRequester)
                                     .testTag("map_picker_search_input"),
                         )
 
@@ -882,6 +913,9 @@ internal fun MapLocationPickerScreenImpl(
                                                 .minimumInteractiveComponentSize()
                                                 .clip(RoundedCornerShape(14.dp))
                                                 .clickable {
+                                                    focusManager.clearFocus(force = true)
+                                                    keyboardController?.hide()
+                                                    isSearchBoxExpanded = false
                                                     onSelectSearchResult(candidate)
                                                 }
                                                 .testTag("map_picker_search_result_$idx"),
@@ -919,6 +953,51 @@ internal fun MapLocationPickerScreenImpl(
                             }
                         }
                     }
+                }
+            } else {
+                // Discrete collapsed control allowing instant reopening of search without clearing the pending selection
+                Surface(
+                    onClick = {
+                        reopenFocusNonce++
+                        isSearchBoxExpanded = true
+                        onReopenSearch()
+                    },
+                    shape = RoundedCornerShape(16.dp),
+                    color = WeatherGlassSpecs.glassContainerColor(spec.cardAlpha),
+                    border = BorderStroke(1.dp, Color(0x5553BDFF)),
+                    modifier =
+                        Modifier
+                            .fillMaxWidth()
+                            .minimumInteractiveComponentSize()
+                            .testTag("map_picker_reopen_search_button"),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Icon(
+                            painter = painterResource(ClimaUiIcons.Search),
+                            contentDescription = "Reabrir pesquisa de localidades",
+                            tint = ClimaAccentCyan,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Text(
+                            text = "Buscar outra cidade, bairro ou localidade",
+                            color = ClimaTextOnDark,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            text = "Pesquisar",
+                            color = ClimaAccentCyan,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
             }
 
             // B & C. Interactive MapLibre + OpenStreetMap viewport with center marker, zoom +/-, pinch zoom & GPS button
@@ -1145,6 +1224,7 @@ internal fun CityMapLibreViewImpl(
     val stateMachine = remember { MapLoadStateMachine(screenName = "Cidades") }
     val tileSnapshot by TileTransportDiagnostics.snapshot.collectAsState()
 
+    var activeSessionHandleRef by remember { mutableStateOf<MapViewSessionHandle?>(null) }
     var mapViewRef by remember { mutableStateOf<MapViewSurfacePort?>(null) }
     var mapLibreMapRef by remember { mutableStateOf<MapLibreControllerPort?>(null) }
     var loadedStyleRef by remember { mutableStateOf<MapStylePort?>(null) }
@@ -1162,9 +1242,32 @@ internal fun CityMapLibreViewImpl(
     }
     var attemptKey by remember { mutableIntStateOf(stateMachine.attemptId) }
 
+    fun isCurrentActiveSession(
+        expectedHandle: MapViewSessionHandle? = activeSessionHandleRef,
+        expectedMap: MapLibreControllerPort? = mapLibreMapRef,
+    ): Boolean {
+        val handle = expectedHandle ?: return false
+        return !sessionDisposedRef.get() &&
+            activeSessionHandleRef === handle &&
+            handle.isSessionActive &&
+            mapViewRef === handle.surfacePort &&
+            (expectedMap == null || mapLibreMapRef === expectedMap)
+    }
+
+    fun clearOwnedSessionRefs(holder: MapViewSessionHandle?) {
+        if (holder == null) return
+        if (activeSessionHandleRef === holder || mapViewRef === holder.surfacePort) {
+            sessionDisposedRef.set(true)
+            activeSessionHandleRef = null
+            mapViewRef = null
+            mapLibreMapRef = null
+            loadedStyleRef = null
+        }
+    }
+
     fun applyCitiesStyle(
         map: MapLibreControllerPort,
-        isSessionCurrent: () -> Boolean = { !sessionDisposedRef.get() && mapLibreMapRef === map },
+        isSessionCurrent: () -> Boolean = { isCurrentActiveSession(expectedMap = map) },
     ) {
         if (!isSessionCurrent()) return
         val onlineNow = latestIsOnline
@@ -1209,20 +1312,20 @@ internal fun CityMapLibreViewImpl(
 
     // Feed real OkHttp tile transport telemetry into the Cities map state machine
     LaunchedEffect(tileSnapshot, isOnline) {
-        if (sessionDisposedRef.get()) return@LaunchedEffect
+        if (!isCurrentActiveSession(expectedMap = null)) return@LaunchedEffect
         loadState = stateMachine.onTileTransportUpdated(tileSnapshot, isOnline)
     }
 
     // Initial load timeout guard: prevents indefinite "Carregando mapa..." without faking Available
     LaunchedEffect(attemptKey, isOnline) {
-        if (sessionDisposedRef.get()) return@LaunchedEffect
+        if (!isCurrentActiveSession(expectedMap = null)) return@LaunchedEffect
         if (!isOnline) {
             loadState = stateMachine.onTileTransportUpdated(TileTransportDiagnostics.snapshot.value, isOnline = false)
             return@LaunchedEffect
         }
         val trackedAttempt = attemptKey
         delay(MapLoadStateMachine.INITIAL_LOAD_TIMEOUT_MS)
-        if (sessionDisposedRef.get()) return@LaunchedEffect
+        if (!isCurrentActiveSession(expectedMap = null)) return@LaunchedEffect
         if (stateMachine.attemptId == trackedAttempt && stateMachine.state.isLoading) {
             val surfaceInfo = mapViewRef?.inspectSurfaceInfo() ?: "MapView=null"
             val timedOutState = stateMachine.onTimeout(TileTransportDiagnostics.snapshot.value, surfaceInfo)
@@ -1237,8 +1340,8 @@ internal fun CityMapLibreViewImpl(
 
     // Reload style when connectivity returns or user triggers a soft retry
     LaunchedEffect(mapLibreMapRef, reloadNonce, isOnline) {
-        if (sessionDisposedRef.get()) return@LaunchedEffect
         val map = mapLibreMapRef ?: return@LaunchedEffect
+        if (!isCurrentActiveSession(expectedMap = map)) return@LaunchedEffect
         if (!isOnline && loadedStyleRef == null) {
             loadState = stateMachine.beginAttempt(isOnline = false, hasMapReady = true, tileSnapshot = TileTransportDiagnostics.snapshot.value)
             attemptKey = stateMachine.attemptId
@@ -1249,7 +1352,7 @@ internal fun CityMapLibreViewImpl(
 
     // Update marker GeoJSON layers whenever marker state changes
     LaunchedEffect(loadedStyleRef, savedMarkersJson, selectedMarkerJson) {
-        if (sessionDisposedRef.get()) return@LaunchedEffect
+        if (!isCurrentActiveSession()) return@LaunchedEffect
         val style = loadedStyleRef ?: return@LaunchedEffect
         if (!style.isFullyLoaded) return@LaunchedEffect
         style.updateGeoJsonSource(OpenStreetMapTileConfig.SAVED_MARKERS_SOURCE_ID, savedMarkersJson)
@@ -1258,8 +1361,8 @@ internal fun CityMapLibreViewImpl(
 
     // Sync programmatic zoom/pan/location camera commands to MapLibreMap cleanly without side effects
     LaunchedEffect(mapLibreMapRef, state.cameraMoveVersion) {
-        if (sessionDisposedRef.get()) return@LaunchedEffect
         val map = mapLibreMapRef ?: return@LaunchedEffect
+        if (!isCurrentActiveSession(expectedMap = map)) return@LaunchedEffect
         if (state.cameraMoveVersion == lastAppliedMoveVersion) return@LaunchedEffect
         lastAppliedMoveVersion = state.cameraMoveVersion
         runCatching {
@@ -1274,8 +1377,8 @@ internal fun CityMapLibreViewImpl(
 
     // Synchronize native MapLibre LocationComponent ONLY when map/style/permission/precision changes
     LaunchedEffect(mapLibreMapRef, loadedStyleRef, state.permissionState, state.locationPrecision) {
-        if (sessionDisposedRef.get()) return@LaunchedEffect
         val map = mapLibreMapRef ?: return@LaunchedEffect
+        if (!isCurrentActiveSession(expectedMap = map)) return@LaunchedEffect
         val style = loadedStyleRef ?: return@LaunchedEffect
         map.syncLocationComponent(context, style)
     }
@@ -1288,18 +1391,25 @@ internal fun CityMapLibreViewImpl(
             DisposableEffect(lifecycleOwner, context) {
                 val observer =
                     LifecycleEventObserver { _, event ->
-                        sessionHolder?.controller?.onLifecycleEvent(event)
+                        val holder = sessionHolder ?: return@LifecycleEventObserver
+                        if (event == Lifecycle.Event.ON_DESTROY) {
+                            localSessionDisposed.set(true)
+                            clearOwnedSessionRefs(holder)
+                            holder.destroyOnceAfterDetach("lifecycle_on_destroy")
+                        } else {
+                            holder.onLifecycleEvent(event)
+                        }
                     }
                 val lowMemoryCallbacks =
                     object : ComponentCallbacks2 {
                         override fun onConfigurationChanged(newConfig: Configuration) = Unit
                         @Deprecated("Deprecated in Java")
                         override fun onLowMemory() {
-                            sessionHolder?.controller?.dispatchLowMemory()
+                            sessionHolder?.dispatchLowMemory()
                         }
                         override fun onTrimMemory(level: Int) {
                             if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
-                                sessionHolder?.controller?.dispatchLowMemory()
+                                sessionHolder?.dispatchLowMemory()
                             }
                         }
                     }
@@ -1310,15 +1420,8 @@ internal fun CityMapLibreViewImpl(
                     lifecycleOwner.lifecycle.removeObserver(observer)
                     context.applicationContext?.unregisterComponentCallbacks(lowMemoryCallbacks)
                     val holder = sessionHolder
-                    if (holder == null || mapViewRef === holder.surfacePort) {
-                        sessionDisposedRef.set(true)
-                    }
+                    clearOwnedSessionRefs(holder)
                     holder?.pauseAndStopBeforeDetach("onDispose")
-                    if (holder != null && mapViewRef === holder.surfacePort) {
-                        mapViewRef = null
-                        mapLibreMapRef = null
-                        loadedStyleRef = null
-                    }
                 }
             }
 
@@ -1331,7 +1434,8 @@ internal fun CityMapLibreViewImpl(
                     fun isThisSessionCurrent(): Boolean =
                         !localSessionDisposed.get() &&
                             mapViewRef === port &&
-                            (sessionHolder == null || sessionHolder?.isSessionActive == true)
+                            sessionHolder?.surfacePort === port &&
+                            sessionHolder?.isSessionActive == true
 
                     ClimaMapLogger.i(
                         ClimaMapLogTags.MAP_RENDER,
@@ -1468,7 +1572,7 @@ internal fun CityMapLibreViewImpl(
                             ),
                         )
 
-                    sessionHolder =
+                    val createdSession =
                         MapViewSessionHandle(
                             screenName = "Cidades",
                             sessionId = sessionId,
@@ -1477,15 +1581,28 @@ internal fun CityMapLibreViewImpl(
                             onDetachListeners = detachListeners,
                             onDetachWindowObserver = detachWindowObserver,
                             onCancelTransitions = {
-                                sessionMapController?.cancelTransitions()
-                                sessionMapController?.clearMapListeners()
+                                val mapCtrl = sessionMapController
+                                sessionMapController = null
+                                mapCtrl?.cancelTransitions()
+                                mapCtrl?.clearMapListeners()
+                                mapCtrl?.invalidate()
+                            },
+                            onInvalidateSession = {
+                                val mapCtrl = sessionMapController
+                                sessionMapController = null
+                                mapCtrl?.invalidate()
                             },
                         )
+                    sessionHolder = createdSession
+                    activeSessionHandleRef = createdSession
                     mapViewRef = port
                     sessionDisposedRef.set(false)
 
                     port.getMapAsync { map ->
-                        if (!isThisSessionCurrent()) return@getMapAsync
+                        if (!isThisSessionCurrent()) {
+                            map.invalidate()
+                            return@getMapAsync
+                        }
                         sessionMapController = map
                         mapLibreMapRef = map
                         stateMachine.updateSurfaceDiagnostics(port.inspectSurfaceInfo())
@@ -1521,15 +1638,8 @@ internal fun CityMapLibreViewImpl(
                 onRelease = {
                     localSessionDisposed.set(true)
                     val holder = sessionHolder
-                    if (holder == null || mapViewRef === holder.surfacePort) {
-                        sessionDisposedRef.set(true)
-                    }
-                    holder?.destroyOnceAfterDetach()
-                    if (holder != null && mapViewRef === holder.surfacePort) {
-                        mapViewRef = null
-                        mapLibreMapRef = null
-                        loadedStyleRef = null
-                    }
+                    clearOwnedSessionRefs(holder)
+                    holder?.destroyOnceAfterDetach("release")
                     ClimaMapLogger.i(ClimaMapLogTags.MAP_RENDER, "MapView de Cidades destruído e listeners removidos.")
                 },
             )

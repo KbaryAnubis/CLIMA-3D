@@ -969,8 +969,21 @@ class ClimaMainViewModel(
         }
     }
 
+    fun reopenMapPickerSearch() {
+        _uiState.update { state ->
+            state.copy(
+                mapLocationPickerState =
+                    state.mapLocationPickerState.copy(
+                        isSearchExpanded = true,
+                        searchErrorMessage = null,
+                    ),
+            )
+        }
+    }
+
     /**
-     * Centers the on-demand map on a selected geocoding suggestion without immediately closing the map.
+     * Centers the on-demand map on a selected geocoding suggestion without immediately closing the map,
+     * while collapsing the search box and suggestion list so the map stays unobstructed.
      * The user can fine-tune the position or confirm immediately via "Confirmar localização".
      */
     fun selectSearchResultInMapPicker(result: CitySearchResult) {
@@ -1001,6 +1014,7 @@ class ClimaMainViewModel(
                         isSearching = false,
                         searchErrorMessage = null,
                         hasSearchedCurrentQuery = false,
+                        isSearchExpanded = false,
                         selectedSearchResult = result,
                         isGpsSelection = false,
                         selectedPlaceName = result.name,

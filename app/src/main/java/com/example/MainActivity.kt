@@ -400,6 +400,7 @@ fun Clima3DApp(
                 onSearchQueryChange = vm::updateMapPickerSearchQuery,
                 onSubmitSearch = vm::submitMapPickerSearch,
                 onSelectSearchResult = vm::selectSearchResultInMapPicker,
+                onReopenSearch = vm::reopenMapPickerSearch,
                 onMapStateChange = vm::updateCityMapState,
                 onCustomPointNameChange = vm::updateCustomPointNameInput,
                 onConfirmSelection = vm::confirmMapLocationSelection,
