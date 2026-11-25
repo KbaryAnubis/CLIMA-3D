@@ -700,7 +700,9 @@ internal fun WeatherVideoBackgroundImpl(
         },
         update = {
             val bridge = surfaceBridgeRef ?: return@AndroidView
-            if (!playerHandle.isReleased && canAttachVideoSurfaceNow && !bridge.isPlayerAttached(playerHandle)) {
+            if (!allowVideoSurfaceOutput) {
+                detachVideoOutputForMapExclusivity(bridge, reason = "map_tab_active")
+            } else if (!playerHandle.isReleased && canAttachVideoSurfaceNow && !bridge.isPlayerAttached(playerHandle)) {
                 attachVideoOutputIfAllowed(bridge, reason = "android_view_update")
             }
         },

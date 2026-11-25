@@ -1887,22 +1887,67 @@ class SurfaceAndLifecycleAuditTest {
             )
         cycle.forEach { tab ->
             val prev = activeTab
+            val prevWasMap = prev == ClimaTab.RADAR || prev == ClimaTab.CITIES
+            val nextIsMap = tab == ClimaTab.RADAR || tab == ClimaTab.CITIES
+            val logCountBefore = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().size
+
             composeTestRule.runOnUiThread {
                 ClimaGraphicsLifecycleDiagnostics.logTabChanged(prev, tab)
                 activeTab = tab
             }
             composeTestRule.waitForIdle()
 
+            val transitionLogs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().drop(logCountBefore)
             val coord = GraphicsSurfaceCoordinator.state.value
-            val isMapTab = tab == ClimaTab.RADAR || tab == ClimaTab.CITIES
-            if (isMapTab) {
+            if (nextIsMap) {
                 assertEquals(MapSurfaceSessionState.MAP_SURFACE_ACTIVE, coord.mapState)
                 assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_DETACHED, coord.videoState)
                 assertFalse(createdSurfaces.single().isPlayerAttached(createdPlayers.single()))
+                if (!prevWasMap) {
+                    val detachForMapIdx = transitionLogs.indexOfFirst { it.contains("VIDEO_OUTPUT_DETACH_FOR_MAP") }
+                    val exoClearIdx = transitionLogs.indexOfFirst { it.contains("EXO_SURFACE_CLEAR") }
+                    val videoDetachedIdx = transitionLogs.indexOfFirst { it.contains("VIDEO_OUTPUT_DETACHED") }
+                    val mapCreatedIdx = transitionLogs.indexOfFirst { it.contains("MAP_SURFACE_CREATED") }
+                    assertTrue(
+                        "Entry to $tab from $prev must follow VIDEO_OUTPUT_DETACH_FOR_MAP -> EXO_SURFACE_CLEAR -> VIDEO_OUTPUT_DETACHED -> MAP_SURFACE_CREATED, got:\n${transitionLogs.joinToString("\n")}",
+                        detachForMapIdx >= 0 &&
+                            exoClearIdx > detachForMapIdx &&
+                            videoDetachedIdx > exoClearIdx &&
+                            mapCreatedIdx > videoDetachedIdx,
+                    )
+                    assertTrue(
+                        "MAP_SURFACE_CREATED must observe videoState=VIDEO_OUTPUT_DETACHED",
+                        transitionLogs[mapCreatedIdx].contains("videoState=VIDEO_OUTPUT_DETACHED"),
+                    )
+                } else {
+                    assertTrue(
+                        "Direct map-to-map switch ($prev -> $tab) must never reattach video output",
+                        transitionLogs.none { it.contains("VIDEO_OUTPUT_REATTACHED") || it.contains("EXO_SURFACE_ATTACH") },
+                    )
+                }
             } else {
                 assertEquals(MapSurfaceSessionState.NO_ACTIVE_MAP_SURFACE, coord.mapState)
                 assertEquals(VideoSurfaceOutputState.VIDEO_OUTPUT_ACTIVE, coord.videoState)
                 assertTrue(createdSurfaces.single().isPlayerAttached(createdPlayers.single()))
+                if (prevWasMap) {
+                    val mapDisposingIdx = transitionLogs.indexOfFirst { it.contains("MAP_SURFACE_DISPOSING") }
+                    val mapDestroyedIdx = transitionLogs.indexOfFirst { it.contains("MAP_DESTROYED") }
+                    val mapDetachedIdx = transitionLogs.indexOfFirst { it.contains("MAP_SURFACE_DETACHED") }
+                    val reattachReqIdx = transitionLogs.indexOfFirst { it.contains("VIDEO_OUTPUT_REATTACH_REQUEST") }
+                    val reattachedIdx = transitionLogs.indexOfFirst { it.contains("VIDEO_OUTPUT_REATTACHED") }
+                    assertTrue(
+                        "Exit from $prev to $tab must follow MAP_SURFACE_DISPOSING -> MAP_DESTROYED -> MAP_SURFACE_DETACHED -> VIDEO_OUTPUT_REATTACH_REQUEST -> VIDEO_OUTPUT_REATTACHED, got:\n${transitionLogs.joinToString("\n")}",
+                        mapDisposingIdx >= 0 &&
+                            mapDestroyedIdx > mapDisposingIdx &&
+                            mapDetachedIdx > mapDestroyedIdx &&
+                            reattachReqIdx > mapDetachedIdx &&
+                            reattachedIdx > reattachReqIdx,
+                    )
+                    assertTrue(
+                        "VIDEO_OUTPUT_REATTACHED must observe mapState=NO_ACTIVE_MAP_SURFACE",
+                        transitionLogs[reattachedIdx].contains("mapState=NO_ACTIVE_MAP_SURFACE"),
+                    )
+                }
             }
         }
 

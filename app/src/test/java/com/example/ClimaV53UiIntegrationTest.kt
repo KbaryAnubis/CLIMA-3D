@@ -476,7 +476,7 @@ class ClimaV53UiIntegrationTest {
         assertEquals(com.example.media.AnimatedWeatherWebp.TEMPESTADE_FORTE, WeatherCondition.TEMPESTADE_FORTE.animatedWebp)
         assertEquals(com.example.media.AnimatedWeatherWebp.CHUVA_MODERADA, WeatherCondition.CHUVA.animatedWebp)
 
-        // 2. Validate physical VP8X animated WebP resource (420x420 1:1, alpha + animation flags, 30 frames) and static fallback drawable
+        // 2. Validate physical VP8X animated WebP resource (420x420 1:1, alpha + animation flags, loop=0, 30 frames @ 100ms = 3000ms) and static fallback drawable
         val webpBytes = context.resources.openRawResource(R.drawable.wx_icon_tempestade_com_granizo).use { it.readBytes() }
         assertTrue("Animated WebP resource must not be empty", webpBytes.size > 30)
         assertEquals("RIFF", String(webpBytes, 0, 4, Charsets.US_ASCII))
@@ -488,6 +488,37 @@ class ClimaV53UiIntegrationTest {
         val canvasHeight = 1 + ((webpBytes[27].toInt() and 0xFF) or ((webpBytes[28].toInt() and 0xFF) shl 8) or ((webpBytes[29].toInt() and 0xFF) shl 16))
         assertEquals(420, canvasWidth)
         assertEquals(420, canvasHeight)
+
+        var offset = 12
+        var animLoopCount = -1
+        var anmfCount = 0
+        var totalDurationMs = 0
+        while (offset + 8 <= webpBytes.size) {
+            val fourCc = String(webpBytes, offset, 4, Charsets.US_ASCII)
+            val chunkSize =
+                (webpBytes[offset + 4].toInt() and 0xFF) or
+                    ((webpBytes[offset + 5].toInt() and 0xFF) shl 8) or
+                    ((webpBytes[offset + 6].toInt() and 0xFF) shl 16) or
+                    ((webpBytes[offset + 7].toInt() and 0xFF) shl 24)
+            val payloadStart = offset + 8
+            if (fourCc == "ANIM" && payloadStart + 6 <= webpBytes.size) {
+                animLoopCount = (webpBytes[payloadStart + 4].toInt() and 0xFF) or ((webpBytes[payloadStart + 5].toInt() and 0xFF) shl 8)
+            } else if (fourCc == "ANMF" && payloadStart + 16 <= webpBytes.size) {
+                val frameDurationMs =
+                    (webpBytes[payloadStart + 12].toInt() and 0xFF) or
+                        ((webpBytes[payloadStart + 13].toInt() and 0xFF) shl 8) or
+                        ((webpBytes[payloadStart + 14].toInt() and 0xFF) shl 16)
+                assertEquals("Every ANMF frame must preserve 100ms duration", 100, frameDurationMs)
+                anmfCount++
+                totalDurationMs += frameDurationMs
+            }
+            val paddedSize = chunkSize + (chunkSize and 1)
+            offset = payloadStart + paddedSize
+        }
+        assertEquals("ANIM loopCount must be 0 (infinite loop)", 0, animLoopCount)
+        assertEquals("Animated WebP must contain all 30 frames", 30, anmfCount)
+        assertEquals("Total animation cycle duration must be 3000ms", 3000, totalDurationMs)
+
         val fallbackDrawable = androidx.core.content.ContextCompat.getDrawable(context, R.drawable.wx_fallback_granizo)
         org.junit.Assert.assertNotNull(fallbackDrawable)
 
