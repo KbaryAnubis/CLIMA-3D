@@ -2165,6 +2165,490 @@ class SurfaceAndLifecycleAuditTest {
         )
     }
 
+    // 41. Etapa 3M (1, 2, 3): Wallpaper permanece visível antes do primeiro frame, VIDEO_WAITING_FIRST_FRAME mantém videoAlpha == 0f e onRenderedFirstFrame habilita a transição visual
+    @Test
+    fun `test_41_wallpaper_visible_and_video_alpha_zero_until_on_rendered_first_frame`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.SOL,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = false).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        assertEquals("Player is READY, but first frame has not rendered yet", "READY", player.playerStateName)
+        assertEquals("videoAlpha MUST remain 0f while waiting for first frame", 0f, observedVideoAlpha, 0.001f)
+
+        val logsBeforeFrame = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(logsBeforeFrame.any { it.contains("BACKGROUND_WALLPAPER_VISIBLE") && it.contains("videoAlpha=0.00") })
+        assertTrue(logsBeforeFrame.any { it.contains("BACKGROUND_VIDEO_WAITING_FIRST_FRAME") && it.contains("frameReady=false") })
+        assertFalse(logsBeforeFrame.any { it.contains("BACKGROUND_VIDEO_FRAME_READY") })
+
+        // Now emit onRenderedFirstFrame -> video transitions smoothly to alpha = 1f
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRendered()
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals("videoAlpha must reach 1f after onRenderedFirstFrame", 1f, observedVideoAlpha, 0.001f)
+        val logsAfterFrame = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(logsAfterFrame.any { it.contains("BACKGROUND_VIDEO_FRAME_READY") && it.contains("frameReady=true") })
+        assertTrue(logsAfterFrame.any { it.contains("BACKGROUND_VIDEO_FADE_IN") && it.contains("videoAlpha=1.00") })
+    }
+
+    // 42. Etapa 3M (4, 9, 11): Erro de decoder esconde o vídeo imediatamente (alpha=0f) sem remover o wallpaper, mantém wallpaper em STATE_IDLE/recuperação e só restaura após novo onRenderedFirstFrame
+    @Test
+    fun `test_42_decoder_error_immediately_hides_video_keeps_wallpaper_during_idle_and_restores_on_new_first_frame`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.CHUVA,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).apply {
+                            simulatedPositionMs = 3_800L
+                        }.also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+
+        // Configure recovery prepare() to NOT emit first frame immediately so we can inspect VIDEO_RECOVERING / IDLE state
+        player.autoFirstFrameOnPrepare = false
+        composeTestRule.runOnUiThread {
+            player.simulateFatalMediaCodecReclaim(
+                decoderName = "c2.android.avc.decoder",
+                errorCodeName = "ERROR_CODE_DECODING_FAILED",
+                errorMessage = "Codec error: ERROR_RECLAIMED",
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        // Video must snap immediately to alpha = 0f while static wallpaper remains mounted
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        assertEquals("Video must hide immediately (alpha=0f) when codec fails and before new first frame", 0f, observedVideoAlpha, 0.001f)
+        val logsDuringRecovery = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(logsDuringRecovery.any { it.contains("BACKGROUND_VIDEO_HIDDEN_NO_FRAME") && it.contains("reason=codec_error_ERROR_CODE_DECODING_FAILED") })
+        assertTrue(logsDuringRecovery.any { it.contains("BACKGROUND_VIDEO_RECOVERY_STARTED") && it.contains("visualState=VIDEO_RECOVERING") })
+
+        // Now new decoder generation renders its first frame -> smooth restoration to alpha = 1f
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRendered()
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+        val logsAfterRecovery = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(logsAfterRecovery.any { it.contains("BACKGROUND_VIDEO_RECOVERY_FINISHED") && it.contains("frameReady=true") })
+    }
+
+    // 43. Etapa 3M (5, 6): ERROR_RECLAIMED incrementa geração do decoder, não reutiliza decoder antigo e não dispara prepare() duplicado
+    @Test
+    fun `test_43_error_reclaimed_advances_decoder_generation_and_avoids_duplicate_prepare`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val snapshots = mutableListOf<com.example.ui.components.WeatherVideoVisualSnapshot>()
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherVideoBackgroundImpl(
+                    videoResId = R.raw.wx_bg_sun_day,
+                    playbackSpeed = 1.0f,
+                    isPlaying = true,
+                    allowVideoSurfaceOutput = true,
+                    onVisualStateChanged = { snapshots += it },
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1, player.prepareCalls)
+        assertEquals(1, player.decoderGeneration)
+        assertEquals(1, snapshots.last().decoderGeneration)
+        assertTrue(snapshots.last().frameReady)
+
+        // Simulate ERROR_RECLAIMED: old decoder gen 1 is released; recovery prepare() initializes new decoder gen 2
+        composeTestRule.runOnUiThread {
+            player.simulateFatalMediaCodecReclaim(
+                decoderName = "c2.android.avc.decoder",
+                errorCodeName = "ERROR_CODE_DECODING_FAILED",
+                errorMessage = "android.media.MediaCodec\$CodecException: Error 0xffffec77 (ERROR_RECLAIMED)",
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals("Recovery must invoke prepare() exactly once (total 2)", 2, player.prepareCalls)
+        assertEquals("New decoder generation must be 2 (old reclaimed decoder gen 1 discarded)", 2, player.decoderGeneration)
+        assertEquals(2, snapshots.last().decoderGeneration)
+        assertTrue(snapshots.last().frameReady)
+    }
+
+    // 44. Etapa 3M (10): BUFFERING sem frame válido não produz flash preto (mantém videoAlpha == 0f e wallpaper visível)
+    @Test
+    fun `test_44_buffering_before_first_frame_keeps_video_hidden_and_wallpaper_visible`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.NUBLADO,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = false).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        composeTestRule.runOnUiThread {
+            player.simulatePlaybackStateChange("BUFFERING", isPlaying = false)
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        assertEquals("videoAlpha must stay 0f during BUFFERING before first frame", 0f, observedVideoAlpha, 0.001f)
+    }
+
+    // 45. Etapa 3M (12): Falhas repetidas de decoder não geram loop infinito de prepare() e mantêm o wallpaper estático
+    @Test
+    fun `test_45_repeated_codec_failures_exhaust_recovery_without_infinite_prepare_loop_and_keep_wallpaper`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.TEMPESTADE,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = false).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1, player.prepareCalls)
+
+        // Trigger 5 consecutive codec failures where prepare() never succeeds in rendering a first frame
+        repeat(5) { attempt ->
+            composeTestRule.runOnUiThread {
+                player.simulateFatalMediaCodecReclaim(
+                    errorCodeName = "ERROR_CODE_DECODING_FAILED",
+                    errorMessage = "Repeated codec failure #$attempt",
+                )
+            }
+            composeTestRule.waitForIdle()
+        }
+
+        // Initial prepare (1) + max 2 unrendered recovery attempts = 3 total prepareCalls (bounded, no infinite loop)
+        assertEquals("prepare() calls must be bounded to initial + 2 recovery attempts", 3, player.prepareCalls)
+        assertEquals("Video must stay hidden at alpha=0f when recovery fails", 0f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(
+            "Must log BACKGROUND_VIDEO_RECOVERY_FAILED when repeated recovery attempts are exhausted",
+            logs.any { it.contains("BACKGROUND_VIDEO_RECOVERY_FAILED") && it.contains("frameReady=false") },
+        )
+    }
+
+    // 46. Etapa 3M (13, 14): Troca de MediaItem (condição meteorológica) e de velocidade não desmonta o wallpaper, não recria o player e esconde vídeo até o novo primeiro frame
+    @Test
+    fun `test_46_changing_weather_condition_and_speed_keeps_same_player_and_hides_video_until_new_first_frame`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var condition by mutableStateOf(WeatherCondition.SOL)
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = condition,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+        assertEquals(1.0f, player.currentPlaybackSpeed, 0.001f)
+
+        // Hold first frame on next media change so we verify alpha snaps to 0f during transition
+        player.autoFirstFrameOnPrepare = false
+        composeTestRule.runOnUiThread {
+            condition = WeatherCondition.CHUVA_FRACA // rawRes = wx_bg_rain, speed = 0.85f
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals("Must reuse the exact same ExoPlayer instance across condition changes", 1, players.size)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        assertEquals("Video must be hidden (alpha=0f) until new MediaItem renders its first frame", 0f, observedVideoAlpha, 0.001f)
+        assertEquals("Playback speed must update to 0.85f on the same player", 0.85f, player.currentPlaybackSpeed, 0.001f)
+        assertEquals("prepare() must be called once for initial and once for new MediaItem", 2, player.prepareCalls)
+
+        val logsDuringSwitch = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(logsDuringSwitch.any { it.contains("BACKGROUND_MEDIA_ITEM_CHANGED") })
+
+        // Render first frame of new MediaItem -> video fades back in
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRendered()
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+    }
+
+    // 47. Etapa 3M (16): Retorno de RADAR/CITIES à HOME não mostra vídeo antes de onRenderedFirstFrame confirmar frame válido na superfície reanexada
+    @Test
+    fun `test_47_returning_from_map_to_home_keeps_video_hidden_until_first_frame_on_reattached_surface`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = {
+                            FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                        },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                        onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                    )
+                    if (activeTab == ClimaTab.RADAR) {
+                        RadarMapLibreViewImpl(
+                            center = CityMapCoordinate(-23.55, -46.63),
+                            zoom = 6.0,
+                            activeFrame = sampleRadarFrame(1700000000L),
+                            layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                            maxRadarZoom = 7,
+                            surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx) },
+                        )
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+
+        // Enter RADAR -> video surface detaches and videoAlpha snaps immediately to 0f
+        player.autoFirstFrameOnPlayAfterReattach = false
+        composeTestRule.runOnUiThread {
+            activeTab = ClimaTab.RADAR
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+
+        // Return to HOME -> surface reattaches, but before onRenderedFirstFrame fires on the reattached surface,
+        // videoAlpha MUST remain 0f (static wallpaper visible)
+        composeTestRule.runOnUiThread {
+            activeTab = ClimaTab.HOME
+        }
+        composeTestRule.waitForIdle()
+
+        assertTrue(surfaces.single().isPlayerAttached(player))
+        assertEquals(
+            "Video must NOT become visible on return to HOME before onRenderedFirstFrame confirms a valid frame on the reattached surface",
+            0f,
+            observedVideoAlpha,
+            0.001f,
+        )
+
+        // Once onRenderedFirstFrame fires on the reattached surface, video fades in to 1f
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRendered()
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+    }
+
+    // 48. Etapa 3M (17, 18): LocationPickerDialog e recomposições na HOME não reiniciam fades nem alteram o estado visual do vídeo
+    @Test
+    fun `test_48_location_picker_and_recompositions_do_not_restart_fades_or_alter_visual_state`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val alphaHistory = mutableListOf<Float>()
+        var showLocationModal by mutableStateOf(false)
+        var recomposeCounter by mutableIntStateOf(0)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    Text("tick-$recomposeCounter")
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL,
+                        activeTab = ClimaTab.HOME,
+                        animatedEnabled = true,
+                        playerBridgeFactory = {
+                            FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                        },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                        onEffectiveVideoAlphaChanged = { alphaHistory += it },
+                    )
+                    if (showLocationModal) {
+                        Text("LocationPickerDialogOverlay")
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1f, alphaHistory.last(), 0.001f)
+
+        val fadeInCountBefore =
+            ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().count { it.contains("BACKGROUND_VIDEO_FADE_IN") }
+        assertEquals(1, fadeInCountBefore)
+
+        // Open and close LocationPickerDialog and trigger 10 recompositions
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logModalLifecycle("LocationPicker", "OPEN")
+            showLocationModal = true
+        }
+        composeTestRule.waitForIdle()
+        repeat(10) {
+            composeTestRule.runOnUiThread { recomposeCounter++ }
+            composeTestRule.waitForIdle()
+        }
+        composeTestRule.runOnUiThread {
+            ClimaGraphicsLifecycleDiagnostics.logModalLifecycle("LocationPicker", "CLOSE")
+            showLocationModal = false
+        }
+        composeTestRule.waitForIdle()
+
+        val fadeInCountAfter =
+            ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().count { it.contains("BACKGROUND_VIDEO_FADE_IN") }
+        assertEquals("Fades must not restart across modal open/close or recompositions", 1, fadeInCountAfter)
+        assertEquals(1f, alphaHistory.last(), 0.001f)
+    }
+
+    // 49. Etapa 3M (19): Fundo animado desativado respeita a preferência do usuário (não monta vídeo, mantém wallpaper estático)
+    @Test
+    fun `test_49_animated_background_disabled_respects_user_preference_and_keeps_static_wallpaper`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.TEMPESTADE,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = false,
+                    playerBridgeFactory = { FakeWeatherVideoPlayerBridge().also { players += it } },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        assertTrue("No ExoPlayer instance should be created when animatedEnabled=false", players.isEmpty())
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertTrue(logs.any { it.contains("BACKGROUND_WALLPAPER_VISIBLE") && it.contains("reason=animated_disabled") })
+    }
+
+    // 50. Etapa 3M (20): Ciclo ON_PAUSE/ON_STOP e ON_START/ON_RESUME não provoca oscilações repetidas nem prepare() duplicado
+    @Test
+    fun `test_50_activity_pause_stop_and_resume_cycle_does_not_cause_repeated_oscillations`() {
+        val lifecycleOwner = TestLifecycleOwner(Lifecycle.State.RESUMED)
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            CompositionLocalProvider(LocalLifecycleOwner provides lifecycleOwner) {
+                Clima3DTheme(darkTheme = true) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL,
+                        activeTab = ClimaTab.HOME,
+                        animatedEnabled = true,
+                        playerBridgeFactory = {
+                            FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                        },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                        onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+        assertEquals(1, player.prepareCalls)
+
+        // Move Activity to background (ON_PAUSE -> ON_STOP)
+        composeTestRule.runOnUiThread {
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals("Video layer must hide cleanly when Activity is stopped", 0f, observedVideoAlpha, 0.001f)
+        assertEquals(1, player.pauseCalls)
+        assertEquals(1, player.prepareCalls)
+
+        // Return Activity to foreground (ON_START -> ON_RESUME)
+        composeTestRule.runOnUiThread {
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals("Video layer must restore smoothly on Activity resume", 1f, observedVideoAlpha, 0.001f)
+        assertEquals("prepare() must NOT be re-invoked on normal ON_STOP -> ON_RESUME cycle", 1, player.prepareCalls)
+        assertEquals(1, player.playCalls)
+    }
+
     private fun extractToken(line: String, prefix: String): String? {
         val idx = line.indexOf(prefix)
         if (idx < 0) return null
@@ -2190,12 +2674,17 @@ private object GlobalOrderClock {
     val counter = AtomicInteger(0)
 }
 
-private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
+private class FakeWeatherVideoPlayerBridge(
+    var autoFirstFrameOnPrepare: Boolean = true,
+    var autoFirstFrameOnPlayAfterReattach: Boolean = true,
+) : WeatherVideoPlayerBridge {
     override val sessionId: String = "fake-exo-${GlobalOrderClock.counter.incrementAndGet()}"
     override val identityHash: Int = System.identityHashCode(this)
 
     var released = false
     var idleState = true
+    var currentPlayerState = "IDLE"
+    var currentDecoderGen = 0
     var setMediaItemCalls = 0
     var prepareCalls = 0
     var stopCalls = 0
@@ -2209,11 +2698,14 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
     var simulatedPositionMs: Long = 0L
     var currentSpeedValue: Float = 1.0f
     var currentVideoResHint: Int = R.raw.wx_bg_sun_day
+    private var needsFrameAfterSurfaceReattach = false
     val speedHistory = mutableListOf<Float>()
     val seekHistory = mutableListOf<Long>()
     val events = mutableListOf<String>()
     private var attachedView: Any? = null
     private var firstFrameListener: (() -> Unit)? = null
+    private var decoderLifecycleListener: ((Boolean, Int, String) -> Unit)? = null
+    private var playbackStateListener: ((String, Boolean) -> Unit)? = null
     private var codecErrorListener: ((com.example.ui.components.WeatherVideoCodecErrorDiagnostic) -> Unit)? = null
 
     override val isReleased: Boolean
@@ -2221,6 +2713,12 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
 
     override val isIdle: Boolean
         get() = idleState
+
+    override val playerStateName: String
+        get() = if (released) "RELEASED" else currentPlayerState
+
+    override val decoderGeneration: Int
+        get() = currentDecoderGen
 
     override val currentPositionMs: Long
         get() = simulatedPositionMs
@@ -2260,6 +2758,8 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
     override fun prepare() {
         prepareCalls++
         idleState = false
+        currentPlayerState = "READY"
+        currentDecoderGen += 1
         events += "prepare"
         ClimaGraphicsLifecycleDiagnostics.logExoDecoderInitialized(
             sessionId = sessionId,
@@ -2271,6 +2771,7 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
             videoResId = currentVideoResHint,
             positionMs = simulatedPositionMs,
         )
+        decoderLifecycleListener?.invoke(true, currentDecoderGen, "c2.android.avc.decoder")
         ClimaGraphicsLifecycleDiagnostics.logExoPlaybackMilestone(
             sessionId = sessionId,
             playerIdentity = identityHash,
@@ -2279,27 +2780,44 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
             videoResId = currentVideoResHint,
             positionMs = simulatedPositionMs,
         )
-        if (lastPlayWhenReady == true) {
-            ClimaGraphicsLifecycleDiagnostics.logExoFirstFrame(
-                sessionId = sessionId,
-                playerIdentity = identityHash,
-                videoResId = currentVideoResHint,
-                positionMs = simulatedPositionMs,
-                playerState = "READY",
-            )
-            firstFrameListener?.invoke()
+        playbackStateListener?.invoke("READY", lastPlayWhenReady == true)
+        if (lastPlayWhenReady == true && autoFirstFrameOnPrepare) {
+            emitFirstFrameRendered()
         }
+    }
+
+    fun emitFirstFrameRendered() {
+        needsFrameAfterSurfaceReattach = false
+        ClimaGraphicsLifecycleDiagnostics.logExoFirstFrame(
+            sessionId = sessionId,
+            playerIdentity = identityHash,
+            videoResId = currentVideoResHint,
+            positionMs = simulatedPositionMs,
+            playerState = currentPlayerState,
+        )
+        firstFrameListener?.invoke()
+    }
+
+    fun simulatePlaybackStateChange(stateName: String, isPlaying: Boolean) {
+        currentPlayerState = stateName
+        idleState = stateName == "IDLE"
+        playbackStateListener?.invoke(stateName, isPlaying)
     }
 
     override fun stop() {
         stopCalls++
         idleState = true
+        currentPlayerState = "IDLE"
         events += "stop"
+        playbackStateListener?.invoke("IDLE", false)
     }
 
     override fun play() {
         playCalls++
         events += "play"
+        if (needsFrameAfterSurfaceReattach && autoFirstFrameOnPlayAfterReattach) {
+            emitFirstFrameRendered()
+        }
     }
 
     override fun pause() {
@@ -2312,8 +2830,22 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
         events += "clearVideoSurface"
     }
 
+    override fun notifySurfaceReattachedForNewFrame() {
+        needsFrameAfterSurfaceReattach = true
+    }
+
     override fun setFirstFrameListener(listener: (() -> Unit)?) {
         firstFrameListener = listener
+    }
+
+    override fun setDecoderLifecycleListener(
+        listener: ((initialized: Boolean, decoderGeneration: Int, decoderName: String) -> Unit)?,
+    ) {
+        decoderLifecycleListener = listener
+    }
+
+    override fun setPlaybackStateListener(listener: ((playerStateName: String, isPlaying: Boolean) -> Unit)?) {
+        playbackStateListener = listener
     }
 
     override fun setCodecErrorListener(
@@ -2331,6 +2863,7 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
         val posBeforeError = simulatedPositionMs
         val speedBeforeError = currentSpeedValue
         idleState = true
+        currentPlayerState = "IDLE"
         if (resetLivePositionOnIdle) {
             simulatedPositionMs = 0L
         }
@@ -2355,6 +2888,8 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
             videoResId = currentVideoResHint,
             positionMs = posBeforeError,
         )
+        decoderLifecycleListener?.invoke(false, currentDecoderGen, decoderName)
+        playbackStateListener?.invoke("IDLE", false)
         ClimaGraphicsLifecycleDiagnostics.logExoPlayerError(
             sessionId = sessionId,
             playerIdentity = identityHash,
@@ -2373,6 +2908,7 @@ private class FakeWeatherVideoPlayerBridge : WeatherVideoPlayerBridge {
                 isDeadObjectOrReclaimed = true,
                 positionMsAtError = posBeforeError,
                 playbackSpeedAtError = speedBeforeError,
+                decoderGenerationAtError = currentDecoderGen,
                 message = errorMessage,
             ),
         )

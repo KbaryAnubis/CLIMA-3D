@@ -542,4 +542,28 @@ object ClimaGraphicsLifecycleDiagnostics {
     ) {
         emit("REFRESH_END reason=$reason locationId=${locationId ?: "none"} durationMs=$durationMs outcome=$outcome")
     }
+
+    fun logBackgroundVisualMilestone(
+        eventName: String,
+        sessionId: String,
+        playerIdentity: Int,
+        videoResId: Int,
+        playerState: String,
+        decoderGeneration: Int,
+        videoAlpha: Float,
+        frameReady: Boolean,
+        visualState: String = "UNKNOWN",
+        reason: String? = null,
+        videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
+        mapState: MapSurfaceSessionState = GraphicsSurfaceCoordinator.state.value.mapState,
+    ) {
+        val reasonSuffix = reason?.let { " reason=$it" }.orEmpty()
+        val alphaFormatted = String.format(Locale.US, "%.2f", videoAlpha)
+        emit(
+            "$eventName session=$sessionId playerId=$playerIdentity resId=$videoResId " +
+                "playerState=$playerState decoderGen=$decoderGeneration videoAlpha=$alphaFormatted " +
+                "frameReady=$frameReady visualState=$visualState " +
+                "videoState=${videoState.name} mapState=${mapState.name}$reasonSuffix",
+        )
+    }
 }
