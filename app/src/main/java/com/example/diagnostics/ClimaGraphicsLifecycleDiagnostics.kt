@@ -556,14 +556,128 @@ object ClimaGraphicsLifecycleDiagnostics {
         reason: String? = null,
         videoState: VideoSurfaceOutputState = GraphicsSurfaceCoordinator.state.value.videoState,
         mapState: MapSurfaceSessionState = GraphicsSurfaceCoordinator.state.value.mapState,
+        recoveryState: String? = null,
+        surfaceEpoch: Int? = null,
     ) {
         val reasonSuffix = reason?.let { " reason=$it" }.orEmpty()
+        val recoverySuffix = recoveryState?.let { " recoveryState=$it" }.orEmpty()
+        val surfaceEpochSuffix = surfaceEpoch?.let { " surfaceEpoch=$it" }.orEmpty()
         val alphaFormatted = String.format(Locale.US, "%.2f", videoAlpha)
         emit(
             "$eventName session=$sessionId playerId=$playerIdentity resId=$videoResId " +
                 "playerState=$playerState decoderGen=$decoderGeneration videoAlpha=$alphaFormatted " +
-                "frameReady=$frameReady visualState=$visualState " +
+                "frameReady=$frameReady visualState=$visualState$recoverySuffix$surfaceEpochSuffix " +
                 "videoState=${videoState.name} mapState=${mapState.name}$reasonSuffix",
+        )
+    }
+
+    fun logVideoRevocationDetected(
+        sessionId: String,
+        playerIdentity: Int,
+        revocationReason: String,
+        playerStateAtError: String,
+        decoderGeneration: Int,
+        surfaceEpoch: Int,
+        surfaceStatus: String,
+        videoResId: Int,
+        positionMs: Long,
+        recoveryState: String,
+    ) {
+        emit(
+            "VIDEO_REVOCATION_DETECTED session=$sessionId playerId=$playerIdentity " +
+                "revocationReason=$revocationReason playerState=$playerStateAtError " +
+                "decoderGen=$decoderGeneration surfaceEpoch=$surfaceEpoch surfaceStatus=$surfaceStatus " +
+                "resId=$videoResId posMs=$positionMs recoveryState=$recoveryState",
+        )
+    }
+
+    fun logVideoRecoveryAttempt(
+        sessionId: String,
+        playerIdentity: Int,
+        tier: String,
+        attemptNumber: Int,
+        maxAttempts: Int,
+        reason: String,
+        decoderGeneration: Int,
+        surfaceEpoch: Int,
+        surfaceStatus: String,
+        videoResId: Int,
+        positionMs: Long,
+        playbackSpeed: Float,
+        recoveryState: String,
+    ) {
+        val speedFormatted = String.format(Locale.US, "%.2f", playbackSpeed)
+        emit(
+            "VIDEO_RECOVERY_ATTEMPT session=$sessionId playerId=$playerIdentity " +
+                "tier=$tier attempt=$attemptNumber/$maxAttempts reason=$reason " +
+                "decoderGen=$decoderGeneration surfaceEpoch=$surfaceEpoch surfaceStatus=$surfaceStatus " +
+                "resId=$videoResId posMs=$positionMs speed=$speedFormatted recoveryState=$recoveryState",
+        )
+    }
+
+    fun logVideoRecoveryOutcome(
+        sessionId: String,
+        playerIdentity: Int,
+        tier: String,
+        outcome: String,
+        decoderGeneration: Int,
+        surfaceEpoch: Int,
+        surfaceStatus: String,
+        recoveryTimeMs: Long?,
+        videoResId: Int,
+        recoveryState: String,
+    ) {
+        val durationSuffix = recoveryTimeMs?.let { " recoveryTimeMs=$it" }.orEmpty()
+        emit(
+            "VIDEO_RECOVERY_OUTCOME session=$sessionId playerId=$playerIdentity " +
+                "tier=$tier outcome=$outcome decoderGen=$decoderGeneration " +
+                "surfaceEpoch=$surfaceEpoch surfaceStatus=$surfaceStatus$durationSuffix " +
+                "resId=$videoResId recoveryState=$recoveryState",
+        )
+    }
+
+    fun logVideoPlayerRebuild(
+        stage: String,
+        previousSessionId: String,
+        previousPlayerId: Int,
+        newSessionId: String? = null,
+        newPlayerId: Int? = null,
+        reason: String,
+        videoResId: Int,
+        positionMs: Long,
+        playbackSpeed: Float,
+        decoderGeneration: Int,
+        surfaceEpoch: Int,
+        surfaceStatus: String,
+    ) {
+        val speedFormatted = String.format(Locale.US, "%.2f", playbackSpeed)
+        val newSessionSuffix = newSessionId?.let { " newSession=$it" }.orEmpty()
+        val newPlayerSuffix = newPlayerId?.let { " newPlayerId=$it" }.orEmpty()
+        emit(
+            "VIDEO_PLAYER_REBUILD stage=$stage prevSession=$previousSessionId prevPlayerId=$previousPlayerId" +
+                "$newSessionSuffix$newPlayerSuffix reason=$reason resId=$videoResId posMs=$positionMs " +
+                "speed=$speedFormatted decoderGen=$decoderGeneration surfaceEpoch=$surfaceEpoch " +
+                "surfaceStatus=$surfaceStatus",
+        )
+    }
+
+    fun logVideoFirstFrameTimeout(
+        sessionId: String,
+        playerIdentity: Int,
+        timeoutMs: Long,
+        playerState: String,
+        decoderGeneration: Int,
+        surfaceEpoch: Int,
+        surfaceStatus: String,
+        recoveryState: String,
+        nextTier: String,
+        videoResId: Int,
+    ) {
+        emit(
+            "VIDEO_FIRST_FRAME_TIMEOUT session=$sessionId playerId=$playerIdentity " +
+                "timeoutMs=$timeoutMs playerState=$playerState decoderGen=$decoderGeneration " +
+                "surfaceEpoch=$surfaceEpoch surfaceStatus=$surfaceStatus " +
+                "recoveryState=$recoveryState nextTier=$nextTier resId=$videoResId",
         )
     }
 }

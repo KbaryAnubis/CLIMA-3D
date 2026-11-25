@@ -2292,7 +2292,7 @@ class SurfaceAndLifecycleAuditTest {
         assertEquals("videoAlpha must stay 0f during BUFFERING before first frame", 0f, observedVideoAlpha, 0.001f)
     }
 
-    // 45. Etapa 3M (12): Falhas repetidas de decoder não geram loop infinito de prepare() e mantêm o wallpaper estático
+    // 45. Etapa 3M/3P.3 (12): Falhas repetidas de decoder escalam até rebuild único do player e entram em FAILED sem loop infinito, mantendo o wallpaper estático
     @Test
     fun `test_45_repeated_codec_failures_exhaust_recovery_without_infinite_prepare_loop_and_keep_wallpaper`() {
         val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
@@ -2314,13 +2314,14 @@ class SurfaceAndLifecycleAuditTest {
         }
         composeTestRule.waitForIdle()
 
-        val player = players.single()
-        assertEquals(1, player.prepareCalls)
+        val player1 = players.single()
+        assertEquals(1, player1.prepareCalls)
 
-        // Trigger 5 consecutive codec failures where prepare() never succeeds in rendering a first frame
-        repeat(5) { attempt ->
+        // Failures 1 & 2 -> Tier 1 (RECOVER_EXISTING) & Tier 2 (CONTROLLED_RETRY) on player1
+        // Failure 3 -> Tier 3 (REBUILD_PLAYER): releases player1 BEFORE creating player2
+        repeat(3) { attempt ->
             composeTestRule.runOnUiThread {
-                player.simulateFatalMediaCodecReclaim(
+                player1.simulateFatalMediaCodecReclaim(
                     errorCodeName = "ERROR_CODE_DECODING_FAILED",
                     errorMessage = "Repeated codec failure #$attempt",
                 )
@@ -2328,8 +2329,26 @@ class SurfaceAndLifecycleAuditTest {
             composeTestRule.waitForIdle()
         }
 
-        // Initial prepare (1) + max 2 unrendered recovery attempts = 3 total prepareCalls (bounded, no infinite loop)
-        assertEquals("prepare() calls must be bounded to initial + 2 recovery attempts", 3, player.prepareCalls)
+        assertEquals("Existing player prepareCalls bounded to initial + 2 retries", 3, player1.prepareCalls)
+        assertTrue("Old player must be released before replacement is created", player1.isReleased)
+        assertEquals("Last-resort rebuild must create 1 replacement player", 2, players.size)
+        val player2 = players[1]
+        assertEquals(1, player2.prepareCalls)
+        assertEquals("Never more than 1 active non-released player", 1, players.count { !it.isReleased })
+
+        // Failures on player2 exhaust rebuild budget -> enters FAILED without infinite loop
+        repeat(2) { attempt ->
+            composeTestRule.runOnUiThread {
+                player2.simulateFatalMediaCodecReclaim(
+                    errorCodeName = "ERROR_CODE_DECODING_FAILED",
+                    errorMessage = "Rebuilt player failure #$attempt",
+                )
+            }
+            composeTestRule.waitForIdle()
+        }
+
+        assertEquals("Rebuilt player must not loop prepare() after exhaustion", 1, player2.prepareCalls)
+        assertEquals("No extra ExoPlayer rebuild beyond bounded limit", 2, players.size)
         assertEquals("Video must stay hidden at alpha=0f when recovery fails", 0f, observedVideoAlpha, 0.001f)
         composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
 
@@ -3236,10 +3255,11 @@ class SurfaceAndLifecycleAuditTest {
         assertEquals(1f, observedVideoAlpha, 0.001f)
     }
 
-    // 59. Etapa 3O (3, 5 #6): Falha definitiva do decoder após o limite de 2 tentativas mantém o wallpaper estático visível sem loop infinito
+    // 59. Etapa 3O/3P.3: Falha definitiva do decoder após Tier 1, Tier 2 e Tier 3 (rebuild único) entra em FAILED mantendo o wallpaper estático visível sem loop infinito
     @Test
     fun `test_59_etapa3o_definitive_codec_failure_after_retry_limit_keeps_static_wallpaper_without_infinite_loop`() {
         val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var autoFirstFrame = true
         var observedVideoAlpha = -1f
 
         composeTestRule.setContent {
@@ -3249,7 +3269,7 @@ class SurfaceAndLifecycleAuditTest {
                     activeTab = ClimaTab.HOME,
                     animatedEnabled = true,
                     playerBridgeFactory = {
-                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = autoFirstFrame).also { players += it }
                     },
                     surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
                     onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
@@ -3258,45 +3278,63 @@ class SurfaceAndLifecycleAuditTest {
         }
         composeTestRule.waitForIdle()
 
-        val player = players.single()
+        val player1 = players.single()
         assertEquals(1f, observedVideoAlpha, 0.001f)
-        assertEquals(1, player.prepareCalls)
+        assertEquals(1, player1.prepareCalls)
 
-        // Subsequent recovery prepare() calls fail to produce a first frame and fault again
-        player.autoFirstFrameOnPrepare = false
+        // Subsequent recovery prepare() calls and any rebuilt player fail to produce a first frame
+        autoFirstFrame = false
+        player1.autoFirstFrameOnPrepare = false
 
-        // Failure #1 -> recovery attempt #1 (prepareCalls becomes 2)
+        // Failure #1 -> Tier 1 (RECOVER_EXISTING, prepareCalls becomes 2)
         composeTestRule.runOnUiThread {
-            player.simulateVideoCodecFaultBeforePlayerError()
-            player.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_1")
+            player1.simulateVideoCodecFaultBeforePlayerError()
+            player1.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_1")
         }
         composeTestRule.waitForIdle()
         assertEquals(0f, observedVideoAlpha, 0.001f)
-        assertEquals(2, player.prepareCalls)
+        assertEquals(2, player1.prepareCalls)
+        assertEquals(1, players.size)
 
-        // Failure #2 -> recovery attempt #2 (prepareCalls becomes 3)
+        // Failure #2 -> Tier 2 (CONTROLLED_RETRY, prepareCalls becomes 3)
         composeTestRule.runOnUiThread {
-            player.simulateVideoCodecFaultBeforePlayerError()
-            player.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_2")
+            player1.simulateVideoCodecFaultBeforePlayerError()
+            player1.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_2")
         }
         composeTestRule.waitForIdle()
         assertEquals(0f, observedVideoAlpha, 0.001f)
-        assertEquals(3, player.prepareCalls)
+        assertEquals(3, player1.prepareCalls)
+        assertEquals(1, players.size)
 
-        // Failure #3 -> recovery budget (2 attempts) exhausted! Must NOT call prepare() again
+        // Failure #3 -> Tier 3 (REBUILD_PLAYER): releases player1 BEFORE creating player2
         composeTestRule.runOnUiThread {
-            player.simulateVideoCodecFaultBeforePlayerError()
-            player.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_3")
+            player1.simulateVideoCodecFaultBeforePlayerError()
+            player1.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_3")
         }
         composeTestRule.waitForIdle()
-        assertEquals("Recovery must stop after 2 consecutive unrendered attempts (no infinite loop)", 3, player.prepareCalls)
+        assertEquals(3, player1.prepareCalls)
+        assertTrue("player1 must be released on Tier 3 rebuild", player1.isReleased)
+        assertEquals(2, players.size)
+        val player2 = players[1]
+        assertTrue("player1 must be released before player2 creation", player1.releaseOrder < player2.creationOrder)
+        assertEquals(1, player2.prepareCalls)
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+
+        // Failure #4 on player2 -> budget exhausted! Must enter FAILED and stop prepare() (no infinite loop)
+        composeTestRule.runOnUiThread {
+            player2.simulateVideoCodecFaultBeforePlayerError()
+            player2.simulateFatalMediaCodecReclaim(errorCodeName = "ERROR_CODE_DECODING_FAILED_4")
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Recovery must stop after bounded existing + rebuild attempts (no infinite loop)", 1, player2.prepareCalls)
+        assertEquals(2, players.size)
         assertEquals("Video must stay hidden at 0f on definitive failure", 0f, observedVideoAlpha, 0.001f)
         composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
 
         val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
         assertTrue(
             "Expected BACKGROUND_VIDEO_RECOVERY_FAILED milestone",
-            logs.any { it.contains("BACKGROUND_VIDEO_RECOVERY_FAILED") && it.contains("exhausted_after_2_attempts") },
+            logs.any { it.contains("BACKGROUND_VIDEO_RECOVERY_FAILED") && it.contains("exhausted_after_2_existing_1_rebuild") },
         )
     }
 
@@ -3643,6 +3681,7 @@ private class FakeWeatherVideoPlayerBridge(
     var clearSurfaceCount = 0
     var seekToCalls = 0
     var lastPlayWhenReady: Boolean? = null
+    val creationOrder = GlobalOrderClock.counter.incrementAndGet()
     var releaseOrder = Int.MAX_VALUE
     var simulatedPositionMs: Long = 0L
     var currentSpeedValue: Float = 1.0f

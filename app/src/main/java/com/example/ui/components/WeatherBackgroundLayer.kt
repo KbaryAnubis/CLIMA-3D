@@ -76,6 +76,14 @@ fun WeatherBackgroundLayer(
     )
 }
 
+private data class WeatherVideoDisplayIdentity(
+    val sessionId: String,
+    val playerIdentity: Int,
+    val videoResId: Int,
+    val decoderGeneration: Int,
+    val surfaceEpoch: Int,
+)
+
 @Composable
 internal fun WeatherBackgroundLayerImpl(
     condition: WeatherCondition,
@@ -86,6 +94,7 @@ internal fun WeatherBackgroundLayerImpl(
     playerBridgeFactory: ((Context) -> WeatherVideoPlayerBridge)? = null,
     surfaceBridgeFactory: ((Context) -> WeatherVideoSurfaceBridge)? = null,
     onEffectiveVideoAlphaChanged: (Float) -> Unit = {},
+    firstFrameTimeoutMs: Long = DEFAULT_FIRST_FRAME_TIMEOUT_MS,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -124,20 +133,22 @@ internal fun WeatherBackgroundLayerImpl(
             visualSnapshot =
                 visualSnapshot.copy(
                     visualState = WeatherVideoVisualState.VIDEO_NOT_READY,
+                    recoveryState = WeatherVideoRecoveryState.IDLE,
                     frameReady = false,
                     surfaceOutputAttached = false,
+                    surfaceAvailable = false,
                 )
         }
     }
 
-    // All required conditions for video layer visibility (Etapa 3M / 3N):
+    // All required conditions for video layer visibility (Etapas 3M, 3N, 3P.3):
     // 1. Animated background preference enabled & system reduced-motion off (shouldMountVideo)
-    // 2. Active tab is not RADAR or CITIES (allowVideoSurfaceOutput / shouldPlayVideoNow)
+    // 2. MapLocationPicker is NOT open (allowVideoSurfaceOutput / shouldPlayVideoNow)
     // 3. Activity is at least STARTED (isActivityStarted)
-    // 4. Video surface output is attached and coordinator permits video output
+    // 4. Video surface output is attached, SurfaceTexture is valid, and coordinator permits video output
     // 5. Valid MediaItem matches current condition's rawRes
-    // 6. Valid visual frame confirmed by onRenderedFirstFrame for current decoder generation
-    // 7. No fatal decoder error or recovery pending
+    // 6. Valid visual frame confirmed by onRenderedFirstFrame for current session, player, decoderGen, and surfaceEpoch
+    // 7. Recovery state is PLAYING (no pending codec revocation, rebuild, timeout, or exhaustion)
     val canDisplayVideoFrame =
         shouldPlayVideoNow &&
             allowVideoSurfaceOutput &&
@@ -148,25 +159,25 @@ internal fun WeatherBackgroundLayerImpl(
             visualSnapshot.isEligibleForVisibleVideo
 
     val currentFrameIdentity =
-        Triple(
-            visualSnapshot.sessionId,
-            currentVideoResId,
-            visualSnapshot.decoderGeneration,
+        WeatherVideoDisplayIdentity(
+            sessionId = visualSnapshot.sessionId,
+            playerIdentity = visualSnapshot.playerIdentity,
+            videoResId = currentVideoResId,
+            decoderGeneration = visualSnapshot.decoderGeneration,
+            surfaceEpoch = visualSnapshot.surfaceEpoch,
         )
 
     // Single centralized Animatable controller for videoAlpha:
-    // - Eliminates the 1-frame asynchronous lag of animateFloatAsState(..., snap()) by clamping
-    //   videoAlpha to 0f synchronously during composition whenever canDisplayVideoFrame is false
-    //   or when a new frame identity (session, MediaItem, decoderGeneration) has not yet started its fade.
-    // - Fades in smoothly (280ms) once per valid confirmed frame identity.
+    // - Eliminates any 1-frame asynchronous lag by clamping videoAlpha to 0f synchronously during
+    //   composition whenever canDisplayVideoFrame is false or when a new frame identity has not yet
+    //   started its fade.
+    // - Fades in smoothly (280ms) once per valid confirmed 5-axis frame identity.
     val videoAlphaAnimatable = remember { Animatable(0f) }
-    var activeVisibleFrameIdentity by remember { mutableStateOf<Triple<String, Int, Int>?>(null) }
-    var lastFadeInLoggedKey by remember { mutableStateOf<Triple<String, Int, Int>?>(null) }
+    var activeVisibleFrameIdentity by remember { mutableStateOf<WeatherVideoDisplayIdentity?>(null) }
+    var lastFadeInLoggedKey by remember { mutableStateOf<WeatherVideoDisplayIdentity?>(null) }
     var lastWallpaperMilestoneSignature by remember { mutableStateOf<Pair<Int, Boolean>?>(null) }
 
     if (!visualSnapshot.isEligibleForVisibleVideo || visualSnapshot.videoResId != currentVideoResId) {
-        // Genuine frame invalidation (codec error, decoder release, MediaItem switch, map tab detach):
-        // require a fresh fade-in when the next valid first frame is confirmed.
         if (activeVisibleFrameIdentity != null) {
             activeVisibleFrameIdentity = null
         }
@@ -193,6 +204,7 @@ internal fun WeatherBackgroundLayerImpl(
         canDisplayVideoFrame,
         currentFrameIdentity,
         visualSnapshot.visualState,
+        visualSnapshot.recoveryState,
     ) {
         val wallpaperVisibleAsPrimary = !canDisplayVideoFrame
         val wallpaperSig = currentVideoResId to wallpaperVisibleAsPrimary
@@ -213,6 +225,8 @@ internal fun WeatherBackgroundLayerImpl(
                     frameReady = visualSnapshot.frameReady,
                     visualState = visualSnapshot.visualState.name,
                     reason = if (!shouldMountVideo) "animated_disabled" else "fallback_active",
+                    recoveryState = visualSnapshot.recoveryState.name,
+                    surfaceEpoch = visualSnapshot.surfaceEpoch,
                 )
             }
         } else {
@@ -233,6 +247,8 @@ internal fun WeatherBackgroundLayerImpl(
                         frameReady = true,
                         visualState = visualSnapshot.visualState.name,
                         reason = "valid_frame_confirmed",
+                        recoveryState = visualSnapshot.recoveryState.name,
+                        surfaceEpoch = visualSnapshot.surfaceEpoch,
                     )
                 }
                 videoAlphaAnimatable.animateTo(
@@ -240,8 +256,6 @@ internal fun WeatherBackgroundLayerImpl(
                     animationSpec = tween(durationMillis = 280),
                 )
             } else if (videoAlphaAnimatable.value != 1f) {
-                // Restoring visibility of the exact same already-validated frame (e.g., Activity ON_STOP -> ON_START
-                // where the decoder and frame remained intact) without re-emitting a duplicate fade-in event.
                 videoAlphaAnimatable.snapTo(1f)
             }
         }
@@ -272,6 +286,7 @@ internal fun WeatherBackgroundLayerImpl(
                         .testTag("weather_video_layer"),
                 playerBridgeFactory = playerBridgeFactory,
                 surfaceBridgeFactory = surfaceBridgeFactory,
+                firstFrameTimeoutMs = firstFrameTimeoutMs,
             )
         }
 
