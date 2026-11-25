@@ -2,13 +2,13 @@ package com.example.ui.components
 
 import android.content.Context
 import android.provider.Settings
+import androidx.annotation.DrawableRes
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -28,6 +28,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -50,9 +51,10 @@ import com.example.ui.theme.WeatherGlassSpecs
  *    switches, map tab transitions, or MediaCodec reclaim/recovery).
  * 2. When dynamic scenarios are enabled and system reduced-motion is off, mounts the Media3
  *    looping MP4 clip (`wx_bg_*`).
- * 3. Hides the video layer immediately (`snap()` -> `alpha = 0f`) whenever a valid rendered frame
- *    is unavailable, and fades it in smoothly (`tween(280)`) only after `onRenderedFirstFrame`
- *    confirms a valid frame for the current `MediaItem` and decoder generation.
+ * 3. Hides the video layer immediately (`0f` on the exact same composition frame) whenever a valid
+ *    rendered frame is unavailable, and fades it in smoothly (`tween(280)`) only after
+ *    `onRenderedFirstFrame` confirms a valid frame for the current `MediaItem`, active decoder
+ *    generation, and attached surface.
  * 4. For `NOITE_CHUVA`, applies the subtle procedural rain-streak overlay over `cloudy_night`
  *    matching V53's visual specification.
  * 5. Respects V39/V53 per-tab shade transparency.
@@ -112,6 +114,7 @@ internal fun WeatherBackgroundLayerImpl(
     }
 
     val currentVideoResId = condition.backgroundVideo.rawRes
+    val currentWallpaperResId = condition.staticWallpaperRes
 
     LaunchedEffect(shouldMountVideo) {
         if (!shouldMountVideo) {
@@ -124,7 +127,7 @@ internal fun WeatherBackgroundLayerImpl(
         }
     }
 
-    // All required conditions for video layer visibility (Etapa 3M item 4):
+    // All required conditions for video layer visibility (Etapa 3M / 3N):
     // 1. Animated background preference enabled & system reduced-motion off (shouldMountVideo)
     // 2. Active tab is not RADAR or CITIES (allowVideoSurfaceOutput / shouldPlayVideoNow)
     // 3. Activity is at least STARTED (isActivityStarted)
@@ -141,70 +144,102 @@ internal fun WeatherBackgroundLayerImpl(
             visualSnapshot.videoResId == currentVideoResId &&
             visualSnapshot.isEligibleForVisibleVideo
 
-    val targetVideoAlpha = if (canDisplayVideoFrame) 1f else 0f
+    val currentFrameIdentity =
+        Triple(
+            visualSnapshot.sessionId,
+            currentVideoResId,
+            visualSnapshot.decoderGeneration,
+        )
 
-    // Single source of truth for videoAlpha:
-    // - Fade in smoothly (280ms) only when a confirmed valid frame becomes ready.
-    // - Snap immediately to 0f when frame readiness is lost (codec error, media change, map tab)
-    //   so an invalid or black TextureView buffer is never exposed over the static wallpaper.
-    val videoAlpha by animateFloatAsState(
-        targetValue = targetVideoAlpha,
-        animationSpec = if (targetVideoAlpha > 0f) tween(durationMillis = 280) else snap(),
-        label = "weather_video_fade",
-    )
+    // Single centralized Animatable controller for videoAlpha:
+    // - Eliminates the 1-frame asynchronous lag of animateFloatAsState(..., snap()) by clamping
+    //   videoAlpha to 0f synchronously during composition whenever canDisplayVideoFrame is false
+    //   or when a new frame identity (session, MediaItem, decoderGeneration) has not yet started its fade.
+    // - Fades in smoothly (280ms) once per valid confirmed frame identity.
+    val videoAlphaAnimatable = remember { Animatable(0f) }
+    var activeVisibleFrameIdentity by remember { mutableStateOf<Triple<String, Int, Int>?>(null) }
+    var lastFadeInLoggedKey by remember { mutableStateOf<Triple<String, Int, Int>?>(null) }
+    var lastWallpaperMilestoneSignature by remember { mutableStateOf<Pair<Int, Boolean>?>(null) }
+
+    if (!visualSnapshot.isEligibleForVisibleVideo || visualSnapshot.videoResId != currentVideoResId) {
+        // Genuine frame invalidation (codec error, decoder release, MediaItem switch, map tab detach):
+        // require a fresh fade-in when the next valid first frame is confirmed.
+        if (activeVisibleFrameIdentity != null) {
+            activeVisibleFrameIdentity = null
+        }
+        if (lastFadeInLoggedKey != null) {
+            lastFadeInLoggedKey = null
+        }
+    }
+
+    val videoAlpha =
+        if (!canDisplayVideoFrame) {
+            0f
+        } else if (activeVisibleFrameIdentity != currentFrameIdentity) {
+            0f
+        } else {
+            videoAlphaAnimatable.value
+        }
 
     LaunchedEffect(videoAlpha) {
         onEffectiveVideoAlphaChanged(videoAlpha)
     }
 
-    var lastWallpaperMilestoneSignature by remember { mutableStateOf<Pair<Int, Boolean>?>(null) }
-    var lastFadeInLoggedKey by remember { mutableStateOf<Triple<String, Int, Int>?>(null) }
-
     LaunchedEffect(
         currentVideoResId,
         canDisplayVideoFrame,
-        visualSnapshot.sessionId,
-        visualSnapshot.decoderGeneration,
+        currentFrameIdentity,
         visualSnapshot.visualState,
     ) {
         val wallpaperVisibleAsPrimary = !canDisplayVideoFrame
         val wallpaperSig = currentVideoResId to wallpaperVisibleAsPrimary
-        if (wallpaperVisibleAsPrimary && lastWallpaperMilestoneSignature != wallpaperSig) {
-            lastWallpaperMilestoneSignature = wallpaperSig
-            ClimaGraphicsLifecycleDiagnostics.logBackgroundVisualMilestone(
-                eventName = "BACKGROUND_WALLPAPER_VISIBLE",
-                sessionId = visualSnapshot.sessionId.ifEmpty { "wallpaper-only" },
-                playerIdentity = visualSnapshot.playerIdentity,
-                videoResId = currentVideoResId,
-                playerState = visualSnapshot.playerState,
-                decoderGeneration = visualSnapshot.decoderGeneration,
-                videoAlpha = 0f,
-                frameReady = visualSnapshot.frameReady,
-                visualState = visualSnapshot.visualState.name,
-                reason = if (!shouldMountVideo) "animated_disabled" else "fallback_active",
-            )
-        } else if (!wallpaperVisibleAsPrimary) {
-            lastWallpaperMilestoneSignature = wallpaperSig
-            val fadeKey =
-                Triple(
-                    visualSnapshot.sessionId,
-                    currentVideoResId,
-                    visualSnapshot.decoderGeneration,
-                )
-            if (lastFadeInLoggedKey != fadeKey) {
-                lastFadeInLoggedKey = fadeKey
+        if (wallpaperVisibleAsPrimary) {
+            if (videoAlphaAnimatable.value != 0f) {
+                videoAlphaAnimatable.snapTo(0f)
+            }
+            if (lastWallpaperMilestoneSignature != wallpaperSig) {
+                lastWallpaperMilestoneSignature = wallpaperSig
                 ClimaGraphicsLifecycleDiagnostics.logBackgroundVisualMilestone(
-                    eventName = "BACKGROUND_VIDEO_FADE_IN",
-                    sessionId = visualSnapshot.sessionId,
+                    eventName = "BACKGROUND_WALLPAPER_VISIBLE",
+                    sessionId = visualSnapshot.sessionId.ifEmpty { "wallpaper-only" },
                     playerIdentity = visualSnapshot.playerIdentity,
                     videoResId = currentVideoResId,
                     playerState = visualSnapshot.playerState,
                     decoderGeneration = visualSnapshot.decoderGeneration,
-                    videoAlpha = 1f,
-                    frameReady = true,
+                    videoAlpha = 0f,
+                    frameReady = visualSnapshot.frameReady,
                     visualState = visualSnapshot.visualState.name,
-                    reason = "valid_frame_confirmed",
+                    reason = if (!shouldMountVideo) "animated_disabled" else "fallback_active",
                 )
+            }
+        } else {
+            lastWallpaperMilestoneSignature = wallpaperSig
+            if (activeVisibleFrameIdentity != currentFrameIdentity) {
+                activeVisibleFrameIdentity = currentFrameIdentity
+                videoAlphaAnimatable.snapTo(0f)
+                if (lastFadeInLoggedKey != currentFrameIdentity) {
+                    lastFadeInLoggedKey = currentFrameIdentity
+                    ClimaGraphicsLifecycleDiagnostics.logBackgroundVisualMilestone(
+                        eventName = "BACKGROUND_VIDEO_FADE_IN",
+                        sessionId = visualSnapshot.sessionId,
+                        playerIdentity = visualSnapshot.playerIdentity,
+                        videoResId = currentVideoResId,
+                        playerState = visualSnapshot.playerState,
+                        decoderGeneration = visualSnapshot.decoderGeneration,
+                        videoAlpha = 1f,
+                        frameReady = true,
+                        visualState = visualSnapshot.visualState.name,
+                        reason = "valid_frame_confirmed",
+                    )
+                }
+                videoAlphaAnimatable.animateTo(
+                    targetValue = 1f,
+                    animationSpec = tween(durationMillis = 280),
+                )
+            } else if (videoAlphaAnimatable.value != 1f) {
+                // Restoring visibility of the exact same already-validated frame (e.g., Activity ON_STOP -> ON_START
+                // where the decoder and frame remained intact) without re-emitting a duplicate fade-in event.
+                videoAlphaAnimatable.snapTo(1f)
             }
         }
     }
@@ -212,13 +247,9 @@ internal fun WeatherBackgroundLayerImpl(
     val tabSpec = remember(activeTab) { WeatherGlassSpecs.forTab(activeTab) }
 
     Box(modifier = modifier.fillMaxSize().background(ClimaDeepSky)) {
-        // Layer 1: Static WebP wallpaper safety layer (always mounted, never unmounted or hidden during video errors/recovery)
-        Image(
-            painter = painterResource(id = condition.staticWallpaperRes),
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize().testTag("weather_static_wallpaper"),
-        )
+        // Layer 1: Static WebP wallpaper safety layer (always mounted, isolated in a skippable composable
+        // so videoAlpha changes and unrelated state updates never reinitialize its Painter)
+        StaticWeatherWallpaperLayer(wallpaperResId = currentWallpaperResId)
 
         // Layer 2: Media3 looping muted MP4 video (hidden at alpha=0f whenever no valid frame is confirmed)
         if (shouldMountVideo) {
@@ -230,7 +261,12 @@ internal fun WeatherBackgroundLayerImpl(
                 onVisualStateChanged = { snapshot ->
                     visualSnapshot = snapshot
                 },
-                modifier = Modifier.fillMaxSize().alpha(videoAlpha).testTag("weather_video_layer"),
+                modifier =
+                    Modifier
+                        .fillMaxSize()
+                        .graphicsLayer { alpha = videoAlpha }
+                        .alpha(videoAlpha)
+                        .testTag("weather_video_layer"),
                 playerBridgeFactory = playerBridgeFactory,
                 surfaceBridgeFactory = surfaceBridgeFactory,
             )
@@ -238,24 +274,44 @@ internal fun WeatherBackgroundLayerImpl(
 
         // Layer 3: Night rain procedural overlay matching V53's `noite_chuva` over `cloudy_night`
         if (condition.needsNightRainOverlay && shouldPlayVideoNow) {
-            NightRainOverlay(modifier = Modifier.fillMaxSize())
+            NightRainOverlay(modifier = Modifier.fillMaxSize().testTag("weather_night_rain_overlay"))
         }
 
         // Layer 4: Subtle top/bottom atmospheric legibility scrim + optional tab shade
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(
-                            Color.Black.copy(alpha = 0.16f + tabSpec.wallpaperShadeAlpha),
-                            Color.Transparent,
-                            Color.Black.copy(alpha = 0.24f + tabSpec.wallpaperShadeAlpha),
-                        )
-                    )
-                )
-        )
+        AtmosphericScrimLayer(wallpaperShadeAlpha = tabSpec.wallpaperShadeAlpha)
     }
+}
+
+@Composable
+private fun StaticWeatherWallpaperLayer(@DrawableRes wallpaperResId: Int) {
+    Image(
+        painter = painterResource(id = wallpaperResId),
+        contentDescription = null,
+        contentScale = ContentScale.Crop,
+        modifier = Modifier.fillMaxSize().testTag("weather_static_wallpaper"),
+    )
+}
+
+@Composable
+private fun AtmosphericScrimLayer(wallpaperShadeAlpha: Float) {
+    val scrimBrush =
+        remember(wallpaperShadeAlpha) {
+            Brush.verticalGradient(
+                colors =
+                    listOf(
+                        Color.Black.copy(alpha = 0.16f + wallpaperShadeAlpha),
+                        Color.Transparent,
+                        Color.Black.copy(alpha = 0.24f + wallpaperShadeAlpha),
+                    ),
+            )
+        }
+    Box(
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .background(scrimBrush)
+                .testTag("weather_atmospheric_scrim"),
+    )
 }
 
 @Composable

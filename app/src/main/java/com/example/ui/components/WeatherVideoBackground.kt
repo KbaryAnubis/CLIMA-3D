@@ -83,6 +83,16 @@ internal data class ExoSurfaceSnapshot(
         "surfaceView=${surfaceViewClass ?: "none"}, textureAvailable=${textureAvailable ?: "unknown"}, hasSurfaceTexture=${hasSurfaceTexture ?: "unknown"}"
 }
 
+internal data class WeatherVideoFrameToken(
+    val sessionId: String,
+    val playerIdentity: Int,
+    val videoResId: Int,
+    val decoderGeneration: Int,
+    val surfaceEpoch: Int = 0,
+    val surfaceViewIdentity: Int = 0,
+    val decoderAlive: Boolean = true,
+)
+
 internal data class WeatherVideoCodecErrorDiagnostic(
     val errorCodeName: String,
     val errorClass: String,
@@ -102,6 +112,10 @@ internal interface WeatherVideoPlayerBridge {
         get() = if (isReleased) "RELEASED" else if (isIdle) "IDLE" else "READY"
     val decoderGeneration: Int
         get() = 1
+    val isDecoderAlive: Boolean
+        get() = !isReleased && !isIdle && decoderGeneration > 0
+    val surfaceEpoch: Int
+        get() = 0
     val currentPositionMs: Long
         get() = 0L
     val currentPlaybackSpeed: Float
@@ -120,6 +134,7 @@ internal interface WeatherVideoPlayerBridge {
     fun pause()
     fun clearVideoSurface()
     fun setFirstFrameListener(listener: (() -> Unit)?)
+    fun setFirstFrameTokenListener(listener: ((WeatherVideoFrameToken) -> Unit)?) {}
     fun setDecoderLifecycleListener(
         listener: ((initialized: Boolean, decoderGeneration: Int, decoderName: String) -> Unit)?,
     ) {}
@@ -190,6 +205,7 @@ private class RealExoPlayerBridge(
 ) : WeatherVideoPlayerBridge {
     private val releasedFlag = AtomicBoolean(false)
     private var firstFrameCallback: (() -> Unit)? = null
+    private var firstFrameTokenCallback: ((WeatherVideoFrameToken) -> Unit)? = null
     private var decoderLifecycleCallback: ((Boolean, Int, String) -> Unit)? = null
     private var playbackStateCallback: ((String, Boolean) -> Unit)? = null
     private var codecErrorCallback: ((WeatherVideoCodecErrorDiagnostic) -> Unit)? = null
@@ -199,6 +215,12 @@ private class RealExoPlayerBridge(
     private var lastKnownGoodPositionMs: Long = 0L
     @Volatile
     private var currentDecoderGen: Int = 0
+    @Volatile
+    private var currentDecoderAlive: Boolean = false
+    @Volatile
+    private var currentSurfaceEpoch: Int = 0
+    @Volatile
+    private var attachedSurfaceViewId: Int = 0
     private var firstFrameLoggedForCurrentItem = false
     private var lastPlaybackSignature: Pair<Int, Boolean>? = null
     private var lastSurfaceSize: Pair<Int, Int>? = null
@@ -217,6 +239,12 @@ private class RealExoPlayerBridge(
 
     override val decoderGeneration: Int
         get() = currentDecoderGen
+
+    override val isDecoderAlive: Boolean
+        get() = !releasedFlag.get() && currentDecoderAlive
+
+    override val surfaceEpoch: Int
+        get() = currentSurfaceEpoch
 
     override val currentPositionMs: Long
         get() =
@@ -246,6 +274,9 @@ private class RealExoPlayerBridge(
         object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (releasedFlag.get()) return
+                if (playbackState == Player.STATE_IDLE) {
+                    currentDecoderAlive = false
+                }
                 val isPlayingNow = exoPlayer.isPlaying
                 val posNow = currentPositionMs
                 val stateLabel = playbackStateName(playbackState)
@@ -329,7 +360,22 @@ private class RealExoPlayerBridge(
                         playerState = currentPlayerStateLabel(),
                     )
                 }
-                firstFrameCallback?.invoke()
+                val token =
+                    WeatherVideoFrameToken(
+                        sessionId = sessionId,
+                        playerIdentity = identityHash,
+                        videoResId = currentVideoResId,
+                        decoderGeneration = currentDecoderGen.coerceAtLeast(1),
+                        surfaceEpoch = currentSurfaceEpoch,
+                        surfaceViewIdentity = attachedSurfaceViewId,
+                        decoderAlive = currentDecoderAlive,
+                    )
+                val tokenCallback = firstFrameTokenCallback
+                if (tokenCallback != null) {
+                    tokenCallback.invoke(token)
+                } else {
+                    firstFrameCallback?.invoke()
+                }
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -338,6 +384,7 @@ private class RealExoPlayerBridge(
                 val speedAtError = currentPlaybackSpeed
                 val causeClass = (error.cause ?: error)::class.java.simpleName
                 val deadObject = isMediaCodecDeadObjectOrReclaimed(error)
+                currentDecoderAlive = false
                 firstFrameLoggedForCurrentItem = false
                 ClimaGraphicsLifecycleDiagnostics.logExoPlayerError(
                     sessionId = sessionId,
@@ -374,6 +421,7 @@ private class RealExoPlayerBridge(
             ) {
                 if (releasedFlag.get()) return
                 currentDecoderGen += 1
+                currentDecoderAlive = true
                 firstFrameLoggedForCurrentItem = false
                 ClimaGraphicsLifecycleDiagnostics.logExoDecoderInitialized(
                     sessionId = sessionId,
@@ -393,6 +441,7 @@ private class RealExoPlayerBridge(
                 decoderName: String,
             ) {
                 if (releasedFlag.get()) return
+                currentDecoderAlive = false
                 firstFrameLoggedForCurrentItem = false
                 ClimaGraphicsLifecycleDiagnostics.logExoDecoderReleased(
                     sessionId = sessionId,
@@ -411,17 +460,26 @@ private class RealExoPlayerBridge(
                 videoCodecError: Exception,
             ) {
                 if (releasedFlag.get()) return
+                currentDecoderAlive = false
                 firstFrameLoggedForCurrentItem = false
+                val deadObject = isMediaCodecDeadObjectOrReclaimed(videoCodecError)
                 ClimaGraphicsLifecycleDiagnostics.logExoCodecError(
                     sessionId = sessionId,
                     playerIdentity = identityHash,
                     trackType = "VIDEO",
                     errorClass = videoCodecError::class.java.simpleName,
-                    isDeadObject = isMediaCodecDeadObjectOrReclaimed(videoCodecError),
+                    isDeadObject = deadObject,
                     playerState = currentPlayerStateLabel(),
                     videoResId = currentVideoResId,
                     positionMs = currentPositionMs,
                     message = videoCodecError.localizedMessage,
+                )
+                // Immediately notify decoder release/invalidation so the video layer hides on the
+                // exact callback when the hardware decoder faults, before onPlayerError arrives.
+                decoderLifecycleCallback?.invoke(
+                    false,
+                    currentDecoderGen,
+                    "codec_error:${videoCodecError::class.java.simpleName}",
                 )
             }
 
@@ -530,6 +588,7 @@ private class RealExoPlayerBridge(
 
     override fun stop() {
         if (releasedFlag.get()) return
+        currentDecoderAlive = false
         firstFrameLoggedForCurrentItem = false
         exoPlayer.stop()
     }
@@ -550,6 +609,8 @@ private class RealExoPlayerBridge(
 
     override fun clearVideoSurface() {
         if (releasedFlag.get()) return
+        currentSurfaceEpoch += 1
+        attachedSurfaceViewId = 0
         firstFrameLoggedForCurrentItem = false
         val livePos = runCatching { exoPlayer.currentPosition.coerceAtLeast(0L) }.getOrDefault(0L)
         if (livePos > 0L) {
@@ -560,6 +621,10 @@ private class RealExoPlayerBridge(
 
     override fun setFirstFrameListener(listener: (() -> Unit)?) {
         firstFrameCallback = listener
+    }
+
+    override fun setFirstFrameTokenListener(listener: ((WeatherVideoFrameToken) -> Unit)?) {
+        firstFrameTokenCallback = listener
     }
 
     override fun setDecoderLifecycleListener(
@@ -577,11 +642,14 @@ private class RealExoPlayerBridge(
     }
 
     override fun notifySurfaceReattachedForNewFrame() {
+        currentSurfaceEpoch += 1
         firstFrameLoggedForCurrentItem = false
     }
 
     override fun attachToPlayerView(playerView: PlayerView) {
         if (releasedFlag.get()) return
+        currentSurfaceEpoch += 1
+        attachedSurfaceViewId = System.identityHashCode(playerView)
         firstFrameLoggedForCurrentItem = false
         playerView.player = exoPlayer
     }
@@ -591,7 +659,9 @@ private class RealExoPlayerBridge(
 
     override fun releaseOnce(): Boolean {
         if (!releasedFlag.compareAndSet(false, true)) return false
+        currentDecoderAlive = false
         firstFrameCallback = null
+        firstFrameTokenCallback = null
         decoderLifecycleCallback = null
         playbackStateCallback = null
         codecErrorCallback = null
@@ -680,8 +750,9 @@ private class RealPlayerViewSurfaceBridge(
  *   OpenGL TextureView session is active or disposing, then reattaches the same in-memory
  *   `ExoPlayer` instance once MapLibre teardown completes.
  * - Tracks an explicit visual frame state machine ([WeatherVideoVisualState]) bound to the
- *   player session, current `MediaItem`, and decoder generation so invalid/black frames are
- *   never shown before `onRenderedFirstFrame` confirms a valid frame.
+ *   player session, player identity, current `MediaItem`, active decoder generation, and
+ *   currently attached video surface so invalid/black frames are never shown before
+ *   `onRenderedFirstFrame` confirms a valid frame for the exact active combination.
  */
 @Composable
 fun WeatherVideoBackground(
@@ -752,11 +823,17 @@ internal fun WeatherVideoBackgroundImpl(
     var videoSurfaceClearedForMap by remember(playerHandle) { mutableStateOf(false) }
     var pendingReattachRequestLogged by remember(playerHandle) { mutableStateOf(false) }
 
-    // Visual frame availability & decoder generation state machine (Etapa 3M)
+    // Visual frame availability & 5-axis token state machine (Etapa 3M / 3N)
     var visualState by remember(playerHandle) { mutableStateOf(WeatherVideoVisualState.VIDEO_NOT_READY) }
     var activeDecoderGeneration by remember(playerHandle) { mutableIntStateOf(0) }
+    var isDecoderCurrentlyAlive by remember(playerHandle) { mutableStateOf(false) }
+    var activeSurfaceAttachmentEpoch by remember(playerHandle) { mutableIntStateOf(0) }
+    var activeSurfaceViewIdentity by remember(playerHandle) { mutableIntStateOf(0) }
+
     var renderedFrameDecoderGeneration by remember(playerHandle) { mutableIntStateOf(-1) }
     var renderedFrameVideoResId by remember(playerHandle) { mutableStateOf<Int?>(null) }
+    var renderedFrameSurfaceEpoch by remember(playerHandle) { mutableIntStateOf(-1) }
+    var renderedFrameViewIdentity by remember(playerHandle) { mutableIntStateOf(0) }
     var hasValidRenderedFrame by remember(playerHandle) { mutableStateOf(false) }
     var hasPendingFatalDecoderError by remember(playerHandle) { mutableStateOf(false) }
     var recoveryInProgress by remember(playerHandle) { mutableStateOf(false) }
@@ -791,6 +868,24 @@ internal fun WeatherVideoBackgroundImpl(
 
     var lastPublishedSnapshot by remember(playerHandle) { mutableStateOf<WeatherVideoVisualSnapshot?>(null) }
 
+    fun isCurrentRenderedFrameStrictlyValid(targetResId: Int): Boolean {
+        val bridge = surfaceBridgeRef
+        val currentViewId = bridge?.viewIdentity ?: 0
+        val attached = bridge != null && bridge.isPlayerAttached(playerHandle) && !videoSurfaceClearedForMap
+        return hasValidRenderedFrame &&
+            isDecoderCurrentlyAlive &&
+            renderedFrameVideoResId == targetResId &&
+            activeDecoderGeneration > 0 &&
+            renderedFrameDecoderGeneration == activeDecoderGeneration &&
+            renderedFrameSurfaceEpoch == activeSurfaceAttachmentEpoch &&
+            (renderedFrameViewIdentity == 0 || renderedFrameViewIdentity == currentViewId) &&
+            attached &&
+            !hasPendingFatalDecoderError &&
+            !recoveryExhaustedForCurrentMedia &&
+            !needsCodecRecovery &&
+            !recoveryInProgress
+    }
+
     fun publishVisualState(
         nextState: WeatherVideoVisualState,
         milestoneEvent: String? = null,
@@ -800,13 +895,8 @@ internal fun WeatherVideoBackgroundImpl(
         val currentRes = appliedVideoResId ?: latestVideoResId
         val attached = isSurfaceCurrentlyAttached()
         val frameReadyNow =
-            hasValidRenderedFrame &&
-                nextState == WeatherVideoVisualState.VIDEO_FRAME_READY &&
-                renderedFrameVideoResId == currentRes &&
-                renderedFrameDecoderGeneration == activeDecoderGeneration &&
-                attached &&
-                !hasPendingFatalDecoderError &&
-                !recoveryExhaustedForCurrentMedia
+            nextState == WeatherVideoVisualState.VIDEO_FRAME_READY &&
+                isCurrentRenderedFrameStrictlyValid(currentRes)
         val snapshot =
             WeatherVideoVisualSnapshot(
                 visualState = nextState,
@@ -848,6 +938,8 @@ internal fun WeatherVideoBackgroundImpl(
         val wasFrameReady = hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY
         hasValidRenderedFrame = false
         renderedFrameDecoderGeneration = -1
+        renderedFrameSurfaceEpoch = -1
+        renderedFrameViewIdentity = 0
         val eventToEmit =
             if (milestoneEvent == "BACKGROUND_VIDEO_HIDDEN_NO_FRAME" && !wasFrameReady && visualState == nextState) {
                 null
@@ -896,6 +988,7 @@ internal fun WeatherVideoBackgroundImpl(
                 recoveryInProgress = true
                 hasPendingFatalDecoderError = true
                 hasValidRenderedFrame = false
+                renderedFrameDecoderGeneration = -1
                 lastAppliedPlayState = true
                 val currentRes = appliedVideoResId ?: videoResId
                 ClimaGraphicsLifecycleDiagnostics.logExoRecoveryAction(
@@ -921,6 +1014,7 @@ internal fun WeatherVideoBackgroundImpl(
                 playerHandle.setPlayWhenReady(true)
                 if (playerHandle.isIdle) {
                     hasValidRenderedFrame = false
+                    renderedFrameDecoderGeneration = -1
                     publishVisualState(
                         nextState = WeatherVideoVisualState.VIDEO_PREPARING,
                         milestoneEvent = "BACKGROUND_VIDEO_WAITING_FIRST_FRAME",
@@ -954,6 +1048,8 @@ internal fun WeatherVideoBackgroundImpl(
             }
             return
         }
+        activeSurfaceAttachmentEpoch += 1
+        activeSurfaceViewIdentity = 0
         GraphicsSurfaceCoordinator.onVideoOutputDetachForMap(
             sessionId = playerHandle.sessionId,
             playerIdentity = playerHandle.identityHash,
@@ -1021,10 +1117,18 @@ internal fun WeatherVideoBackgroundImpl(
             val wasDetachedForMap = videoSurfaceClearedForMap
             pendingReattachRequestLogged = false
             videoSurfaceClearedForMap = false
+            activeSurfaceAttachmentEpoch += 1
+            activeSurfaceViewIdentity = bridge.viewIdentity
             if (wasDetachedForMap) {
                 hasValidRenderedFrame = false
                 renderedFrameDecoderGeneration = -1
+                renderedFrameSurfaceEpoch = -1
+                renderedFrameViewIdentity = 0
                 playerHandle.notifySurfaceReattachedForNewFrame()
+            } else if (hasValidRenderedFrame) {
+                // Initial composition attach where prepare() completed just before view binding
+                renderedFrameSurfaceEpoch = activeSurfaceAttachmentEpoch
+                renderedFrameViewIdentity = bridge.viewIdentity
             }
             bridge.attachPlayer(playerHandle)
             val surfaceFormatted = bridge.inspectSurfaceSnapshot().formatted()
@@ -1044,7 +1148,7 @@ internal fun WeatherVideoBackgroundImpl(
             val nextVisualState =
                 when {
                     needsCodecRecovery || recoveryInProgress -> WeatherVideoVisualState.VIDEO_RECOVERING
-                    hasValidRenderedFrame -> WeatherVideoVisualState.VIDEO_FRAME_READY
+                    hasValidRenderedFrame && isDecoderCurrentlyAlive -> WeatherVideoVisualState.VIDEO_FRAME_READY
                     else -> WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME
                 }
             publishVisualState(
@@ -1061,12 +1165,13 @@ internal fun WeatherVideoBackgroundImpl(
         resumePlayerIfEligible(requireStartedLifecycle = true)
     }
 
-    val handleDecoderLifecycle: (Boolean, Int, String) -> Unit = { initialized, decoderGen, _ ->
+    val handleDecoderLifecycle: (Boolean, Int, String) -> Unit = { initialized, decoderGen, reasonLabel ->
         if (!playerHandle.isReleased) {
             activeDecoderGeneration = maxOf(activeDecoderGeneration, decoderGen)
             if (!initialized) {
-                // Previous decoder was released: any frame from an older generation is no longer valid
-                if (hasValidRenderedFrame) {
+                isDecoderCurrentlyAlive = false
+                // Previous decoder was released or faulted: any frame from an older generation is immediately invalid
+                if (hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY) {
                     invalidateCurrentFrame(
                         nextState =
                             when {
@@ -1075,14 +1180,30 @@ internal fun WeatherVideoBackgroundImpl(
                                 else -> WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME
                             },
                         milestoneEvent = "BACKGROUND_VIDEO_HIDDEN_NO_FRAME",
-                        reason = "decoder_released",
+                        reason = if (reasonLabel.startsWith("codec_error:")) reasonLabel else "decoder_released",
                     )
                 }
             } else {
-                // New decoder generation initialized: wait for onRenderedFirstFrame before showing video
+                isDecoderCurrentlyAlive = true
+                // New decoder generation initialized: invalidate any older frame and wait for onRenderedFirstFrame
+                val hadPreviousReadyFrame = hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY
                 hasValidRenderedFrame = false
                 renderedFrameDecoderGeneration = -1
-                if (latestCanAttachVideoSurfaceNow && !recoveryInProgress) {
+                renderedFrameSurfaceEpoch = -1
+                if (hadPreviousReadyFrame) {
+                    publishVisualState(
+                        nextState =
+                            if (!latestCanAttachVideoSurfaceNow) {
+                                WeatherVideoVisualState.VIDEO_OUTPUT_DETACHED
+                            } else if (recoveryInProgress) {
+                                WeatherVideoVisualState.VIDEO_RECOVERING
+                            } else {
+                                WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME
+                            },
+                        milestoneEvent = "BACKGROUND_VIDEO_HIDDEN_NO_FRAME",
+                        reason = "new_decoder_generation_$activeDecoderGeneration",
+                    )
+                } else if (latestCanAttachVideoSurfaceNow && !recoveryInProgress) {
                     publishVisualState(
                         nextState = WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME,
                         milestoneEvent = "BACKGROUND_VIDEO_WAITING_FIRST_FRAME",
@@ -1095,9 +1216,11 @@ internal fun WeatherVideoBackgroundImpl(
 
     val handlePlaybackState: (String, Boolean) -> Unit = { stateName, _ ->
         if (!playerHandle.isReleased) {
+            val currentRes = appliedVideoResId ?: latestVideoResId
             when (stateName) {
                 "IDLE" -> {
-                    if (hasValidRenderedFrame) {
+                    isDecoderCurrentlyAlive = false
+                    if (hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY) {
                         invalidateCurrentFrame(
                             nextState =
                                 if (needsCodecRecovery || recoveryInProgress) {
@@ -1111,14 +1234,46 @@ internal fun WeatherVideoBackgroundImpl(
                     }
                 }
                 "BUFFERING" -> {
-                    // Notice: STATE_READY or BUFFERING alone does not prove a valid frame is present.
-                    // If we do not yet have a valid rendered frame for the current decoder generation,
-                    // keep video hidden (wallpaper visible) to prevent black buffer flashes.
-                    if (!hasValidRenderedFrame && latestCanAttachVideoSurfaceNow && !recoveryInProgress) {
-                        publishVisualState(
+                    // Etapa 3N Item 4: Strictly differentiate transient BUFFERING from frame-loss BUFFERING:
+                    // 1. If the current decoder generation is still alive, surface remains attached, no fatal
+                    //    error/recovery is active, and a valid rendered frame for the current MediaItem &
+                    //    decoder generation is already displayed, KEEP the valid frame visible (no flicker).
+                    // 2. Otherwise (new MediaItem, released decoder, fatal codec error, detached surface,
+                    //    or recovery after ERROR_RECLAIMED), keep or immediately snap the video hidden.
+                    val canPreserveExistingValidFrameDuringTransientBuffering =
+                        isCurrentRenderedFrameStrictlyValid(currentRes)
+                    if (!canPreserveExistingValidFrameDuringTransientBuffering) {
+                        if (hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY) {
+                            invalidateCurrentFrame(
+                                nextState =
+                                    when {
+                                        !latestCanAttachVideoSurfaceNow -> WeatherVideoVisualState.VIDEO_OUTPUT_DETACHED
+                                        needsCodecRecovery || recoveryInProgress -> WeatherVideoVisualState.VIDEO_RECOVERING
+                                        else -> WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME
+                                    },
+                                milestoneEvent = "BACKGROUND_VIDEO_HIDDEN_NO_FRAME",
+                                reason = "buffering_without_valid_frame",
+                            )
+                        } else if (latestCanAttachVideoSurfaceNow && !recoveryInProgress) {
+                            publishVisualState(
+                                nextState = WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME,
+                                milestoneEvent = null,
+                                reason = "player_buffering_no_frame",
+                            )
+                        }
+                    }
+                }
+                "READY" -> {
+                    // Notice (Etapa 3N Item 3): STATE_READY alone NEVER confirms a rendered frame.
+                    // If the frame is not strictly valid for the current decoder generation, MediaItem,
+                    // and attached surface, remain hidden waiting for onRenderedFirstFrame.
+                    if (!isCurrentRenderedFrameStrictlyValid(currentRes) &&
+                        visualState == WeatherVideoVisualState.VIDEO_FRAME_READY
+                    ) {
+                        invalidateCurrentFrame(
                             nextState = WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME,
-                            milestoneEvent = null,
-                            reason = "player_buffering_no_frame",
+                            milestoneEvent = "BACKGROUND_VIDEO_HIDDEN_NO_FRAME",
+                            reason = "ready_without_valid_frame_token",
                         )
                     }
                 }
@@ -1126,34 +1281,91 @@ internal fun WeatherVideoBackgroundImpl(
         }
     }
 
-    val handleFirstFrame: () -> Unit = {
+    val handleFirstFrameWithToken: (WeatherVideoFrameToken) -> Unit = { token ->
         if (!playerHandle.isReleased && latestCanAttachVideoSurfaceNow) {
-            val currentGen = maxOf(activeDecoderGeneration, playerHandle.decoderGeneration)
-            activeDecoderGeneration = currentGen
             val currentRes = appliedVideoResId ?: latestVideoResId
-            val wasRecovering = recoveryInProgress
-            consecutiveUnrenderedRecoveryCount = 0
-            recoveryInProgress = false
-            hasPendingFatalDecoderError = false
-            recoveryExhaustedForCurrentMedia = false
-            hasValidRenderedFrame = true
-            renderedFrameDecoderGeneration = currentGen
-            renderedFrameVideoResId = currentRes
+            val expectedGen = maxOf(activeDecoderGeneration, playerHandle.decoderGeneration)
+            val bridge = surfaceBridgeRef
+            val attachedNow = bridge != null && bridge.isPlayerAttached(playerHandle) && !videoSurfaceClearedForMap
+            val initialPreFactoryPrepare = bridge == null && activeSurfaceAttachmentEpoch == 0 && !videoSurfaceClearedForMap
 
-            if (wasRecovering) {
-                publishVisualState(
-                    nextState = WeatherVideoVisualState.VIDEO_FRAME_READY,
-                    milestoneEvent = "BACKGROUND_VIDEO_RECOVERY_FINISHED",
-                    reason = "first_frame_after_recovery_gen_$currentGen",
-                )
+            // Etapa 3N Item 3: Validate the exact 5-axis combination before accepting onRenderedFirstFrame:
+            // 1. ExoPlayer session & player instance identity
+            // 2. Current MediaItem (videoResId)
+            // 3. Current active decoder generation (must match and decoder must be alive)
+            // 4. Currently attached video surface (epoch & view identity)
+            val matchesSessionAndPlayer =
+                token.sessionId == playerHandle.sessionId &&
+                    token.playerIdentity == playerHandle.identityHash
+            val matchesMediaItem = token.videoResId == currentRes
+            val matchesDecoderGeneration =
+                token.decoderGeneration > 0 &&
+                    token.decoderGeneration == expectedGen &&
+                    token.decoderAlive &&
+                    (isDecoderCurrentlyAlive || playerHandle.isDecoderAlive)
+            val matchesSurface =
+                when {
+                    initialPreFactoryPrepare -> true
+                    !attachedNow -> false
+                    token.surfaceViewIdentity != 0 && token.surfaceViewIdentity != bridge.viewIdentity -> false
+                    token.surfaceEpoch != playerHandle.surfaceEpoch -> false
+                    else -> true
+                }
+
+            if (matchesSessionAndPlayer && matchesMediaItem && matchesDecoderGeneration && matchesSurface) {
+                activeDecoderGeneration = expectedGen
+                isDecoderCurrentlyAlive = true
+                val wasRecovering = recoveryInProgress
+                val alreadyReadyForSameToken =
+                    hasValidRenderedFrame &&
+                        visualState == WeatherVideoVisualState.VIDEO_FRAME_READY &&
+                        renderedFrameVideoResId == currentRes &&
+                        renderedFrameDecoderGeneration == expectedGen &&
+                        renderedFrameSurfaceEpoch == activeSurfaceAttachmentEpoch &&
+                        !wasRecovering
+
+                consecutiveUnrenderedRecoveryCount = 0
+                recoveryInProgress = false
+                hasPendingFatalDecoderError = false
+                recoveryExhaustedForCurrentMedia = false
+                hasValidRenderedFrame = true
+                renderedFrameDecoderGeneration = expectedGen
+                renderedFrameVideoResId = currentRes
+                renderedFrameSurfaceEpoch = activeSurfaceAttachmentEpoch
+                renderedFrameViewIdentity = bridge?.viewIdentity ?: 0
+
+                if (!alreadyReadyForSameToken) {
+                    if (wasRecovering) {
+                        publishVisualState(
+                            nextState = WeatherVideoVisualState.VIDEO_FRAME_READY,
+                            milestoneEvent = "BACKGROUND_VIDEO_RECOVERY_FINISHED",
+                            reason = "first_frame_after_recovery_gen_$expectedGen",
+                        )
+                    }
+                    publishVisualState(
+                        nextState = WeatherVideoVisualState.VIDEO_FRAME_READY,
+                        milestoneEvent = "BACKGROUND_VIDEO_FRAME_READY",
+                        reason = "rendered_first_frame_gen_$expectedGen",
+                    )
+                }
+                latestOnFirstFrame()
             }
-            publishVisualState(
-                nextState = WeatherVideoVisualState.VIDEO_FRAME_READY,
-                milestoneEvent = "BACKGROUND_VIDEO_FRAME_READY",
-                reason = "rendered_first_frame_gen_$currentGen",
-            )
-            latestOnFirstFrame()
         }
+    }
+
+    val handleFirstFrameLegacy: () -> Unit = {
+        val currentRes = appliedVideoResId ?: latestVideoResId
+        handleFirstFrameWithToken(
+            WeatherVideoFrameToken(
+                sessionId = playerHandle.sessionId,
+                playerIdentity = playerHandle.identityHash,
+                videoResId = currentRes,
+                decoderGeneration = maxOf(activeDecoderGeneration, playerHandle.decoderGeneration),
+                surfaceEpoch = playerHandle.surfaceEpoch,
+                surfaceViewIdentity = surfaceBridgeRef?.viewIdentity ?: 0,
+                decoderAlive = isDecoderCurrentlyAlive || playerHandle.isDecoderAlive,
+            ),
+        )
     }
 
     val handleCodecError: (WeatherVideoCodecErrorDiagnostic) -> Unit = { diagnostic ->
@@ -1166,9 +1378,11 @@ internal fun WeatherVideoBackgroundImpl(
             recoverySavedSpeed = speedToSave
             lastCodecErrorCode = diagnostic.errorCodeName
             lastAppliedPlayState = false
+            isDecoderCurrentlyAlive = false
             hasPendingFatalDecoderError = true
             hasValidRenderedFrame = false
             renderedFrameDecoderGeneration = -1
+            renderedFrameSurfaceEpoch = -1
             // Previous recovery attempt (if any) failed with a new codec error, so mark it no longer in progress
             recoveryInProgress = false
 
@@ -1222,16 +1436,19 @@ internal fun WeatherVideoBackgroundImpl(
     // Bind callbacks before any effect runs so synchronous prepare() calls always reach the active handlers
     playerHandle.setDecoderLifecycleListener(handleDecoderLifecycle)
     playerHandle.setPlaybackStateListener(handlePlaybackState)
-    playerHandle.setFirstFrameListener(handleFirstFrame)
+    playerHandle.setFirstFrameTokenListener(handleFirstFrameWithToken)
+    playerHandle.setFirstFrameListener(handleFirstFrameLegacy)
     playerHandle.setCodecErrorListener(handleCodecError)
 
     DisposableEffect(playerHandle) {
         playerHandle.setDecoderLifecycleListener(handleDecoderLifecycle)
         playerHandle.setPlaybackStateListener(handlePlaybackState)
-        playerHandle.setFirstFrameListener(handleFirstFrame)
+        playerHandle.setFirstFrameTokenListener(handleFirstFrameWithToken)
+        playerHandle.setFirstFrameListener(handleFirstFrameLegacy)
         playerHandle.setCodecErrorListener(handleCodecError)
         onDispose {
             playerHandle.setFirstFrameListener(null)
+            playerHandle.setFirstFrameTokenListener(null)
             playerHandle.setDecoderLifecycleListener(null)
             playerHandle.setPlaybackStateListener(null)
             playerHandle.setCodecErrorListener(null)
@@ -1279,6 +1496,8 @@ internal fun WeatherVideoBackgroundImpl(
         val uri = Uri.parse("android.resource://${context.packageName}/$videoResId")
         val isMediaChange = appliedVideoResId != null
         val playNow = latestIsPlaying && latestCanAttachVideoSurfaceNow
+        val hadVisibleFrameBeforeSwitch =
+            hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY
         needsCodecRecovery = false
         recoveryInProgress = false
         hasPendingFatalDecoderError = false
@@ -1288,9 +1507,22 @@ internal fun WeatherVideoBackgroundImpl(
         hasValidRenderedFrame = false
         renderedFrameDecoderGeneration = -1
         renderedFrameVideoResId = null
+        renderedFrameSurfaceEpoch = -1
         appliedVideoResId = videoResId
 
         playerHandle.setVideoResIdHint(videoResId)
+        if (isMediaChange && hadVisibleFrameBeforeSwitch) {
+            publishVisualState(
+                nextState =
+                    if (latestCanAttachVideoSurfaceNow) {
+                        WeatherVideoVisualState.VIDEO_PREPARING
+                    } else {
+                        WeatherVideoVisualState.VIDEO_OUTPUT_DETACHED
+                    },
+                milestoneEvent = "BACKGROUND_VIDEO_HIDDEN_NO_FRAME",
+                reason = "media_item_switching",
+            )
+        }
         publishVisualState(
             nextState =
                 if (latestCanAttachVideoSurfaceNow) {
@@ -1391,10 +1623,32 @@ internal fun WeatherVideoBackgroundImpl(
                         textureAvailable = snapshot.textureAvailable,
                         hasSurfaceTexture = snapshot.hasSurfaceTexture,
                     )
+                    val lostTextureSurface =
+                        !attached || snapshot.textureAvailable == false || snapshot.hasSurfaceTexture == false
+                    if (lostTextureSurface && (hasValidRenderedFrame || visualState == WeatherVideoVisualState.VIDEO_FRAME_READY)) {
+                        activeSurfaceAttachmentEpoch += 1
+                        playerHandle.notifySurfaceReattachedForNewFrame()
+                        invalidateCurrentFrame(
+                            nextState =
+                                if (!latestCanAttachVideoSurfaceNow || !attached) {
+                                    WeatherVideoVisualState.VIDEO_OUTPUT_DETACHED
+                                } else {
+                                    WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME
+                                },
+                            milestoneEvent = "BACKGROUND_VIDEO_HIDDEN_NO_FRAME",
+                            reason = if (!attached) "view_detached_from_window" else "surface_texture_unavailable",
+                        )
+                    }
                 }
             if (canAttachVideoSurfaceNow) {
+                activeSurfaceAttachmentEpoch += 1
+                activeSurfaceViewIdentity = bridge.viewIdentity
                 bridge.attachPlayer(playerHandle)
                 videoSurfaceClearedForMap = false
+                if (hasValidRenderedFrame && isDecoderCurrentlyAlive) {
+                    renderedFrameSurfaceEpoch = activeSurfaceAttachmentEpoch
+                    renderedFrameViewIdentity = bridge.viewIdentity
+                }
                 val surfaceFormatted = bridge.inspectSurfaceSnapshot().formatted()
                 ClimaGraphicsLifecycleDiagnostics.logPlayerSurfaceAttached(
                     sessionId = playerHandle.sessionId,
@@ -1410,7 +1664,7 @@ internal fun WeatherVideoBackgroundImpl(
                     surfaceInfo = surfaceFormatted,
                 )
                 val initialVisualState =
-                    if (hasValidRenderedFrame) {
+                    if (hasValidRenderedFrame && isDecoderCurrentlyAlive) {
                         WeatherVideoVisualState.VIDEO_FRAME_READY
                     } else {
                         WeatherVideoVisualState.VIDEO_WAITING_FIRST_FRAME
@@ -1427,6 +1681,7 @@ internal fun WeatherVideoBackgroundImpl(
                 )
             } else {
                 videoSurfaceClearedForMap = true
+                activeSurfaceViewIdentity = 0
                 GraphicsSurfaceCoordinator.onVideoOutputDetached(
                     sessionId = playerHandle.sessionId,
                     playerIdentity = playerHandle.identityHash,
@@ -1454,6 +1709,8 @@ internal fun WeatherVideoBackgroundImpl(
             detachWindowObserverRef = null
             val bridge = surfaceBridgeRef
             if (bridge != null) {
+                activeSurfaceAttachmentEpoch += 1
+                activeSurfaceViewIdentity = 0
                 if (bridge.isPlayerAttached(playerHandle)) {
                     bridge.detachPlayer()
                 }
@@ -1471,6 +1728,11 @@ internal fun WeatherVideoBackgroundImpl(
                     sessionId = playerHandle.sessionId,
                     playerIdentity = playerHandle.identityHash,
                     viewIdentity = bridge.viewIdentity,
+                    reason = "onRelease",
+                )
+                invalidateCurrentFrame(
+                    nextState = WeatherVideoVisualState.VIDEO_OUTPUT_DETACHED,
+                    milestoneEvent = "BACKGROUND_VIDEO_HIDDEN_NO_FRAME",
                     reason = "onRelease",
                 )
                 surfaceBridgeRef = null

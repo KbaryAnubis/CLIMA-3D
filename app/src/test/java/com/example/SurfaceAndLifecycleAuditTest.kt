@@ -2649,6 +2649,468 @@ class SurfaceAndLifecycleAuditTest {
         assertEquals(1, player.playCalls)
     }
 
+    // 51. Etapa 3N (3, 11 #2, #3, #8): Callbacks tardios/obsoletos de onRenderedFirstFrame (geração antiga, decoder liberado, MediaItem anterior ou superfície antiga) são descartados e nunca tornam o vídeo visível
+    @Test
+    fun `test_51_stale_first_frame_callbacks_from_old_decoder_generation_old_media_or_detached_surface_are_discarded`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var condition by mutableStateOf(WeatherCondition.SOL)
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = condition,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        val surface = surfaces.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+        assertEquals(1, player.decoderGeneration)
+
+        // Hold automatic first frame on next prepare() so we can inject stale callbacks
+        player.autoFirstFrameOnPrepare = false
+        composeTestRule.runOnUiThread {
+            player.simulateFatalMediaCodecReclaim(
+                decoderName = "c2.android.avc.decoder",
+                errorCodeName = "ERROR_CODE_DECODING_FAILED",
+                errorMessage = "Codec error: ERROR_RECLAIMED",
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        // Recovery prepare() has initialized decoderGeneration = 2, waiting for gen 2's first frame
+        assertEquals(2, player.decoderGeneration)
+        assertEquals("Video must be hidden (0f) while waiting for gen 2 first frame", 0f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+
+        // 1. Late callback from OLD decoder generation (gen 1 when active is gen 2) -> MUST be discarded
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRenderedWithToken(
+                com.example.ui.components.WeatherVideoFrameToken(
+                    sessionId = player.sessionId,
+                    playerIdentity = player.identityHash,
+                    videoResId = R.raw.wx_bg_sun_day,
+                    decoderGeneration = 1,
+                    surfaceEpoch = player.surfaceEpoch,
+                    surfaceViewIdentity = surface.viewIdentity,
+                    decoderAlive = true,
+                ),
+            )
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Stale callback from old decoder generation (gen=1) must NOT reveal video", 0f, observedVideoAlpha, 0.001f)
+
+        // 2. Late callback claiming decoderAlive = false -> MUST be discarded
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRenderedWithToken(
+                com.example.ui.components.WeatherVideoFrameToken(
+                    sessionId = player.sessionId,
+                    playerIdentity = player.identityHash,
+                    videoResId = R.raw.wx_bg_sun_day,
+                    decoderGeneration = 2,
+                    surfaceEpoch = player.surfaceEpoch,
+                    surfaceViewIdentity = surface.viewIdentity,
+                    decoderAlive = false,
+                ),
+            )
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Callback from dead/released decoder must NOT reveal video", 0f, observedVideoAlpha, 0.001f)
+
+        // 3. Late callback from a detached/old surface epoch -> MUST be discarded
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRenderedWithToken(
+                com.example.ui.components.WeatherVideoFrameToken(
+                    sessionId = player.sessionId,
+                    playerIdentity = player.identityHash,
+                    videoResId = R.raw.wx_bg_sun_day,
+                    decoderGeneration = 2,
+                    surfaceEpoch = player.surfaceEpoch - 1,
+                    surfaceViewIdentity = surface.viewIdentity,
+                    decoderAlive = true,
+                ),
+            )
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Stale callback from previous surfaceEpoch must NOT reveal video", 0f, observedVideoAlpha, 0.001f)
+
+        // 4. Switch weather condition to CHUVA (new MediaItem) and fire a late callback for the old MediaItem (SOL)
+        composeTestRule.runOnUiThread {
+            condition = WeatherCondition.CHUVA
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(3, player.decoderGeneration)
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRenderedWithToken(
+                com.example.ui.components.WeatherVideoFrameToken(
+                    sessionId = player.sessionId,
+                    playerIdentity = player.identityHash,
+                    videoResId = R.raw.wx_bg_sun_day, // stale MediaItem!
+                    decoderGeneration = 3,
+                    surfaceEpoch = player.surfaceEpoch,
+                    surfaceViewIdentity = surface.viewIdentity,
+                    decoderAlive = true,
+                ),
+            )
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Stale callback from previous MediaItem (wx_bg_sun_day) must NOT reveal video", 0f, observedVideoAlpha, 0.001f)
+
+        // 5. Finally emit the authentic first frame for the active MediaItem (CHUVA) & active decoder generation (gen 3)
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRendered()
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Valid first frame matching all 5 axes must restore videoAlpha to 1f", 1f, observedVideoAlpha, 0.001f)
+    }
+
+    // 52. Etapa 3N (4, 11 #4, #5): Buffering transitório com frame válido preserva exibição sem oscilação, enquanto buffering após perda do decoder oculta o vídeo
+    @Test
+    fun `test_52_transient_buffering_with_valid_frame_preserves_video_visibility_without_oscillation_or_fade_restart`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val alphaHistory = mutableListOf<Float>()
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.SOL,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                    onEffectiveVideoAlphaChanged = { alphaHistory += it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, alphaHistory.last(), 0.001f)
+        val initialFadeInCount =
+            ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().count { it.contains("BACKGROUND_VIDEO_FADE_IN") }
+        assertEquals(1, initialFadeInCount)
+
+        // 1. Transient STATE_BUFFERING -> STATE_READY while decoder gen 1 is alive and surface remains attached
+        val alphaCountBeforeTransientBuffering = alphaHistory.size
+        composeTestRule.runOnUiThread {
+            player.simulatePlaybackStateChange("BUFFERING", isPlaying = false)
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("Transient BUFFERING with valid frame must preserve videoAlpha=1f", 1f, alphaHistory.last(), 0.001f)
+
+        composeTestRule.runOnUiThread {
+            player.simulatePlaybackStateChange("READY", isPlaying = true)
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1f, alphaHistory.last(), 0.001f)
+        assertTrue(
+            "videoAlpha must never dip below 1f during transient BUFFERING",
+            alphaHistory.drop(alphaCountBeforeTransientBuffering).all { it == 1f },
+        )
+        val fadeInCountAfterTransientBuffering =
+            ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().count { it.contains("BACKGROUND_VIDEO_FADE_IN") }
+        assertEquals("Fade-in must not restart after transient BUFFERING", 1, fadeInCountAfterTransientBuffering)
+
+        // 2. Now release decoder (real frame loss) followed by BUFFERING and READY without onRenderedFirstFrame
+        composeTestRule.runOnUiThread {
+            player.simulateDecoderReleasedOnly()
+            player.simulatePlaybackStateChange("BUFFERING", isPlaying = false)
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("BUFFERING after decoder release must hide video immediately (alpha=0f)", 0f, alphaHistory.last(), 0.001f)
+
+        // Even if player reports STATE_READY, without onRenderedFirstFrame for a new alive decoder generation, video MUST stay hidden
+        composeTestRule.runOnUiThread {
+            player.simulatePlaybackStateChange("READY", isPlaying = true)
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("STATE_READY alone must never reveal video without onRenderedFirstFrame", 0f, alphaHistory.last(), 0.001f)
+    }
+
+    // 53. Etapa 3N (5, 11 #9, #10, #11): Callbacks redundantes de onRenderedFirstFrame e mudança entre condições que compartilham o mesmo vídeo (CHUVA <-> CHUVA_FRACA 0.85x) não reiniciam fade nem piscam
+    @Test
+    fun `test_53_redundant_first_frame_callbacks_and_same_video_condition_changes_do_not_restart_fade_or_flicker`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val alphaHistory = mutableListOf<Float>()
+        var condition by mutableStateOf(WeatherCondition.CHUVA)
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = condition,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                    onEffectiveVideoAlphaChanged = { alphaHistory += it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, alphaHistory.last(), 0.001f)
+        val historyIndexAfterInitialFade = alphaHistory.size
+
+        // Emit 3 redundant onRenderedFirstFrame callbacks for the same active MediaItem & decoderGeneration
+        repeat(3) {
+            composeTestRule.runOnUiThread {
+                player.emitFirstFrameRendered()
+            }
+            composeTestRule.waitForIdle()
+        }
+
+        // Switch CHUVA (1.0x) -> CHUVA_FRACA (0.85x) -> CHUVA (1.0x), which share R.raw.wx_bg_rain_day
+        composeTestRule.runOnUiThread {
+            condition = WeatherCondition.CHUVA_FRACA
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(0.85f, player.currentPlaybackSpeed, 0.001f)
+
+        composeTestRule.runOnUiThread {
+            condition = WeatherCondition.CHUVA
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1.0f, player.currentPlaybackSpeed, 0.001f)
+
+        assertEquals("prepare() must only run once because rawRes did not change", 1, player.prepareCalls)
+        assertEquals("videoAlpha must remain at 1f throughout", 1f, alphaHistory.last(), 0.001f)
+        assertTrue(
+            "No dip to 0f may occur during redundant first-frame callbacks or speed switches on the same video",
+            alphaHistory.drop(historyIndexAfterInitialFade).all { it == 1f },
+        )
+
+        val logs = ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot()
+        assertEquals(
+            "BACKGROUND_VIDEO_FADE_IN must be logged exactly once",
+            1,
+            logs.count { it.contains("BACKGROUND_VIDEO_FADE_IN") },
+        )
+        assertEquals(
+            "BACKGROUND_VIDEO_FRAME_READY must be deduplicated for identical token",
+            1,
+            logs.count { it.contains("BACKGROUND_VIDEO_FRAME_READY") },
+        )
+    }
+
+    // 54. Etapa 3N (6, 11 #16): Ciclo ON_PAUSE -> ON_RESUME (sem ON_STOP) pausa e retoma o player mantendo videoAlpha == 1f sem nenhuma oscilação
+    @Test
+    fun `test_54_on_pause_to_on_resume_without_on_stop_keeps_video_and_wallpaper_stable_with_zero_alpha_oscillation`() {
+        val lifecycleOwner = TestLifecycleOwner(Lifecycle.State.RESUMED)
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val alphaHistory = mutableListOf<Float>()
+
+        composeTestRule.setContent {
+            CompositionLocalProvider(LocalLifecycleOwner provides lifecycleOwner) {
+                Clima3DTheme(darkTheme = true) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.SOL,
+                        activeTab = ClimaTab.HOME,
+                        animatedEnabled = true,
+                        playerBridgeFactory = {
+                            FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                        },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                        onEffectiveVideoAlphaChanged = { alphaHistory += it },
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, alphaHistory.last(), 0.001f)
+        val idxAfterReady = alphaHistory.size
+
+        // Simulate ON_PAUSE -> ON_RESUME (Activity stays STARTED, e.g. system overlay / dialog)
+        composeTestRule.runOnUiThread {
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1, player.pauseCalls)
+        assertEquals(1f, alphaHistory.last(), 0.001f)
+
+        composeTestRule.runOnUiThread {
+            lifecycleOwner.registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1, player.playCalls)
+        assertEquals(1, player.prepareCalls)
+        assertEquals(1f, alphaHistory.last(), 0.001f)
+        assertTrue(
+            "videoAlpha must not oscillate during ON_PAUSE -> ON_RESUME",
+            alphaHistory.drop(idxAfterReady).all { it == 1f },
+        )
+        val fadeCount =
+            ClimaGraphicsLifecycleDiagnostics.recentEventsSnapshot().count { it.contains("BACKGROUND_VIDEO_FADE_IN") }
+        assertEquals(1, fadeCount)
+    }
+
+    // 55. Etapa 3N (6, 11 #1, #12, #17, #18): NightRainOverlay, wallpaper estático e scrim atmosférico permanecem íntegros durante falhas do decoder e trocas de superfície (HOME <-> RADAR <-> CITIES)
+    @Test
+    fun `test_55_night_rain_overlay_and_atmospheric_scrim_remain_mounted_across_codec_errors_and_surface_switches`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        var activeTab by mutableStateOf(ClimaTab.HOME)
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    WeatherBackgroundLayerImpl(
+                        condition = WeatherCondition.NOITE_CHUVA,
+                        activeTab = activeTab,
+                        animatedEnabled = true,
+                        playerBridgeFactory = {
+                            FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                        },
+                        surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx) },
+                        onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                    )
+                    if (activeTab == ClimaTab.RADAR) {
+                        RadarMapLibreViewImpl(
+                            center = CityMapCoordinate(-23.55, -46.63),
+                            zoom = 6.0,
+                            activeFrame = sampleRadarFrame(1700000000L),
+                            layerStyle = RadarBaseStyle.PRECIPITATION_MAP,
+                            maxRadarZoom = 7,
+                            surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx) },
+                        )
+                    } else if (activeTab == ClimaTab.CITIES) {
+                        CityMapLibreViewImpl(
+                            state = CityMapUiState(),
+                            onMapTap = {},
+                            onCameraGestureSettled = { _, _ -> },
+                            surfacePortFactory = { ctx -> FakeMapViewSurfacePort(ctx) },
+                        )
+                    }
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        composeTestRule.onNodeWithTag("weather_night_rain_overlay").assertExists()
+        composeTestRule.onNodeWithTag("weather_atmospheric_scrim").assertExists()
+
+        // Simulate MediaCodec hardware fault before recovery completes
+        player.autoFirstFrameOnPrepare = false
+        composeTestRule.runOnUiThread {
+            player.simulateVideoCodecFaultBeforePlayerError()
+        }
+        composeTestRule.waitForIdle()
+
+        // Video must snap immediately to 0f while static wallpaper, NightRainOverlay, and atmospheric scrim stay mounted
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        composeTestRule.onNodeWithTag("weather_night_rain_overlay").assertExists()
+        composeTestRule.onNodeWithTag("weather_atmospheric_scrim").assertExists()
+
+        // Navigate HOME -> RADAR -> CITIES -> HOME
+        player.autoFirstFrameOnPlayAfterReattach = false
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.RADAR }
+        composeTestRule.waitForIdle()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        composeTestRule.onNodeWithTag("weather_atmospheric_scrim").assertExists()
+
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.CITIES }
+        composeTestRule.waitForIdle()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        composeTestRule.onNodeWithTag("weather_atmospheric_scrim").assertExists()
+
+        composeTestRule.runOnUiThread { activeTab = ClimaTab.HOME }
+        composeTestRule.waitForIdle()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        composeTestRule.onNodeWithTag("weather_night_rain_overlay").assertExists()
+        composeTestRule.onNodeWithTag("weather_atmospheric_scrim").assertExists()
+    }
+
+    // 56. Etapa 3N (2A, 3, 11 #18): Perda de SurfaceTexture ou detach da janela oculta imediatamente o vídeo e exige novo primeiro frame na superfície válida
+    @Test
+    fun `test_56_surface_texture_loss_or_window_detach_immediately_hides_video_until_new_frame_on_valid_surface`() {
+        val players = mutableListOf<FakeWeatherVideoPlayerBridge>()
+        val surfaces = mutableListOf<FakeWeatherVideoSurfaceBridge>()
+        var observedVideoAlpha = -1f
+
+        composeTestRule.setContent {
+            Clima3DTheme(darkTheme = true) {
+                WeatherBackgroundLayerImpl(
+                    condition = WeatherCondition.SOL,
+                    activeTab = ClimaTab.HOME,
+                    animatedEnabled = true,
+                    playerBridgeFactory = {
+                        FakeWeatherVideoPlayerBridge(autoFirstFrameOnPrepare = true).also { players += it }
+                    },
+                    surfaceBridgeFactory = { ctx -> FakeWeatherVideoSurfaceBridge(ctx).also { surfaces += it } },
+                    onEffectiveVideoAlphaChanged = { observedVideoAlpha = it },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val player = players.single()
+        val surface = surfaces.single()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+
+        val staleEpochBeforeLoss = player.surfaceEpoch
+
+        // Simulate TextureView losing its SurfaceTexture (textureAvailable = false)
+        composeTestRule.runOnUiThread {
+            surface.emitSurfaceAvailability(attached = true, textureAvailable = false, hasSurfaceTexture = false)
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals("Video must snap immediately to 0f when SurfaceTexture is lost", 0f, observedVideoAlpha, 0.001f)
+        composeTestRule.onNodeWithTag("weather_static_wallpaper").assertExists()
+        composeTestRule.onNodeWithTag("weather_atmospheric_scrim").assertExists()
+
+        // Late frame token from before SurfaceTexture loss must be rejected
+        composeTestRule.runOnUiThread {
+            player.emitFirstFrameRenderedWithToken(
+                com.example.ui.components.WeatherVideoFrameToken(
+                    sessionId = player.sessionId,
+                    playerIdentity = player.identityHash,
+                    videoResId = R.raw.wx_bg_sun_day,
+                    decoderGeneration = player.decoderGeneration,
+                    surfaceEpoch = staleEpochBeforeLoss,
+                    surfaceViewIdentity = surface.viewIdentity,
+                    decoderAlive = true,
+                ),
+            )
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(0f, observedVideoAlpha, 0.001f)
+
+        // Restore SurfaceTexture availability and emit a new valid first frame on the current surfaceEpoch
+        composeTestRule.runOnUiThread {
+            surface.emitSurfaceAvailability(attached = true, textureAvailable = true, hasSurfaceTexture = true)
+            player.emitFirstFrameRendered()
+        }
+        composeTestRule.waitForIdle()
+        assertEquals(1f, observedVideoAlpha, 0.001f)
+    }
+
     private fun extractToken(line: String, prefix: String): String? {
         val idx = line.indexOf(prefix)
         if (idx < 0) return null
@@ -2685,6 +3147,9 @@ private class FakeWeatherVideoPlayerBridge(
     var idleState = true
     var currentPlayerState = "IDLE"
     var currentDecoderGen = 0
+    var currentDecoderAlive = false
+    var currentSurfaceEpoch = 0
+    var attachedSurfaceViewId = 0
     var setMediaItemCalls = 0
     var prepareCalls = 0
     var stopCalls = 0
@@ -2704,6 +3169,7 @@ private class FakeWeatherVideoPlayerBridge(
     val events = mutableListOf<String>()
     private var attachedView: Any? = null
     private var firstFrameListener: (() -> Unit)? = null
+    private var firstFrameTokenListener: ((com.example.ui.components.WeatherVideoFrameToken) -> Unit)? = null
     private var decoderLifecycleListener: ((Boolean, Int, String) -> Unit)? = null
     private var playbackStateListener: ((String, Boolean) -> Unit)? = null
     private var codecErrorListener: ((com.example.ui.components.WeatherVideoCodecErrorDiagnostic) -> Unit)? = null
@@ -2719,6 +3185,12 @@ private class FakeWeatherVideoPlayerBridge(
 
     override val decoderGeneration: Int
         get() = currentDecoderGen
+
+    override val isDecoderAlive: Boolean
+        get() = !released && currentDecoderAlive
+
+    override val surfaceEpoch: Int
+        get() = currentSurfaceEpoch
 
     override val currentPositionMs: Long
         get() = simulatedPositionMs
@@ -2760,6 +3232,7 @@ private class FakeWeatherVideoPlayerBridge(
         idleState = false
         currentPlayerState = "READY"
         currentDecoderGen += 1
+        currentDecoderAlive = true
         events += "prepare"
         ClimaGraphicsLifecycleDiagnostics.logExoDecoderInitialized(
             sessionId = sessionId,
@@ -2795,18 +3268,51 @@ private class FakeWeatherVideoPlayerBridge(
             positionMs = simulatedPositionMs,
             playerState = currentPlayerState,
         )
-        firstFrameListener?.invoke()
+        val token =
+            com.example.ui.components.WeatherVideoFrameToken(
+                sessionId = sessionId,
+                playerIdentity = identityHash,
+                videoResId = currentVideoResHint,
+                decoderGeneration = currentDecoderGen.coerceAtLeast(1),
+                surfaceEpoch = currentSurfaceEpoch,
+                surfaceViewIdentity = attachedSurfaceViewId,
+                decoderAlive = currentDecoderAlive,
+            )
+        val tokenCb = firstFrameTokenListener
+        if (tokenCb != null) {
+            tokenCb.invoke(token)
+        } else {
+            firstFrameListener?.invoke()
+        }
+    }
+
+    fun emitFirstFrameRenderedWithToken(token: com.example.ui.components.WeatherVideoFrameToken) {
+        firstFrameTokenListener?.invoke(token)
     }
 
     fun simulatePlaybackStateChange(stateName: String, isPlaying: Boolean) {
         currentPlayerState = stateName
         idleState = stateName == "IDLE"
+        if (idleState) {
+            currentDecoderAlive = false
+        }
         playbackStateListener?.invoke(stateName, isPlaying)
+    }
+
+    fun simulateDecoderReleasedOnly(decoderName: String = "c2.android.avc.decoder") {
+        currentDecoderAlive = false
+        decoderLifecycleListener?.invoke(false, currentDecoderGen, decoderName)
+    }
+
+    fun simulateVideoCodecFaultBeforePlayerError() {
+        currentDecoderAlive = false
+        decoderLifecycleListener?.invoke(false, currentDecoderGen, "codec_error:MediaCodecVideoDecoderException")
     }
 
     override fun stop() {
         stopCalls++
         idleState = true
+        currentDecoderAlive = false
         currentPlayerState = "IDLE"
         events += "stop"
         playbackStateListener?.invoke("IDLE", false)
@@ -2827,15 +3333,29 @@ private class FakeWeatherVideoPlayerBridge(
 
     override fun clearVideoSurface() {
         clearSurfaceCount++
+        currentSurfaceEpoch += 1
+        attachedSurfaceViewId = 0
         events += "clearVideoSurface"
     }
 
     override fun notifySurfaceReattachedForNewFrame() {
+        currentSurfaceEpoch += 1
         needsFrameAfterSurfaceReattach = true
+    }
+
+    fun onBoundToFakeSurface(viewIdentity: Int) {
+        currentSurfaceEpoch += 1
+        attachedSurfaceViewId = viewIdentity
     }
 
     override fun setFirstFrameListener(listener: (() -> Unit)?) {
         firstFrameListener = listener
+    }
+
+    override fun setFirstFrameTokenListener(
+        listener: ((com.example.ui.components.WeatherVideoFrameToken) -> Unit)?,
+    ) {
+        firstFrameTokenListener = listener
     }
 
     override fun setDecoderLifecycleListener(
@@ -2863,6 +3383,7 @@ private class FakeWeatherVideoPlayerBridge(
         val posBeforeError = simulatedPositionMs
         val speedBeforeError = currentSpeedValue
         idleState = true
+        currentDecoderAlive = false
         currentPlayerState = "IDLE"
         if (resetLivePositionOnIdle) {
             simulatedPositionMs = 0L
@@ -2915,6 +3436,8 @@ private class FakeWeatherVideoPlayerBridge(
     }
 
     override fun attachToPlayerView(playerView: androidx.media3.ui.PlayerView) {
+        currentSurfaceEpoch += 1
+        attachedSurfaceViewId = System.identityHashCode(playerView)
         attachedView = playerView
     }
 
@@ -2924,6 +3447,7 @@ private class FakeWeatherVideoPlayerBridge(
     override fun releaseOnce(): Boolean {
         if (released) return false
         released = true
+        currentDecoderAlive = false
         releaseCalls++
         releaseOrder = GlobalOrderClock.counter.incrementAndGet()
         events += "release"
@@ -2937,6 +3461,8 @@ private class FakeWeatherVideoSurfaceBridge(context: Context) : WeatherVideoSurf
     override val viewClassName: String = "FakePlayerView"
     private var boundPlayer: WeatherVideoPlayerBridge? = null
     private var attachObserver: ((Boolean, com.example.ui.components.ExoSurfaceSnapshot) -> Unit)? = null
+    private var currentTextureAvailable: Boolean = true
+    private var currentHasSurfaceTexture: Boolean = true
     var attachCount = 0
     var detachCount = 0
     var firstDetachOrder = Int.MAX_VALUE
@@ -2944,6 +3470,9 @@ private class FakeWeatherVideoSurfaceBridge(context: Context) : WeatherVideoSurf
     override fun attachPlayer(player: WeatherVideoPlayerBridge) {
         attachCount++
         boundPlayer = player
+        if (player is FakeWeatherVideoPlayerBridge) {
+            player.onBoundToFakeSurface(viewIdentity)
+        }
     }
 
     override fun isPlayerAttached(player: WeatherVideoPlayerBridge): Boolean =
@@ -2960,8 +3489,8 @@ private class FakeWeatherVideoSurfaceBridge(context: Context) : WeatherVideoSurf
     override fun inspectSurfaceSnapshot() =
         com.example.ui.components.ExoSurfaceSnapshot(
             surfaceViewClass = "TextureView",
-            textureAvailable = true,
-            hasSurfaceTexture = true,
+            textureAvailable = currentTextureAvailable,
+            hasSurfaceTexture = currentHasSurfaceTexture,
         )
 
     override fun attachWindowObserver(
@@ -2972,6 +3501,16 @@ private class FakeWeatherVideoSurfaceBridge(context: Context) : WeatherVideoSurf
     }
 
     fun emitAttach(attached: Boolean) {
+        attachObserver?.invoke(attached, inspectSurfaceSnapshot())
+    }
+
+    fun emitSurfaceAvailability(
+        attached: Boolean,
+        textureAvailable: Boolean,
+        hasSurfaceTexture: Boolean,
+    ) {
+        currentTextureAvailable = textureAvailable
+        currentHasSurfaceTexture = hasSurfaceTexture
         attachObserver?.invoke(attached, inspectSurfaceSnapshot())
     }
 }
